@@ -9617,15 +9617,19 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("Qraw", g->q, q_dim, il, pos);
     }
-    if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
-    if (ok) {
-        metal_graph_debug_dump_tensor("Qnorm", g->q, q_dim, il, pos);
-    }
-    if (ok) ok = ds4_gpu_rope_tail_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM,
-                                            DS4_N_ROT, pos,
-                                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                            false, freq_base, freq_scale, ext_factor, attn_factor,
-                                            DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+    /* Fused head-rms-norm + RoPE rotation on Q (mainline already has the
+     * batched variant of this fusion implicit in some paths; the standalone
+     * fused kernel ds4_gpu_head_rms_norm_rope_tail_tensor saves one DRAM
+     * round trip and one kernel launch per layer on the decode hot path).
+     * Mathematically equivalent to the prior two-kernel sequence; FMA
+     * reordering may produce ULP-scale differences. */
+    if (ok) ok = ds4_gpu_head_rms_norm_rope_tail_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM,
+                                                          DS4_N_ROT, pos,
+                                                          compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                          false, freq_base, freq_scale,
+                                                          ext_factor, attn_factor,
+                                                          DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW,
+                                                          DS4_RMS_EPS) != 0;
     DS4_METAL_PROFILE_DECODE_STAGE("q_path");
     if (ok) {
         metal_graph_debug_dump_tensor("Qcur", g->q, q_dim, il, pos);
@@ -11666,35 +11670,30 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
     DS4_METAL_PROFILE_Q_STAGE("q_b");
-    if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->batch_q,
-                                                n_tokens,
-                                                DS4_N_HEAD,
-                                                DS4_N_HEAD_DIM,
-                                                DS4_RMS_EPS) != 0;
-    if (ok) {
-        metal_graph_debug_dump_tensor("Qnorm", g->batch_q,
-                                      (uint64_t)n_tokens * q_dim, il, pos0);
-    }
-    DS4_METAL_PROFILE_Q_STAGE("head_norm");
-    if (ok) ok = ds4_gpu_rope_tail_tensor(g->batch_q,
-                                            n_tokens,
-                                            DS4_N_HEAD,
-                                            DS4_N_HEAD_DIM,
-                                            DS4_N_ROT,
-                                            pos0,
-                                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                            false,
-                                            freq_base,
-                                            freq_scale,
-                                            ext_factor,
-                                            attn_factor,
-                                            DS4_ROPE_YARN_BETA_FAST,
-                                            DS4_ROPE_YARN_BETA_SLOW) != 0;
+    /* Fused head-rms-norm + RoPE tail on Q (batched path).  Replaces the
+     * head_rms_norm + rope_tail pair that ran sequentially; saves one DRAM
+     * round-trip and one launch per layer.  ULP-scale FMA reordering may
+     * differ from the sequential pair. */
+    if (ok) ok = ds4_gpu_head_rms_norm_rope_tail_tensor(g->batch_q,
+                                                          n_tokens,
+                                                          DS4_N_HEAD,
+                                                          DS4_N_HEAD_DIM,
+                                                          DS4_N_ROT,
+                                                          pos0,
+                                                          compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                          false,
+                                                          freq_base,
+                                                          freq_scale,
+                                                          ext_factor,
+                                                          attn_factor,
+                                                          DS4_ROPE_YARN_BETA_FAST,
+                                                          DS4_ROPE_YARN_BETA_SLOW,
+                                                          DS4_RMS_EPS) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("Qcur", g->batch_q,
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
-    DS4_METAL_PROFILE_Q_STAGE("rope");
+    DS4_METAL_PROFILE_Q_STAGE("head_norm_rope");
     DS4_METAL_PROFILE_ATTN_STAGE("q_path");
     if (!qkv_rms_fused) {
         if (ok) ok = metal_graph_matmul_q8_0_named_tensor("attn_kv",

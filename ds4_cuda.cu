@@ -2414,8 +2414,15 @@ __global__ static void head_rms_norm_rope_tail_kernel(
         float s = sinf(theta) * mscale;
         if (inverse) s = -s;
         float *tail = xr + n_nope;
-        float x0 = tail[i] * scale;
-        float x1 = tail[i + 1] * scale;
+        /* Match the sequential (rms-then-rope) numerical path: that path
+         * stores scale*tail[i] back to fp32 memory before the RoPE rotation
+         * reads it.  Use __fmul_rn to force a single-rounded fp32 multiply
+         * for the scale step, preventing the compiler from fusing scale*x
+         * into the c/s multiply via FMA.  Without this barrier the long-
+         * context (high pos0 -> large theta) drift compounds across layers
+         * and flips argmax decisions on long_memory_archive. */
+        float x0 = __fmul_rn(tail[i], scale);
+        float x1 = __fmul_rn(tail[i + 1], scale);
         tail[i] = x0 * c - x1 * s;
         tail[i + 1] = x0 * s + x1 * c;
     }

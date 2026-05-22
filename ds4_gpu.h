@@ -299,6 +299,28 @@ int ds4_gpu_rope_tail_tensor(
         float             beta_fast,
         float             beta_slow);
 
+/* Fused per-head RMS norm + RoPE tail rotation on Q-style tensors.
+ * Mathematically equivalent to head_rms_norm_tensor + rope_tail_tensor
+ * applied back-to-back, but in a single kernel — saves one DRAM
+ * round-trip + one launch per call. ULP-scale FMA reordering may differ
+ * from the sequential pair. */
+int ds4_gpu_head_rms_norm_rope_tail_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          n_head,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        uint32_t          pos0,
+        uint32_t          n_ctx_orig,
+        bool              inverse,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow,
+        float             eps);
+
 /* Release decode fused KV finalizer: after the standalone RoPE kernel, this
  * performs DS4's FP8 non-RoPE KV round trip and writes the F16-rounded raw
  * attention cache row in one dispatch. */
