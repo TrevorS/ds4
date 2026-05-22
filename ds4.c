@@ -16087,6 +16087,16 @@ struct ds4_session {
     int mtp_draft_token;
     uint64_t mtp_probe_total;
     uint64_t mtp_probe_hit;
+    /* Speculative-decode accept-rate stats.  Incremented inside
+     * ds4_session_eval_speculative_argmax* whenever drafts are proposed,
+     * accepted (fully or partially), or fully rejected.  Reported on
+     * session free when DS4_MTP_ACCEPT_REPORT is set. */
+    uint64_t mtp_spec_iters;             /* total spec-decode entries */
+    uint64_t mtp_spec_drafts_proposed;   /* sum over iters of draft_n */
+    uint64_t mtp_spec_drafts_accepted;   /* sum over iters of n_accept-1 (verifier accepts beyond drafts[0]) */
+    uint64_t mtp_spec_full_accepts;      /* iters where all proposed drafts were accepted */
+    uint64_t mtp_spec_partial_accepts;   /* iters where some (>0) but not all drafts were accepted */
+    uint64_t mtp_spec_zero_accepts;      /* iters where draft[0] was rejected outright */
     ds4_session_progress_fn progress;
     void *progress_ud;
     ds4_session_progress_fn display_progress;
@@ -17875,6 +17885,20 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 
 void ds4_session_free(ds4_session *s) {
     if (!s) return;
+    if (s->mtp_spec_iters > 0 && getenv("DS4_MTP_ACCEPT_REPORT") != NULL) {
+        const double accept_rate = (double)s->mtp_spec_drafts_accepted /
+                                   (double)s->mtp_spec_drafts_proposed * 100.0;
+        const double per_iter = (double)s->mtp_spec_drafts_accepted /
+                                (double)s->mtp_spec_iters;
+        fprintf(stderr,
+                "ds4: mtp accept: iters=%llu proposed=%llu accepted=%llu "
+                "rate=%.1f%% per_iter=%.2f\n",
+                (unsigned long long)s->mtp_spec_iters,
+                (unsigned long long)s->mtp_spec_drafts_proposed,
+                (unsigned long long)s->mtp_spec_drafts_accepted,
+                accept_rate,
+                per_iter);
+    }
     if (ds4_session_is_cpu(s)) {
         kv_cache_free(&s->cpu_cache);
         cpu_decode_scratch_free(&s->cpu_scratch);
@@ -18459,6 +18483,15 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             break;
         }
     }
+    /* Record accept-rate diagnostics: one spec-decode iteration with draft_n
+     * proposed drafts (drafts[0] is the prior cached MTP prediction;
+     * drafts[1..draft_n-1] are the candidates we verify).  The
+     * DS4_MTP_RECORD_ACCEPT macro wraps the n_accept++ pattern so every
+     * draft commit also bumps the session-level counter; the report at
+     * session free divides accepted by proposed to yield the accept rate. */
+    s->mtp_spec_iters++;
+    s->mtp_spec_drafts_proposed += (uint64_t)draft_n;
+#define DS4_MTP_RECORD_ACCEPT() do { s->mtp_spec_drafts_accepted++; } while (0)
     if (mtp_conf_log && draft_n > 1) {
         float v0 = 0.0f, v1 = 0.0f;
         logits_top2(s->mtp_logits, DS4_N_VOCAB, &mtp_last_top0, &v0, &mtp_last_top1, &v1);
@@ -18492,6 +18525,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             free(row_logits);
             token_vec_push(&s->checkpoint, drafts[0]);
             accepted[n_accept++] = drafts[0];
+            DS4_MTP_RECORD_ACCEPT();
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
             DS4_MTP_KEEP_ACCEPTED(1);
@@ -18547,7 +18581,11 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             token_vec_push(&s->checkpoint, drafts[0]);
             token_vec_push(&s->checkpoint, drafts[1]);
             accepted[n_accept++] = drafts[0];
-            if (n_accept < accepted_cap) accepted[n_accept++] = drafts[1];
+            DS4_MTP_RECORD_ACCEPT();
+            if (n_accept < accepted_cap) {
+                accepted[n_accept++] = drafts[1];
+                DS4_MTP_RECORD_ACCEPT();
+            }
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
             DS4_MTP_KEEP_ACCEPTED(2);
@@ -18573,6 +18611,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         if (ok) {
             token_vec_push(&s->checkpoint, drafts[0]);
             accepted[n_accept++] = drafts[0];
+            DS4_MTP_RECORD_ACCEPT();
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
             DS4_MTP_KEEP_ACCEPTED(1);
@@ -18683,6 +18722,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                         memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
                         for (int i = 0; i < replayed && n_accept < accepted_cap; i++) {
                             accepted[n_accept++] = drafts[i];
+                            DS4_MTP_RECORD_ACCEPT();
                             if (drafts[i] == eos_token) break;
                         }
                         s->checkpoint_valid = true;
@@ -18704,6 +18744,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
                     for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
                         accepted[n_accept++] = drafts[i];
+                        DS4_MTP_RECORD_ACCEPT();
                         if (drafts[i] == eos_token) break;
                     }
                     s->checkpoint_valid = true;
@@ -18735,6 +18776,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                 if (ok) {
                     memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
                     accepted[n_accept++] = drafts[0];
+                    DS4_MTP_RECORD_ACCEPT();
                     s->checkpoint_valid = true;
                     s->mtp_draft_valid = false;
                     DS4_MTP_KEEP_ACCEPTED(1);
@@ -18769,6 +18811,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                 if (ok) {
                     memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
                     accepted[n_accept++] = drafts[0];
+                    DS4_MTP_RECORD_ACCEPT();
                     s->checkpoint_valid = true;
                     s->mtp_draft_valid = false;
                     DS4_MTP_KEEP_ACCEPTED(1);
@@ -18809,6 +18852,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
                     for (int i = 0; i < commit_drafts && n_accept < accepted_cap; i++) {
                         accepted[n_accept++] = drafts[i];
+                        DS4_MTP_RECORD_ACCEPT();
                         if (drafts[i] == eos_token) break;
                     }
                     s->checkpoint_valid = true;
@@ -18894,6 +18938,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         token_vec_push(&s->checkpoint, drafts[i]);
         logits_on_host = false;
         accepted[n_accept++] = drafts[i];
+        DS4_MTP_RECORD_ACCEPT();
         verified++;
         if (drafts[i] == eos_token) break;
     }
@@ -18936,6 +18981,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         }
     }
     return n_accept;
+#undef DS4_MTP_RECORD_ACCEPT
 #endif
 }
 
