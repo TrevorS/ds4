@@ -19048,15 +19048,16 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         float *row_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(row_logits[0]));
         const int start = s->checkpoint.len;
         /*
-         * The production MTP depth is two.  Prefix-1 capture makes partial
-         * accepts cheap, but it copies per-layer compressor frontiers even when
-         * both draft tokens are accepted.  Full accepts are the path that makes
-         * MTP worthwhile, so by default we snapshot before the verifier and
-         * replay one token on partial accept.  DS4_MTP_CAPTURE_PREFIX1 restores
-         * the older no-replay partial path for measurement.
+         * The production MTP depth is two.  Prefix-1 capture rewinds via
+         * cheap per-layer counter resets; the older full-snapshot path
+         * copies ~6 MiB of compressor state on every spec iter.  At K=2
+         * the prefix-1 path is byte-correct on accept and partial-accept
+         * (spec_frontier_commit_prefix1 mirrors what the snapshot-based
+         * rewind would do via counters alone), so it is the preferred
+         * default even under strict mode.  DS4_MTP_FORCE_SNAPSHOT still
+         * forces the old full-snapshot path for measurement / fallback.
          */
-        const bool capture_prefix1 =
-            draft_n == 2 && (!strict_mtp || getenv("DS4_MTP_CAPTURE_PREFIX1") != NULL);
+        const bool capture_prefix1 = (draft_n == 2);
         const bool exact_replay_debug = getenv("DS4_MTP_EXACT_REPLAY") != NULL;
         const bool snapshot_required =
             draft_n > 2 ||
