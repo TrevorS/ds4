@@ -13359,6 +13359,62 @@ static bool metal_graph_eval_mtp_draft(
                                               top_id);
 }
 
+/* Batched MTP-draft generator. Chains N-1 MTP-block evaluations starting from
+ * an input drafts[0], producing drafts[1..N-1] inside a single command-buffer
+ * window. Output drafts[i] is the MTP-predicted token at position
+ * start_pos+i, and ping-pongs the HC state across mtp_state_hc / mtp_next_hc
+ * as in the original per-call loop.
+ *
+ * Returns the number of drafts successfully filled (always >= 1 since
+ * drafts[0] is given as input). last_logits, if non-NULL, receives the logits
+ * from the FINAL MTP-block call (used by callers that need the last-position
+ * margin for verifier dispatch decisions). Caller is responsible for invoking
+ * spec-decode rollback on partial fills.
+ *
+ * This is the foundational batched MTP primitive: future work can replace
+ * the per-step inner call with a truly batched N=K kernel chain (single
+ * embed_n + matmul_n + decode_layer with N>1) — the public signature here
+ * is shape-compatible with that follow-up. */
+static uint32_t metal_graph_eval_mtp_draft_n_from_hc(
+        ds4_gpu_graph       *g,
+        const ds4_model       *base_model,
+        const ds4_weights     *base_weights,
+        const ds4_model       *mtp_model,
+        const ds4_mtp_weights *mtp,
+        uint32_t               n,           /* total drafts including drafts[0] */
+        int                   *drafts,      /* in: drafts[0]; out: drafts[1..n_filled-1] */
+        uint32_t               start_pos,   /* position of drafts[0] */
+        float                 *last_logits, /* may be NULL */
+        int                    eos_token) {
+    if (!g || !mtp || !drafts || n == 0) return 0;
+    if (n == 1) return 1;
+
+    uint32_t n_filled = 1;
+    for (uint32_t i = 1; i < n; i++) {
+        ds4_gpu_tensor *prev_hc = (i & 1u) ? g->mtp_state_hc : g->mtp_next_hc;
+        ds4_gpu_tensor *out_hc  = (i & 1u) ? g->mtp_next_hc  : g->mtp_state_hc;
+        int mtp_top = -1;
+        float *logits_sink = (i == n - 1u) ? last_logits : NULL;
+        if (!metal_graph_eval_mtp_draft_from_hc(g,
+                                                base_model,
+                                                base_weights,
+                                                mtp_model,
+                                                mtp,
+                                                prev_hc,
+                                                out_hc,
+                                                drafts[i - 1u],
+                                                start_pos + i - 1u,
+                                                logits_sink,
+                                                &mtp_top)) {
+            break;
+        }
+        drafts[i] = mtp_top;
+        n_filled++;
+        if (drafts[i] == eos_token) break;
+    }
+    return n_filled;
+}
+
 /* =========================================================================
  * Imatrix Collection.
  * =========================================================================
@@ -18460,28 +18516,28 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         s->graph.mtp_n_raw = keep_; \
     } while (0)
 
-    for (; draft_n < draft_cap; draft_n++) {
-        ds4_gpu_tensor *prev_hc = (draft_n & 1) ? s->graph.mtp_state_hc : s->graph.mtp_next_hc;
-        ds4_gpu_tensor *out_hc = (draft_n & 1) ? s->graph.mtp_next_hc : s->graph.mtp_state_hc;
-        int mtp_top = -1;
-        if (!metal_graph_eval_mtp_draft_from_hc(&s->graph,
-                                                &e->model,
-                                                &e->weights,
-                                                &e->mtp_model,
-                                                &e->mtp_weights,
-                                                prev_hc,
-                                                out_hc,
-                                                drafts[draft_n - 1],
-                                                (uint32_t)(s->checkpoint.len + draft_n - 1),
-                                                mtp_need_logits ? s->mtp_logits : NULL,
-                                                &mtp_top))
-        {
+    /* Batched MTP-draft generation. Fills drafts[1..draft_cap-1] from the
+     * single drafts[0] input via the metal_graph_eval_mtp_draft_n_from_hc
+     * primitive. On a partial fill (MTP block failure or mid-suffix EOS),
+     * draft_n reflects how many drafts are valid; the caller continues with
+     * whatever was filled. */
+    {
+        const uint32_t n_filled = metal_graph_eval_mtp_draft_n_from_hc(
+            &s->graph,
+            &e->model,
+            &e->weights,
+            &e->mtp_model,
+            &e->mtp_weights,
+            (uint32_t)draft_cap,
+            drafts,
+            (uint32_t)s->checkpoint.len,
+            mtp_need_logits ? s->mtp_logits : NULL,
+            eos_token);
+        if (n_filled == 0) return n_accept; /* defensive; cannot happen with drafts[0] valid */
+        draft_n = (int)n_filled;
+        if (n_filled < (uint32_t)draft_cap && drafts[n_filled - 1u] != eos_token) {
+            /* MTP block evaluation failed mid-loop; return what we accepted so far. */
             return n_accept;
-        }
-        drafts[draft_n] = mtp_top >= 0 ? mtp_top : sample_argmax(s->mtp_logits, DS4_N_VOCAB);
-        if (drafts[draft_n] == eos_token) {
-            draft_n++;
-            break;
         }
     }
     /* Record accept-rate diagnostics: one spec-decode iteration with draft_n
