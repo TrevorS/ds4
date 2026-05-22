@@ -5022,6 +5022,52 @@ __global__ static void indexer_scores_wmma128_kernel(
 #endif
 }
 
+/* Single-block argmax over n_vocab F32 logits. One block of 1024 threads
+ * cooperatively scans the vocab, tracking a (best_v, best_idx) pair per
+ * thread, then reduces in shared memory with value-keyed comparison.
+ *
+ * Tie-breaking: lower index wins, matching the host sample_argmax used by
+ * the CPU reference path. Replaces the indexer-as-argmax workaround used
+ * in the MTP top-id sites, which fell through to the legacy single-thread
+ * indexer_topk_kernel at top_k=1, costing ~17.5 ms per call on n_vocab=129280. */
+__global__ static void argmax_kernel(int32_t *out_idx, const float *logits, uint32_t n_vocab) {
+    enum { THREADS = 1024 };
+    __shared__ float sm_val[THREADS];
+    __shared__ int32_t sm_idx[THREADS];
+
+    const uint32_t tid = threadIdx.x;
+    float local_v = -INFINITY;
+    int32_t local_i = 0;
+    for (uint32_t i = tid; i < n_vocab; i += THREADS) {
+        const float v = logits[i];
+        if (v > local_v) {
+            local_v = v;
+            local_i = (int32_t)i;
+        }
+    }
+    sm_val[tid] = local_v;
+    sm_idx[tid] = local_i;
+    __syncthreads();
+
+    for (uint32_t s = THREADS / 2u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            const float vr = sm_val[tid + s];
+            const int32_t ir = sm_idx[tid + s];
+            const float vl = sm_val[tid];
+            const int32_t il = sm_idx[tid];
+            /* Larger value wins; on exact ties prefer the lower index. */
+            const bool take_right = (vr > vl) || (vr == vl && ir < il);
+            if (take_right) {
+                sm_val[tid] = vr;
+                sm_idx[tid] = ir;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) *out_idx = sm_idx[0];
+}
+
 __global__ static void indexer_topk_kernel(uint32_t *selected, const float *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
     uint32_t t = blockIdx.x;
     if (t >= n_tokens || threadIdx.x != 0) return;
@@ -5812,6 +5858,21 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                          (const float *)scores->ptr,
                                          n_comp, n_tokens, top_k);
     return cuda_ok(cudaGetLastError(), "indexer topk launch");
+}
+
+extern "C" int ds4_gpu_argmax_tensor(
+        ds4_gpu_tensor       *out_idx,
+        const ds4_gpu_tensor *logits,
+        uint32_t                n_vocab) {
+    if (!out_idx || !logits || n_vocab == 0 ||
+        out_idx->bytes < sizeof(int32_t) ||
+        logits->bytes < (uint64_t)n_vocab * sizeof(float)) {
+        return 0;
+    }
+    argmax_kernel<<<1, 1024>>>((int32_t *)out_idx->ptr,
+                               (const float *)logits->ptr,
+                               n_vocab);
+    return cuda_ok(cudaGetLastError(), "argmax launch");
 }
 
 extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
