@@ -2049,10 +2049,37 @@ __global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
         acc += __half2float(*scale_h) * xscale[b] * (float)dot;
     }
     acc = warp_sum_f32(acc);
-    if (lane == 0) {
-        const uint32_t d = (uint32_t)row;
-        block_out[d] = acc;
-        float block_v = acc;
+    /* Broadcast the per-row block_v from lane 0 to all 32 lanes so we can
+     * parallelize the n_hc HC outputs across lanes 0..n_hc-1.  The previous
+     * implementation collapsed to lane 0 for the entire HC epilogue, doing
+     * n_hc * n_hc serial HBM reads of residual_hc -- the dominant cost of
+     * this kernel.  Using lanes 0..n_hc-1 we issue n_hc parallel residual
+     * loads and share them across lanes via __shfl_sync, then each lane
+     * computes one dst_hc output and writes in parallel. */
+    const float block_v0 = __shfl_sync(0xffffffffu, acc, 0);
+    const uint32_t d = (uint32_t)row;
+    if (lane == 0) block_out[d] = block_v0;
+    if (n_hc <= 32u) {
+        float block_v = block_v0;
+        if (has_add) block_v += block_add[d];
+        const float *post = split + n_hc;
+        const float *comb = split + 2u * n_hc;
+        const float my_res = (lane < n_hc)
+            ? residual_hc[(uint64_t)lane * n_embd + d]
+            : 0.0f;
+        if (lane < n_hc) {
+            const uint32_t dst_hc = lane;
+            float hc_acc = block_v * post[dst_hc];
+            for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
+                const float src_res = __shfl_sync(0xffffffffu, my_res, src_hc);
+                hc_acc += comb[dst_hc + (uint64_t)src_hc * n_hc] * src_res;
+            }
+            out_hc[(uint64_t)dst_hc * n_embd + d] = hc_acc;
+        }
+    } else if (lane == 0) {
+        /* Fallback for unusual n_hc > warp size (not used by DSV4 which has
+         * n_hc = 4).  Same serial path as before. */
+        float block_v = block_v0;
         if (has_add) block_v += block_add[d];
         const float *post = split + n_hc;
         const float *comb = split + 2u * n_hc;
