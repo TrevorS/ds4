@@ -8231,12 +8231,24 @@ typedef struct {
     ds4_gpu_tensor *spec_prefix1_attn_state_score[DS4_N_LAYER];
     ds4_gpu_tensor *spec_prefix1_index_state_kv[DS4_N_LAYER];
     ds4_gpu_tensor *spec_prefix1_index_state_score[DS4_N_LAYER];
+    /* prefix-2: state after row 1 of an N=3 combined forward (= after
+     * first_token + drafts[0] committed; drafts[1] rejected). Mirrors
+     * prefix-1; captured at t==1 in encode_layer_batch when
+     * spec_capture_prefix2 is set. Used by the combined N=K+1 forward path
+     * to cheaply roll back when drafts[1] mismatches. */
+    ds4_gpu_tensor *spec_prefix2_attn_state_kv[DS4_N_LAYER];
+    ds4_gpu_tensor *spec_prefix2_attn_state_score[DS4_N_LAYER];
+    ds4_gpu_tensor *spec_prefix2_index_state_kv[DS4_N_LAYER];
+    ds4_gpu_tensor *spec_prefix2_index_state_score[DS4_N_LAYER];
     ds4_gpu_tensor *spec_logits;
     uint32_t layer_n_comp[DS4_N_LAYER];
     uint32_t layer_n_index_comp[DS4_N_LAYER];
     uint32_t spec_prefix1_n_comp[DS4_N_LAYER];
     uint32_t spec_prefix1_n_index_comp[DS4_N_LAYER];
+    uint32_t spec_prefix2_n_comp[DS4_N_LAYER];
+    uint32_t spec_prefix2_n_index_comp[DS4_N_LAYER];
     bool spec_capture_prefix1;
+    bool spec_capture_prefix2;
     uint32_t raw_cap;
     /* Maximum compressed-row capacity across layers.  Shared work buffers use
      * this worst-case size because ratio-4 indexer layers can still reach it. */
@@ -8297,6 +8309,14 @@ typedef struct {
     ds4_gpu_tensor *mtp_input_hc;
     ds4_gpu_tensor *mtp_state_hc;
     ds4_gpu_tensor *mtp_next_hc;
+    /* Saved post-final-layer HC of the last committed token from the
+     * verifier or combined-forward.  Used by the combined-forward path
+     * at iter start: MTP-block(prev_hc=combined_prev_hc, token=first_token,
+     * pos=base_pos) yields drafts[0] for the current iter at the correct
+     * position (= base_pos+1), avoiding the off-by-one trap of regenerating
+     * MTP draft from the post-commit HC at end of prior iter.  Size: hc_dim
+     * floats (single row).  Validity tracked by combined_prev_hc_valid. */
+    ds4_gpu_tensor *combined_prev_hc;
     ds4_gpu_tensor *mtp_raw_cache;
     uint32_t mtp_n_raw;
     uint32_t prefill_cap;
@@ -8438,6 +8458,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->prefill_tokens);
     ds4_gpu_tensor_free(g->logits);
     ds4_gpu_tensor_free(g->mtp_raw_cache);
+    ds4_gpu_tensor_free(g->combined_prev_hc);
     ds4_gpu_tensor_free(g->mtp_next_hc);
     ds4_gpu_tensor_free(g->mtp_state_hc);
     ds4_gpu_tensor_free(g->mtp_input_hc);
@@ -8511,6 +8532,10 @@ static void metal_graph_free(ds4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->spec_prefix1_attn_state_score[il]);
         ds4_gpu_tensor_free(g->spec_prefix1_index_state_kv[il]);
         ds4_gpu_tensor_free(g->spec_prefix1_index_state_score[il]);
+        ds4_gpu_tensor_free(g->spec_prefix2_attn_state_kv[il]);
+        ds4_gpu_tensor_free(g->spec_prefix2_attn_state_score[il]);
+        ds4_gpu_tensor_free(g->spec_prefix2_index_state_kv[il]);
+        ds4_gpu_tensor_free(g->spec_prefix2_index_state_score[il]);
     }
     ds4_gpu_tensor_free(g->kv);
     ds4_gpu_tensor_free(g->kv_raw);
@@ -8934,6 +8959,8 @@ static bool metal_graph_alloc_raw_cap(
                 g->spec_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
                 g->spec_prefix1_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
                 g->spec_prefix1_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
+                g->spec_prefix2_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
+                g->spec_prefix2_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
             }
             if (g->layer_attn_state_kv[il]) {
                 state_init_ok = state_init_ok &&
@@ -8957,6 +8984,8 @@ static bool metal_graph_alloc_raw_cap(
                     g->spec_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                     g->spec_prefix1_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                     g->spec_prefix1_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
+                    g->spec_prefix2_index_state_kv[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
+                    g->spec_prefix2_index_state_score[il] = ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                 }
                 if (g->layer_index_state_kv[il]) {
                     state_init_ok = state_init_ok &&
@@ -9022,6 +9051,7 @@ static bool metal_graph_alloc_raw_cap(
         g->mtp_input_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
         g->mtp_state_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
         g->mtp_next_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
+        g->combined_prev_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
         g->mtp_raw_cache = metal_graph_alloc_kv_cache_tensor(
                 managed_kv_cache,
                 (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
@@ -9080,7 +9110,9 @@ static bool metal_graph_alloc_raw_cap(
                               (g->spec_attn_state_kv[il] != NULL &&
                                g->spec_attn_state_score[il] != NULL &&
                                g->spec_prefix1_attn_state_kv[il] != NULL &&
-                               g->spec_prefix1_attn_state_score[il] != NULL));
+                               g->spec_prefix1_attn_state_score[il] != NULL &&
+                               g->spec_prefix2_attn_state_kv[il] != NULL &&
+                               g->spec_prefix2_attn_state_score[il] != NULL));
         }
         if (layer_cache_ok && ratio == 4) {
             layer_cache_ok = g->layer_index_comp_cache[il] != NULL &&
@@ -9090,7 +9122,9 @@ static bool metal_graph_alloc_raw_cap(
                               (g->spec_index_state_kv[il] != NULL &&
                                g->spec_index_state_score[il] != NULL &&
                                g->spec_prefix1_index_state_kv[il] != NULL &&
-                               g->spec_prefix1_index_state_score[il] != NULL));
+                               g->spec_prefix1_index_state_score[il] != NULL &&
+                               g->spec_prefix2_index_state_kv[il] != NULL &&
+                               g->spec_prefix2_index_state_score[il] != NULL));
         }
     }
 
@@ -9205,6 +9239,32 @@ static bool metal_graph_capture_prefix1_index_state(ds4_gpu_graph *g, uint32_t i
     return ds4_gpu_tensor_copy(g->spec_prefix1_index_state_kv[il], 0,
                                  g->layer_index_state_kv[il], 0, bytes) != 0 &&
            ds4_gpu_tensor_copy(g->spec_prefix1_index_state_score[il], 0,
+                                 g->layer_index_state_score[il], 0, bytes) != 0;
+}
+
+/* prefix-2 captures the per-layer compressor frontier after row 1 of a
+ * combined N=3 forward (= after first_token + drafts[0] committed, but
+ * before drafts[1]). Mirrors prefix-1; triggered at t==1 by the
+ * encode_layer_batch loop when spec_capture_prefix2 is set. Used by the
+ * combined-forward partial-accept path to cheaply commit 2 tokens when
+ * drafts[1] mismatches the verifier prediction. */
+static bool metal_graph_capture_prefix2_attn_state(ds4_gpu_graph *g, uint32_t il) {
+    if (!g->spec_capture_prefix2 || !g->spec_prefix2_attn_state_kv[il]) return true;
+    const uint64_t bytes = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
+    g->spec_prefix2_n_comp[il] = g->layer_n_comp[il];
+    return ds4_gpu_tensor_copy(g->spec_prefix2_attn_state_kv[il], 0,
+                                 g->layer_attn_state_kv[il], 0, bytes) != 0 &&
+           ds4_gpu_tensor_copy(g->spec_prefix2_attn_state_score[il], 0,
+                                 g->layer_attn_state_score[il], 0, bytes) != 0;
+}
+
+static bool metal_graph_capture_prefix2_index_state(ds4_gpu_graph *g, uint32_t il) {
+    if (!g->spec_capture_prefix2 || !g->spec_prefix2_index_state_kv[il]) return true;
+    const uint64_t bytes = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
+    g->spec_prefix2_n_index_comp[il] = g->layer_n_index_comp[il];
+    return ds4_gpu_tensor_copy(g->spec_prefix2_index_state_kv[il], 0,
+                                 g->layer_index_state_kv[il], 0, bytes) != 0 &&
+           ds4_gpu_tensor_copy(g->spec_prefix2_index_state_score[il], 0,
                                  g->layer_index_state_score[il], 0, bytes) != 0;
 }
 
@@ -12108,6 +12168,7 @@ static bool metal_graph_encode_layer_attention_batch(
                     if (ok && emit) g->layer_n_comp[il]++;
                     if (comp_counts) comp_counts[t] = g->layer_n_comp[il];
                     if (ok && t == 0) ok = metal_graph_capture_prefix1_attn_state(g, il);
+                    if (ok && t == 1) ok = metal_graph_capture_prefix2_attn_state(g, il);
                     ds4_gpu_tensor_free(sc_view);
                     ds4_gpu_tensor_free(kv_view);
                 }
@@ -12398,6 +12459,7 @@ static bool metal_graph_encode_layer_attention_batch(
                         if (ok && emit) g->layer_n_index_comp[il]++;
                         if (index_counts) index_counts[t] = g->layer_n_index_comp[il];
                         if (ok && t == 0) ok = metal_graph_capture_prefix1_index_state(g, il);
+                        if (ok && t == 1) ok = metal_graph_capture_prefix2_index_state(g, il);
                         ds4_gpu_tensor_free(sc_view);
                         ds4_gpu_tensor_free(kv_view);
                     }
@@ -14106,6 +14168,14 @@ static bool metal_graph_prefill_chunked(
  * state.  It still reuses the existing batch layer kernels, so it is not yet
  * the final hand-written N=2/N=4 decode microbatch, but it exercises the right
  * verifier contract and removes the obvious diagnostic overheads first. */
+/* Batched N-token forward on the verifier/combined path.
+ *
+ * capture_prefix1 — capture per-layer compressor frontier at row 0 boundary
+ *                   (= "after first row processed"). Valid for n_tokens >= 2.
+ * capture_prefix2 — capture per-layer compressor frontier at row 1 boundary
+ *                   (= "after first two rows processed"). Valid for
+ *                   n_tokens >= 3. Used by the combined N=K+1 forward path
+ *                   to cheaply rewind on a 2-token partial accept. */
 static bool metal_graph_verify_suffix_tops(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -14114,6 +14184,7 @@ static bool metal_graph_verify_suffix_tops(
         uint32_t               start,
         uint32_t               n_tokens,
         bool                   capture_prefix1,
+        bool                   capture_prefix2,
         int                   *row_tops,
         float                 *row_logits) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap || !g->spec_logits) return false;
@@ -14131,8 +14202,10 @@ static bool metal_graph_verify_suffix_tops(
                                                          n_tokens);
     if (!ok) return false;
 
-    const bool saved_capture = g->spec_capture_prefix1;
-    g->spec_capture_prefix1 = capture_prefix1 && n_tokens == 2;
+    const bool saved_capture1 = g->spec_capture_prefix1;
+    const bool saved_capture2 = g->spec_capture_prefix2;
+    g->spec_capture_prefix1 = capture_prefix1 && n_tokens >= 2;
+    g->spec_capture_prefix2 = capture_prefix2 && n_tokens >= 3;
 
     ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
@@ -14145,7 +14218,8 @@ static bool metal_graph_verify_suffix_tops(
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
-    g->spec_capture_prefix1 = saved_capture;
+    g->spec_capture_prefix1 = saved_capture1;
+    g->spec_capture_prefix2 = saved_capture2;
     if (!ok) return false;
 
     ok = ds4_gpu_begin_commands() != 0;
@@ -16161,6 +16235,11 @@ struct ds4_session {
     int ctx_size;
     bool checkpoint_valid;
     bool mtp_draft_valid;
+    /* True when graph.combined_prev_hc holds the post-final-layer HC of the
+     * last committed token (= post-position-(checkpoint.len-1) HC).  Set by
+     * canonical verifier paths and the combined-forward path; consumed by
+     * the combined-forward path at its next entry to compute drafts[0]. */
+    bool combined_prev_hc_valid;
 };
 
 /* =========================================================================
@@ -16604,6 +16683,38 @@ static bool spec_frontier_commit_prefix1(ds4_session *s) {
                                        g->spec_prefix1_index_state_kv[il], 0, ib) != 0 &&
                  ds4_gpu_tensor_copy(g->layer_index_state_score[il], 0,
                                        g->spec_prefix1_index_state_score[il], 0, ib) != 0;
+        }
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    return ok;
+}
+
+/* Cheap commit of the prefix-2 captured frontier (= state after row 1 of a
+ * combined N=3 forward). Used when the combined-forward path verifies
+ * first_token + drafts[0] but rejects drafts[1]. Mirrors
+ * spec_frontier_commit_prefix1; the per-layer compressor caches and counters
+ * rewind to the post-row-1 boundary without a full restore + replay. */
+static bool spec_frontier_commit_prefix2(ds4_session *s) {
+    ds4_gpu_graph *g = &s->graph;
+    bool ok = ds4_gpu_begin_commands() != 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+
+        g->layer_n_comp[il] = g->spec_prefix2_n_comp[il];
+        const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
+        ok = ds4_gpu_tensor_copy(g->layer_attn_state_kv[il], 0,
+                                   g->spec_prefix2_attn_state_kv[il], 0, ab) != 0 &&
+             ds4_gpu_tensor_copy(g->layer_attn_state_score[il], 0,
+                                   g->spec_prefix2_attn_state_score[il], 0, ab) != 0;
+        if (ok && ratio == 4) {
+            g->layer_n_index_comp[il] = g->spec_prefix2_n_index_comp[il];
+            const uint64_t ib = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
+            ok = ds4_gpu_tensor_copy(g->layer_index_state_kv[il], 0,
+                                       g->spec_prefix2_index_state_kv[il], 0, ib) != 0 &&
+                 ds4_gpu_tensor_copy(g->layer_index_state_score[il], 0,
+                                       g->spec_prefix2_index_state_score[il], 0, ib) != 0;
         }
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
@@ -18418,6 +18529,191 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     return ds4_session_eval_internal(s, token, true, err, errlen);
 }
 
+#ifndef DS4_NO_GPU
+/* Snapshot the post-final-layer HC of the just-committed last token from a
+ * batched-forward row into s->graph.combined_prev_hc.  This is the
+ * structurally correct prep for the next combined-forward iter: that iter
+ * will call MTP-block(prev_hc=combined_prev_hc, token=NEW_first_token,
+ * pos=NEW_base_pos) to produce a drafts[0] at the correct position
+ * (= NEW_base_pos+1), avoiding the off-by-one that would result from
+ * predicting drafts[0] at end of prior iter without knowing the next
+ * first_token. */
+static void spec_argmax_snapshot_combined_prev_hc(ds4_session *s, uint32_t row) {
+    ds4_engine *e = s->engine;
+    if (!e->mtp_ready || !s->graph.combined_prev_hc) return;
+    const uint64_t hc_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    if (ds4_gpu_tensor_copy(s->graph.combined_prev_hc, 0,
+                            s->graph.batch_cur_hc, row * hc_bytes,
+                            hc_bytes) != 0) {
+        s->combined_prev_hc_valid = true;
+    }
+}
+
+/* Combined N=K+1 speculative decode (Path α). Replaces the (main forward +
+ * verifier) sequence with a single batched N=K+1 forward over
+ * [first_token, drafts[0..K-1]]. Verifier slots are row_tops[0..K-1]; the
+ * final row K-1 doubles as next-iter sample logits.
+ *
+ * Only supports K=2 (mtp_draft_tokens == 2) for now: K=2 needs prefix-1 and
+ * prefix-2 capture which mainline has after this commit. K>=3 falls back.
+ *
+ * Preconditions:
+ *   - s->mtp_draft_valid must be true (drafts[0] from prior iter)
+ *   - e->mtp_ready, mtp_draft_tokens == 2, !DS4_MTP_SPEC_DISABLE
+ *
+ * Win comes from: skip ds4_session_eval(first_token)'s separate main
+ * forward (~65ms on Spark) and fold first_token into the batched verifier
+ * call.  HC state for next-iter MTP draft is recovered via
+ * metal_graph_tensor_row_view(batch_cur_hc, commit_row).
+ *
+ * Returns count of tokens written to accepted[], or -1 on error. */
+static int ds4_session_eval_speculative_argmax_combined(
+        ds4_session *s, int first_token, int max_tokens, int eos_token,
+        int *accepted, int accepted_cap, char *err, size_t errlen) {
+    ds4_engine *e = s->engine;
+    int n_accept = 0;
+
+    /* Need the prior iter's saved post-commit HC row to derive drafts[0]
+     * at the correct position.  Cold start (no prior combined or canonical
+     * iter has populated this) falls back to canonical. */
+    if (!s->combined_prev_hc_valid || !s->graph.combined_prev_hc) return -2;
+
+    /* Combined N=2 mode (K=1 effective via batched eval-fold).
+     *
+     * Empirical finding: with prev_hc semantics constrained by mainline
+     * (combined_prev_hc holds post-(p-1) HC, not post-p HC needed for the
+     * MTP block's "informed" prediction), drafts[1] cascades from a
+     * slightly-off mtp_state_hc and is systematically rejected by the
+     * target verifier.  N=3 combined therefore pays for an unused row.
+     *
+     * N=2 combined skips drafts[1] entirely and just verifies drafts[0]:
+     * forwards [first_token, drafts[0]] in a single batched 2-row pass.
+     * Effectively K=1 spec but with first_token folded into the verifier
+     * call, saving the canonical eval(first_token) cost (~65ms raw_swa)
+     * relative to canonical K=1.  At K=2 user setting, this is a tradeoff:
+     * we never get the canonical full-accept 3-token iter, but we always
+     * skip eval's separate forward.  Whether this nets to a win depends on
+     * mainline's batched-N=2 cost vs raw_swa + verify-N=1; empirically
+     * batched-N=2 ~= canonical's verify-N=2 ~120ms, so combined-N=2 ~120ms
+     * vs canonical-K=1 eval+nothing ~65ms - canonical wins on K=1.  Where
+     * combined-N=2 may win: K=2 user setting where canonical's average
+     * iter cost is ~165ms (eval+verify+mix) for ~2.4 tokens.  */
+    int draft_cap = 1; /* N=2 mode: K=1 effective */
+    if (draft_cap > max_tokens - 1) draft_cap = max_tokens - 1;
+    if (draft_cap > accepted_cap - 1) draft_cap = accepted_cap - 1;
+    int room = s->ctx_size - s->checkpoint.len;
+    if (draft_cap > room - 1) draft_cap = room - 1;
+    if (draft_cap < 1) return -2;
+
+    const uint32_t mtp_base_raw = s->graph.mtp_n_raw;
+    const uint32_t base_pos = (uint32_t)s->checkpoint.len;
+    const bool mtp_timing = getenv("DS4_MTP_TIMING") != NULL;
+    const double mtp_t0 = mtp_timing ? now_sec() : 0.0;
+
+    int drafts[3] = { -1, -1, -1 };
+
+    /* drafts[0]: MTP-block(prev_hc=combined_prev_hc, token=first_token,
+     * pos=base_pos) produces the MTP prediction for position base_pos+1. */
+    {
+        int mtp_top = -1;
+        bool ok = metal_graph_eval_mtp_draft_from_hc(
+            &s->graph, &e->model, &e->weights,
+            &e->mtp_model, &e->mtp_weights,
+            s->graph.combined_prev_hc, s->graph.mtp_state_hc,
+            first_token, base_pos,
+            NULL, &mtp_top);
+        if (!ok || mtp_top < 0) return -2;
+        drafts[0] = mtp_top;
+    }
+    s->combined_prev_hc_valid = false;
+    s->mtp_draft_valid = false;
+
+    const int draft_n = draft_cap;
+
+    /* Push [first_token, drafts[0]] to checkpoint for the verifier's
+     * prompt-window read.  Total pushed = K+1 = 2 in N=2 mode. */
+    const int start = s->checkpoint.len;
+    token_vec_push(&s->checkpoint, first_token);
+    for (int i = 0; i < draft_n; i++) token_vec_push(&s->checkpoint, drafts[i]);
+    const uint32_t n_tokens = (uint32_t)(draft_n + 1);
+
+    int row_tops[2] = { -1, -1 };
+    float *row_logits = xmalloc((size_t)n_tokens * DS4_N_VOCAB * sizeof(row_logits[0]));
+    bool ok = metal_graph_verify_suffix_tops(&s->graph, &e->model, &e->weights,
+                                             &s->checkpoint,
+                                             (uint32_t)start, n_tokens,
+                                             /*capture_prefix1*/ true,
+                                             /*capture_prefix2*/ false,
+                                             row_tops, row_logits);
+    if (!ok) {
+        s->checkpoint.len = start;
+        free(row_logits);
+        snprintf(err, errlen, "%s combined-forward failed", ds4_backend_name(e->backend));
+        s->checkpoint_valid = false;
+        return -1;
+    }
+
+    /* Verifier: row_tops[i] is target's argmax after position i in the
+     * combined window.  row_tops[0] confirms drafts[0]; row_tops[1] confirms
+     * drafts[1]; etc.  C counts accepted drafts on top of first_token. */
+    int commit = 0;
+    while (commit < draft_n && row_tops[commit] == drafts[commit]) commit++;
+
+    /* Rewind checkpoint to first_token + drafts[0..commit-1]. */
+    s->checkpoint.len = start + 1 + commit;
+
+    /* Cheap compressor frontier rollback.  N=2 mode: commit ∈ {0, 1}.
+     * commit=0 (drafts[0] rejected) → prefix-1 commit (state after row 0
+     * = post-first_token).  commit=1 (full accept) → no rollback needed. */
+    if (commit < draft_n) {
+        bool rb_ok = spec_frontier_commit_prefix1(s);
+        if (!rb_ok) {
+            free(row_logits);
+            snprintf(err, errlen, "%s prefix commit failed", ds4_backend_name(e->backend));
+            s->checkpoint_valid = false;
+            return -1;
+        }
+    }
+
+    /* The committed-prefix logits are at spec_logits row `commit` (= after
+     * first_token + drafts[0..commit-1]).  These feed the next-iter sampler. */
+    memcpy(s->logits,
+           row_logits + (uint64_t)commit * DS4_N_VOCAB,
+           (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+    free(row_logits);
+
+    /* Snapshot post-final-layer HC of the last committed token for the
+     * NEXT iter's drafts[0] derivation.  Row `commit` is the HC immediately
+     * after the last committed token in the combined forward. */
+    spec_argmax_snapshot_combined_prev_hc(s, (uint32_t)commit);
+
+    /* Commit accepted: first_token + drafts[0..commit-1]. */
+    accepted[n_accept++] = first_token;
+    for (int i = 0; i < commit && n_accept < accepted_cap; i++) {
+        accepted[n_accept++] = drafts[i];
+        if (drafts[i] == eos_token) break;
+    }
+    s->checkpoint_valid = true;
+
+    /* Adjust MTP raw cache visibility: drafts[0]'s MTP-block call wrote at
+     * base_pos; chained MTP wrote drafts[1..K-1] at base_pos+1..base_pos+K-1.
+     * Keep `commit` slots = drafts that were verifier-accepted.  Combined
+     * does no post-commit MTP-block call (only an HC-row snapshot), so the
+     * counter ends at mtp_base_raw + commit. */
+    uint32_t keep = mtp_base_raw + (uint32_t)commit;
+    if (keep > s->graph.raw_window) keep = s->graph.raw_window;
+    s->graph.mtp_n_raw = keep;
+
+    if (mtp_timing) {
+        fprintf(stderr,
+                "ds4: mtp timing combined drafted=%d committed=%d total=%.3f ms\n",
+                draft_n, commit, (now_sec() - mtp_t0) * 1000.0);
+    }
+
+    return n_accept;
+}
+#endif
+
 /* Speculative decode state machine:
  * 1. commit the normal target token and use its logits to validate draft[0];
  * 2. let MTP recursively draft a tiny suffix from its own raw-cache frontier;
@@ -18445,6 +18741,30 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 #else
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
     ds4_engine *e = s->engine;
+
+    /* Path α (combined N=K+1 forward) — opt-in via DS4_MTP_COMBINED_FORWARD.
+     * Replaces the eval(first_token) + verifier sequence with a single
+     * batched forward over [first_token, drafts[0..K-1]].  Requires a valid
+     * prior-iter MTP draft (drafts[0]); falls back to the canonical path on
+     * cold start, K!=2, or any precondition gap.  See
+     * ds4_session_eval_speculative_argmax_combined for the implementation. */
+    const bool mtp_spec_disabled_env = getenv("DS4_MTP_SPEC_DISABLE") != NULL;
+    const bool try_combined =
+        getenv("DS4_MTP_COMBINED_FORWARD") != NULL &&
+        e->mtp_ready &&
+        e->mtp_draft_tokens == 2 &&
+        !mtp_spec_disabled_env &&
+        max_tokens >= 2 && accepted_cap >= 2 &&
+        first_token != eos_token &&
+        s->checkpoint.len + 3 <= s->ctx_size;
+    if (try_combined) {
+        const int rc = ds4_session_eval_speculative_argmax_combined(
+            s, first_token, max_tokens, eos_token,
+            accepted, accepted_cap, err, errlen);
+        if (rc >= 0) return rc;
+        if (rc == -1) return -1;
+        /* rc == -2: precondition gap, fall through to canonical path. */
+    }
 
     /*
      * MTP in DeepSeek V4 is a speculative drafter, not a replacement sampler.
@@ -18740,6 +19060,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                 (uint32_t)start,
                                                 (uint32_t)draft_n,
                                                 capture_prefix1,
+                                                false,
                                                 row_tops,
                                                 NULL);
         }
@@ -18807,6 +19128,10 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     s->checkpoint_valid = true;
                     s->mtp_draft_valid = false;
                     DS4_MTP_KEEP_ACCEPTED(draft_n);
+                    /* Seed next-iter combined-forward: snapshot the HC row
+                     * for the last committed token. Next combined iter will
+                     * use it as MTP-block prev_hc with the new first_token. */
+                    spec_argmax_snapshot_combined_prev_hc(s, (uint32_t)(draft_n - 1));
                     if (mtp_timing) {
                         fprintf(stderr,
                                 "ds4: mtp timing micro drafted=%d committed=%d draft=%.3f ms snapshot=%.3f ms verify=%.3f ms total=%.3f ms\n",
@@ -18837,6 +19162,9 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     s->checkpoint_valid = true;
                     s->mtp_draft_valid = false;
                     DS4_MTP_KEEP_ACCEPTED(1);
+                    /* Seed next-iter combined-forward by snapshotting HC at
+                     * row 0 (= after drafts[0]). */
+                    spec_argmax_snapshot_combined_prev_hc(s, 0);
                     token_vec_push(&s->checkpoint, drafts[0]);
                     if (mtp_timing) {
                         fprintf(stderr,
@@ -18899,6 +19227,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                     &s->checkpoint,
                                                     (uint32_t)start,
                                                     (uint32_t)commit_drafts,
+                                                    false,
                                                     false,
                                                     row_tops,
                                                     NULL);
