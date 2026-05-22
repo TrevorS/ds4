@@ -9560,19 +9560,23 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("attn_norm", g->attn_norm, DS4_N_EMBD, il, pos);
     }
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->qr, model->map, model->size,
-                                              layer->attn_q_a->abs_offset,
-                                              DS4_N_EMBD, q_rank,
-                                              g->attn_norm, 1) != 0;
-    if (ok) {
-        metal_graph_debug_dump_tensor("q_lora", g->qr, q_rank, il, pos);
-    }
     if (qkv_rms_fused) {
-        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->kv_raw, model->map, model->size,
-                                                  layer->attn_kv->abs_offset,
-                                                  DS4_N_EMBD, DS4_N_HEAD_DIM,
-                                                  g->attn_norm, 1) != 0;
+        /* Pair-fuse Q_A and KV_A matmuls: both read the same attn_norm input,
+         * so we share one prequantize pass and one warp-of-8 launch instead
+         * of two back-to-back launches.  The same pair primitive already
+         * powers the shared_gate/shared_up fusion.  At n_tok=1 the kernel
+         * uses identical Q8_0 quantization of x and the identical dp4a
+         * accumulation path as two sequential matmul_q8_0 calls; the only
+         * difference is one kernel launch and one prequantize amortized. */
+        if (ok) ok = ds4_gpu_matmul_q8_0_pair_tensor(g->qr, g->kv_raw,
+                                                       model->map, model->size,
+                                                       layer->attn_q_a->abs_offset,
+                                                       layer->attn_kv->abs_offset,
+                                                       DS4_N_EMBD,
+                                                       q_rank, DS4_N_HEAD_DIM,
+                                                       g->attn_norm, 1) != 0;
         if (ok) {
+            metal_graph_debug_dump_tensor("q_lora", g->qr, q_rank, il, pos);
             metal_graph_debug_dump_tensor("KVraw", g->kv_raw, DS4_N_HEAD_DIM, il, pos);
         }
         if (ok) ok = ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(g->qr_norm,
@@ -9588,6 +9592,13 @@ static bool metal_graph_encode_decode_layer(
                                                              1,
                                                              DS4_RMS_EPS) != 0;
     } else {
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->qr, model->map, model->size,
+                                                  layer->attn_q_a->abs_offset,
+                                                  DS4_N_EMBD, q_rank,
+                                                  g->attn_norm, 1) != 0;
+        if (ok) {
+            metal_graph_debug_dump_tensor("q_lora", g->qr, q_rank, il, pos);
+        }
         if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->qr_norm, g->qr,
                                                       model->map, model->size,
                                                       layer->attn_q_a_norm->abs_offset,

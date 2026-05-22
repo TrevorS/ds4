@@ -151,6 +151,23 @@ int ds4_gpu_matmul_q8_0_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Pair-fused Q8_0 matmul: two weight matrices share a single prequantize of x
+ * and one warp-of-8 kernel launch.  out0/out1 can have asymmetric output
+ * dimensions (e.g. Q_A and KV_A in DSV4).  Falls back to two sequential
+ * ds4_gpu_matmul_q8_0_tensor calls for n_tok > 1. */
+int ds4_gpu_matmul_q8_0_pair_tensor(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *out1,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight0_offset,
+        uint64_t                weight1_offset,
+        uint64_t                in_dim,
+        uint64_t                out0_dim,
+        uint64_t                out1_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
 int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
