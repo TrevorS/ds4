@@ -241,7 +241,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         void *reg_dev = NULL;
         err = cudaHostRegister((void *)reg_addr,
                                (size_t)reg_bytes,
-                               cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+                               cudaHostRegisterMapped);
         if (err == cudaSuccess) {
             err = cudaHostGetDevicePointer(&reg_dev, (void *)reg_addr, 0);
             if (err == cudaSuccess && reg_dev) {
@@ -1470,8 +1470,12 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         }
     }
 
+    /* GB10 / driver 580.142 reports cudaDevAttrHostRegisterReadOnlySupported = 0,
+     * so requesting cudaHostRegisterReadOnly here fails with cudaErrorNotSupported
+     * and the entire model-resident fast path falls back to per-deref H2D streaming.
+     * Plain `Mapped` works on Spark.  Mirrors spark's cuda/runtime.cu:254-268. */
     cudaError_t err = cudaHostRegister((void *)model_map, (size_t)model_size,
-                                       cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+                                       cudaHostRegisterMapped);
     if (err == cudaSuccess) {
         void *dev = NULL;
         err = cudaHostGetDevicePointer(&dev, (void *)model_map, 0);
