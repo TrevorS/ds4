@@ -18549,6 +18549,23 @@ static void spec_argmax_snapshot_combined_prev_hc(ds4_session *s, uint32_t row) 
     }
 }
 
+/* Bootstrap variant: snapshot from the single-row decode tensor g->cur_hc.
+ * After ds4_session_eval (= one plain main-forward), g->cur_hc holds the
+ * post-final-layer HC of the just-committed token.  Folding it into
+ * combined_prev_hc lets the NEXT spec iter's combined-forward path call
+ * MTP-block(prev_hc=combined_prev_hc, token=next_first_token, ...) without
+ * the cold-start bailout.  Cost is one 112 KiB device-to-device copy. */
+static void spec_argmax_bootstrap_combined_prev_hc(ds4_session *s) {
+    ds4_engine *e = s->engine;
+    if (!e->mtp_ready || !s->graph.combined_prev_hc || !s->graph.cur_hc) return;
+    const uint64_t hc_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    if (ds4_gpu_tensor_copy(s->graph.combined_prev_hc, 0,
+                            s->graph.cur_hc, 0,
+                            hc_bytes) != 0) {
+        s->combined_prev_hc_valid = true;
+    }
+}
+
 /* Combined N=K+1 speculative decode (Path α). Replaces the (main forward +
  * verifier) sequence with a single batched N=K+1 forward over
  * [first_token, drafts[0..K-1]]. Verifier slots are row_tops[0..K-1]; the
@@ -18775,6 +18792,10 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
      * draft token is correctness-safe but cannot be faster than baseline.
      */
     if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+    /* Bootstrap combined_prev_hc from the just-completed main forward so the
+     * next spec iter can take the combined path without cold-start fallback.
+     * Cheap (~112 KiB copy) and side-effect-free for non-combined paths. */
+    spec_argmax_bootstrap_combined_prev_hc(s);
     int n_accept = 0;
     accepted[n_accept++] = first_token;
     if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
