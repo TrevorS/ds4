@@ -17751,6 +17751,18 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
+        /* Also populate the HBM cache for the MTP support model when loaded.
+         * Without this, MTP-block tensor reads at decode time hit the UVA-
+         * mapped pointer (slow) instead of cudaMalloc'd HBM copies (fast).
+         * The MoE expert filter in accelerator_cache_model_tensor_spans
+         * skips `mtp.0.ffn_*_exps.weight` automatically. */
+        if (e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->mtp_model)) {
+            fprintf(stderr, "ds4: %s failed to prepare MTP startup model cache\n",
+                    ds4_backend_name(e->backend));
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));
     }
