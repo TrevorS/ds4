@@ -6438,7 +6438,10 @@ extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "f32");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
-    if (g_cublas_ready && n_tok > 1) {
+    /* PR5: strict-batched routes batched-N>1 through the per-token
+     * matmul_f32_kernel that N=1 plain decode uses, instead of cublasSgemm. */
+    const bool strict_batched_f32 = getenv("DS4_CUDA_STRICT_BATCHED") != NULL;
+    if (!strict_batched_f32 && g_cublas_ready && n_tok > 1) {
         const float alpha = 1.0f;
         const float beta = 0.0f;
         cublasStatus_t st = cublasSgemm(g_cublas,
