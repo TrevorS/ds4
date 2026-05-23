@@ -2127,6 +2127,52 @@ __global__ static void matmul_q8_0_preq_batch_warp8_kernel(
     if (lane == 0) out[tok * out_dim + row] = acc;
 }
 
+/* Shared-weight variant: each warp reads one row of weights once and
+ * computes N_TOK dot products against N_TOK different token inputs.
+ * Cuts weight-bandwidth N-fold vs the per-token kernel above.  Used for
+ * small batches (MTP spec verify at N=2-4) where cuBLAS GEMM pads the
+ * tensor-core M tile (16 for f16) and wastes ~7/8 of the M-axis work. */
+template <int N_TOK>
+__global__ static void matmul_q8_0_preq_batch_share_warp_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks,
+        int use_dp4a) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+
+    const unsigned char *wr = w + row * blocks * 34;
+    float acc[N_TOK];
+    #pragma unroll
+    for (int t = 0; t < N_TOK; t++) acc[t] = 0.0f;
+
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const uint64_t i0 = b * 32;
+        const uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
+        const __half *scale_h = (const __half *)(wr + b * 34);
+        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+        const float wscale = __half2float(*scale_h);
+        #pragma unroll
+        for (int t = 0; t < N_TOK; t++) {
+            const int8_t *xqb = xq + (uint64_t)t * blocks * 32 + b * 32;
+            const float xs = xscale[(uint64_t)t * blocks + b];
+            int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+            acc[t] += wscale * xs * (float)dot;
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < N_TOK; t++) acc[t] = warp_sum_f32(acc[t]);
+    if (lane == 0) {
+        #pragma unroll
+        for (int t = 0; t < N_TOK; t++) out[(uint64_t)t * out_dim + row] = acc[t];
+    }
+}
+
 __global__ static void dequant_q8_0_to_f16_kernel(
         __half *out,
         const unsigned char *w,
@@ -5947,6 +5993,62 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         out->bytes < n_tok * out_dim * sizeof(float)) return 0;
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "q8_0");
     if (!wptr) return 0;
+    /* Small-batch shared-weight path: at n_tok = 2..4, the hand-rolled warp
+     * kernel that reads each weight row once and computes N dot products
+     * against N tokens replaces the per-token batch_warp8 kernel and is
+     * bit-identical to it (same blocks, same per-block FMA order, same warp
+     * reduction).  Gate to the same conditions under which batch_warp8
+     * would have been chosen: no F32/F16 cuBLAS cache hit and blocks <= 32.
+     * Otherwise fall through so cuBLAS Gemm (the existing reference path)
+     * stays in charge for that weight.  Disable with
+     * DS4_CUDA_NO_Q8_SHARE_BATCH=1. */
+    if (n_tok >= 2u && n_tok <= 4u && blocks <= 32u &&
+        getenv("DS4_CUDA_NO_Q8_SHARE_BATCH") == NULL &&
+        getenv("DS4_CUDA_NO_Q8_BATCH_WARP") == NULL &&
+        (!g_cublas_ready ||
+         (cuda_q8_f32_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label) == NULL &&
+          cuda_q8_f16_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label) == NULL))) {
+        const uint64_t share_xq_bytes = n_tok * blocks * 32u;
+        const uint64_t share_scale_offset = (share_xq_bytes + 15u) & ~15ull;
+        const uint64_t share_tmp_bytes = share_scale_offset + n_tok * blocks * sizeof(float);
+        void *share_tmp = cuda_tmp_alloc(share_tmp_bytes, "q8_0 share prequant");
+        if (share_tmp) {
+            int8_t *share_xq = (int8_t *)share_tmp;
+            float *share_xscale = (float *)((char *)share_tmp + share_scale_offset);
+            const int share_dp4a = cuda_q8_use_dp4a();
+            dim3 share_qgrid((unsigned)blocks, (unsigned)n_tok, 1);
+            quantize_q8_0_f32_kernel<<<share_qgrid, 32>>>(share_xq, share_xscale,
+                                                          (const float *)x->ptr,
+                                                          in_dim, blocks);
+            if (cuda_ok(cudaGetLastError(), "matmul_q8_0 share quantize launch")) {
+                const unsigned grid_x = ((unsigned)out_dim + 7u) / 8u;
+                bool launched = false;
+                if (n_tok == 2u) {
+                    matmul_q8_0_preq_batch_share_warp_kernel<2><<<grid_x, 256>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        share_xq, share_xscale, in_dim, out_dim, blocks, share_dp4a);
+                    launched = true;
+                } else if (n_tok == 3u) {
+                    matmul_q8_0_preq_batch_share_warp_kernel<3><<<grid_x, 256>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        share_xq, share_xscale, in_dim, out_dim, blocks, share_dp4a);
+                    launched = true;
+                } else if (n_tok == 4u) {
+                    matmul_q8_0_preq_batch_share_warp_kernel<4><<<grid_x, 256>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        share_xq, share_xscale, in_dim, out_dim, blocks, share_dp4a);
+                    launched = true;
+                }
+                if (launched && cuda_ok(cudaGetLastError(), "matmul_q8_0 share warp launch")) {
+                    return 1;
+                }
+            }
+        }
+        /* Falls through to cuBLAS / fallback if anything above failed. */
+    }
     if (g_cublas_ready && n_tok > 1) {
         const float *w_f32 = cuda_q8_f32_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
         if (w_f32) {
