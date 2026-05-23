@@ -319,32 +319,6 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     return cuda_model_range_populate_device_copy(model_map, offset, bytes, what);
 }
 
-static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
-    if (bytes == 0) return 1;
-    if (g_model_device_owned || g_model_registered) return 1;
-
-    const uint64_t end = offset + bytes;
-    if (end < offset) return 0;
-    for (const cuda_model_range &r : g_model_ranges) {
-        if (r.host_base == model_map &&
-            offset >= r.offset &&
-            end <= r.offset + r.bytes) {
-            return 1;
-        }
-        if (r.host_base == model_map &&
-            r.host_registered &&
-            r.registered_base &&
-            r.registered_device_base) {
-            const uintptr_t h0 = (uintptr_t)((const char *)model_map + offset);
-            const uintptr_t h1 = h0 + bytes;
-            const uintptr_t r0 = (uintptr_t)r.registered_base;
-            const uintptr_t r1 = r0 + r.registered_bytes;
-            if (h1 >= h0 && h0 >= r0 && h1 <= r1) return 1;
-        }
-    }
-    return 0;
-}
-
 static void cuda_q8_f16_cache_release_all(void) {
     for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
         (void)cudaFree(r.device_ptr);
@@ -948,9 +922,16 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
         char *end = NULL;
         unsigned long long v = strtoull(env, &end, 10);
         if (end != env) gb = (uint64_t)v;
+        return gb * 1073741824ull;
     }
-    if (gb == 0) return UINT64_MAX;
-    return gb * 1073741824ull;
+    /* Default cap protects against OOM on UMA systems where a full ~80 GiB
+     * model would otherwise duplicate the mmap'd host pages into HBM-backed
+     * cudaMalloc allocations and exhaust the 121 GiB UMA pool.  24 GiB
+     * comfortably covers attn projections + embedding + output head +
+     * shared FFN; routed MoE experts (~65 GiB, only top-K active per token)
+     * fall back to the UVA-mapped pointer for cold lookups.  Tune up via
+     * DS4_CUDA_WEIGHT_CACHE_LIMIT_GB on hosts with more memory budget. */
+    return 24ull * 1073741824ull;
 }
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
@@ -1560,8 +1541,22 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
 extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
-    if (!cuda_model_range_ptr(model_map, offset, bytes, label ? label : "model_tensor")) return 0;
-    return cuda_model_range_is_cached(model_map, offset, bytes);
+    /* Startup walk: force-populate the device-resident HBM cache so hot
+     * tensors hit cudaMalloc copies rather than the UVA-mapped fallback.
+     * Skip silently if over budget or opted out — the mapped pointer still
+     * works for any tensor we don't pre-cache. */
+    if (getenv("DS4_CUDA_NO_HBM_CACHE") != NULL) return 1;
+    if (g_model_device_owned) return 1;
+    const uint64_t limit = cuda_model_cache_limit_bytes();
+    if (g_model_range_bytes >= limit || bytes > limit - g_model_range_bytes) return 1;
+    const char *what = label ? label : "model_tensor";
+    /* Skip if this span is already populated. */
+    auto exact = g_model_range_by_offset.find(offset);
+    if (exact != g_model_range_by_offset.end()) {
+        const cuda_model_range &r = g_model_ranges[exact->second];
+        if (r.host_base == model_map && bytes <= r.bytes && !r.host_registered) return 1;
+    }
+    return cuda_model_range_populate_device_copy(model_map, offset, bytes, what) != NULL;
 }
 
 extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {

@@ -1394,6 +1394,13 @@ static uint64_t accelerator_cuda_preload_span_bytes(void) {
 }
 
 static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *cached_out) {
+    /* Routed MoE expert weights (`*_exps.weight`) are ~65 GiB of the model on
+     * V4-Flash but only top-K of N=256 experts fire per token — pre-caching
+     * them in HBM wastes most of the budget on cold weights and starves the
+     * hot non-MoE tensors that every token reads.  Skip them at the span-
+     * build stage so the cap fills with attn / shared FFN / embedding /
+     * output head.  Cold MoE expert reads fall back to the UVA-mapped
+     * pointer. */
     accelerator_tensor_span *spans = xmalloc((size_t)m->n_tensors * sizeof(spans[0]));
     uint64_t nspan = 0;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
@@ -1402,6 +1409,10 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
         if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) {
             free(spans);
             return false;
+        }
+        if (t->name.len >= 12 &&
+            memmem(t->name.ptr, t->name.len, "_exps.", 6) != NULL) {
+            continue;
         }
         spans[nspan++] = (accelerator_tensor_span){
             .off = t->abs_offset,
