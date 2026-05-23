@@ -7658,7 +7658,12 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         long v = strtol(out_a_min_env, &endp, 10);
         if (endp != out_a_min_env && v > 1 && v < 4096) out_a_cublas_min_tokens = (uint32_t)v;
     }
-    if (!g_quality_mode &&
+    /* PR5: strict-batched skips the cuBLAS F16 strided-batched attn-output-A
+     * path so the batched verifier uses grouped_q8_0_a_preq_warp8_kernel,
+     * the same kernel N=1 plain decode uses. */
+    const bool strict_batched_aoa = getenv("DS4_CUDA_STRICT_BATCHED") != NULL;
+    if (!strict_batched_aoa &&
+        !g_quality_mode &&
         g_cublas_ready &&
         n_tokens >= out_a_cublas_min_tokens &&
         getenv("DS4_CUDA_NO_CUBLAS_ATTENTION_OUTPUT_A") == NULL) {
