@@ -16240,6 +16240,13 @@ struct ds4_session {
      * canonical verifier paths and the combined-forward path; consumed by
      * the combined-forward path at its next entry to compute drafts[0]. */
     bool combined_prev_hc_valid;
+    /* Session-cached spec verifier readback buffers.  Sized for max(N=3)
+     * verifier rows + N row tops.  Avoids per-spec-call xmalloc/free of
+     * up to ~1.5 MiB of f32 logits, which was measurable per-iter
+     * overhead when combined-forward calls fire every iter. */
+    float *spec_row_logits_buf;
+    int *spec_row_tops_buf;
+    uint32_t spec_row_logits_cap_rows;
 };
 
 /* =========================================================================
@@ -18044,6 +18051,15 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (e->mtp_ready) {
         s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
         s->mtp_draft_token = -1;
+        /* Pre-allocate spec verifier readback buffers sized for max(N=3).
+         * Replaces per-call xmalloc/free of ~1.5 MiB row_logits and a
+         * small int[] row_tops in spec_argmax / combined paths. */
+        s->spec_row_logits_cap_rows = 3u;
+        s->spec_row_logits_buf = xmalloc((size_t)s->spec_row_logits_cap_rows *
+                                          (size_t)DS4_N_VOCAB *
+                                          sizeof(s->spec_row_logits_buf[0]));
+        s->spec_row_tops_buf = xmalloc((size_t)s->spec_row_logits_cap_rows *
+                                        sizeof(s->spec_row_tops_buf[0]));
     }
     *out = s;
     return 0;
@@ -18078,6 +18094,8 @@ void ds4_session_free(ds4_session *s) {
     token_vec_free(&s->checkpoint);
     free(s->logits);
     free(s->mtp_logits);
+    free(s->spec_row_logits_buf);
+    free(s->spec_row_tops_buf);
     free(s);
 }
 
@@ -18595,27 +18613,16 @@ static int ds4_session_eval_speculative_argmax_combined(
      * iter has populated this) falls back to canonical. */
     if (!s->combined_prev_hc_valid || !s->graph.combined_prev_hc) return -2;
 
-    /* Combined N=2 mode (K=1 effective via batched eval-fold).
-     *
-     * Empirical finding: with prev_hc semantics constrained by mainline
-     * (combined_prev_hc holds post-(p-1) HC, not post-p HC needed for the
-     * MTP block's "informed" prediction), drafts[1] cascades from a
-     * slightly-off mtp_state_hc and is systematically rejected by the
-     * target verifier.  N=3 combined therefore pays for an unused row.
-     *
-     * N=2 combined skips drafts[1] entirely and just verifies drafts[0]:
-     * forwards [first_token, drafts[0]] in a single batched 2-row pass.
-     * Effectively K=1 spec but with first_token folded into the verifier
-     * call, saving the canonical eval(first_token) cost (~65ms raw_swa)
-     * relative to canonical K=1.  At K=2 user setting, this is a tradeoff:
-     * we never get the canonical full-accept 3-token iter, but we always
-     * skip eval's separate forward.  Whether this nets to a win depends on
-     * mainline's batched-N=2 cost vs raw_swa + verify-N=1; empirically
-     * batched-N=2 ~= canonical's verify-N=2 ~120ms, so combined-N=2 ~120ms
-     * vs canonical-K=1 eval+nothing ~65ms - canonical wins on K=1.  Where
-     * combined-N=2 may win: K=2 user setting where canonical's average
-     * iter cost is ~165ms (eval+verify+mix) for ~2.4 tokens.  */
-    int draft_cap = 1; /* N=2 mode: K=1 effective */
+    /* Combined N=2 mode (K=1 effective).  K=2 (combined-N=3) is correct
+     * but loses: drafts[1] derives from chained MTP-block call whose
+     * prev_hc is the same stale combined_prev_hc -> drafts[1] is rejected
+     * by the target verifier roughly always, so the extra batched-N=3
+     * row costs more than it pays.  DS4_MTP_COMBINED_K2=1 forces N=3 for
+     * measurement / when the MTP staleness fix lands. */
+    int draft_cap = 1;
+    if (getenv("DS4_MTP_COMBINED_K2") != NULL && e->mtp_draft_tokens >= 2) {
+        draft_cap = 2;
+    }
     if (draft_cap > max_tokens - 1) draft_cap = max_tokens - 1;
     if (draft_cap > accepted_cap - 1) draft_cap = accepted_cap - 1;
     int room = s->ctx_size - s->checkpoint.len;
@@ -18645,26 +18652,44 @@ static int ds4_session_eval_speculative_argmax_combined(
     s->combined_prev_hc_valid = false;
     s->mtp_draft_valid = false;
 
-    const int draft_n = draft_cap;
+    int draft_n = 1;
+    /* drafts[1..draft_cap-1]: chained MTP block calls.  Same primitive
+     * canonical K=2 uses; ping-pongs mtp_state_hc / mtp_next_hc. */
+    if (draft_cap > 1) {
+        const uint32_t n_filled = metal_graph_eval_mtp_draft_n_from_hc(
+            &s->graph, &e->model, &e->weights,
+            &e->mtp_model, &e->mtp_weights,
+            (uint32_t)draft_cap, drafts,
+            base_pos,
+            NULL, eos_token);
+        draft_n = (int)n_filled;
+        if (draft_n < draft_cap && drafts[draft_n - 1] != eos_token) {
+            /* MTP block evaluation failed mid-chain; honor what we have. */
+        }
+    }
 
-    /* Push [first_token, drafts[0]] to checkpoint for the verifier's
-     * prompt-window read.  Total pushed = K+1 = 2 in N=2 mode. */
+    /* Push [first_token, drafts[0..draft_n-1]] to checkpoint for the
+     * verifier's prompt-window read.  Total pushed = draft_n + 1. */
     const int start = s->checkpoint.len;
     token_vec_push(&s->checkpoint, first_token);
     for (int i = 0; i < draft_n; i++) token_vec_push(&s->checkpoint, drafts[i]);
     const uint32_t n_tokens = (uint32_t)(draft_n + 1);
 
-    int row_tops[2] = { -1, -1 };
-    float *row_logits = xmalloc((size_t)n_tokens * DS4_N_VOCAB * sizeof(row_logits[0]));
-    bool ok = metal_graph_verify_suffix_tops(&s->graph, &e->model, &e->weights,
+    int row_tops[3] = { -1, -1, -1 };
+    /* Reuse the session-cached row_logits buffer (allocated at session
+     * creation, sized for max N=3 rows).  Saves per-call malloc/free of
+     * up to ~1.5 MiB. */
+    float *row_logits = s->spec_row_logits_buf;
+    const bool need_prefix2 = (draft_n >= 2);
+    bool ok = (row_logits != NULL) &&
+              metal_graph_verify_suffix_tops(&s->graph, &e->model, &e->weights,
                                              &s->checkpoint,
                                              (uint32_t)start, n_tokens,
                                              /*capture_prefix1*/ true,
-                                             /*capture_prefix2*/ false,
+                                             /*capture_prefix2*/ need_prefix2,
                                              row_tops, row_logits);
     if (!ok) {
         s->checkpoint.len = start;
-        free(row_logits);
         snprintf(err, errlen, "%s combined-forward failed", ds4_backend_name(e->backend));
         s->checkpoint_valid = false;
         return -1;
@@ -18679,13 +18704,21 @@ static int ds4_session_eval_speculative_argmax_combined(
     /* Rewind checkpoint to first_token + drafts[0..commit-1]. */
     s->checkpoint.len = start + 1 + commit;
 
-    /* Cheap compressor frontier rollback.  N=2 mode: commit ∈ {0, 1}.
-     * commit=0 (drafts[0] rejected) → prefix-1 commit (state after row 0
-     * = post-first_token).  commit=1 (full accept) → no rollback needed. */
+    /* Cheap compressor frontier rollback. Commit ∈ {0..draft_n}.
+     *   commit=0 (drafts[0] rejected)     -> prefix-1 = post-first_token
+     *   commit=1 (drafts[0] only)         -> prefix-2 = post-drafts[0] (K=2)
+     *                                        or no rollback needed (K=1)
+     *   commit=draft_n (full accept)      -> no rollback needed
+     * draft_n=1 (K=1): only prefix-1 is relevant.
+     * draft_n=2 (K=2): both prefix-1 and prefix-2 possible. */
     if (commit < draft_n) {
-        bool rb_ok = spec_frontier_commit_prefix1(s);
+        bool rb_ok = false;
+        if (commit == 0) {
+            rb_ok = spec_frontier_commit_prefix1(s);
+        } else if (commit == 1 && draft_n >= 2) {
+            rb_ok = spec_frontier_commit_prefix2(s);
+        }
         if (!rb_ok) {
-            free(row_logits);
             snprintf(err, errlen, "%s prefix commit failed", ds4_backend_name(e->backend));
             s->checkpoint_valid = false;
             return -1;
@@ -18697,7 +18730,6 @@ static int ds4_session_eval_speculative_argmax_combined(
     memcpy(s->logits,
            row_logits + (uint64_t)commit * DS4_N_VOCAB,
            (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-    free(row_logits);
 
     /* Snapshot post-final-layer HC of the last committed token for the
      * NEXT iter's drafts[0] derivation.  Row `commit` is the HC immediately
