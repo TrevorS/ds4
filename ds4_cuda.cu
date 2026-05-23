@@ -7354,7 +7354,13 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         if (!cuda_ok(cudaGetLastError(), "indexed attention topk sort launch")) return 0;
         topk_ptr = sorted;
     }
-    if (n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
+    /* PR5: strict-batched routes indexed attention through the scalar
+     * attention_indexed_mixed_kernel (matches N=1) instead of the heads8
+     * online flash kernel.  The online kernel does running softmax with
+     * recomputed normalizers, which diverges at ulp scale from the
+     * canonical materialized-scores softmax in the scalar kernel. */
+    const bool strict_batched_idx = getenv("DS4_CUDA_STRICT_BATCHED") != NULL;
+    if (!strict_batched_idx && n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
         getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
         if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
             dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
