@@ -17733,7 +17733,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        if (!e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->model)) {
+        if (!accelerator_cache_model_tensors(e->backend, &e->model)) {
             fprintf(stderr, "ds4: %s failed to prepare startup model cache\n",
                     ds4_backend_name(e->backend));
             ds4_engine_close(e);
