@@ -5709,7 +5709,12 @@ static int indexer_scores_launch(
                                                          scale, causal ? 1 : 0);
         return cuda_ok(cudaGetLastError(), "indexer score one direct launch");
     }
-    if (!g_quality_mode && head_dim == 128u && n_head == 64u &&
+    /* PR5: strict-batched routes indexer scoring through the scalar
+     * indexer_scores_kernel so batched-N matches the N=1 direct path.
+     * The wmma kernels do f16 accumulation in tensor cores, which diverges
+     * at ulp scale from the scalar f32 accumulation in indexer_scores_kernel. */
+    const bool strict_batched_ix = getenv("DS4_CUDA_STRICT_BATCHED") != NULL;
+    if (!strict_batched_ix && !g_quality_mode && head_dim == 128u && n_head == 64u &&
         getenv("DS4_CUDA_NO_INDEXER_WMMA") == NULL) {
         if (getenv("DS4_CUDA_NO_INDEXER_WMMA128") == NULL) {
             dim3 grid((n_comp + 127u) / 128u, (n_tokens + 15u) / 16u, 1);
