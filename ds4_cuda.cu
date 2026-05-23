@@ -6056,7 +6056,17 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         }
         /* Falls through to cuBLAS / fallback if anything above failed. */
     }
-    if (g_cublas_ready && n_tok > 1) {
+    /* PR5: when DS4_CUDA_STRICT_BATCHED is set, skip cuBLAS Sgemm/GemmEx at
+     * n_tok > 1 and fall through to the per-token Q8 batch_warp8 kernel.  The
+     * cuBLAS path takes a fundamentally different numerical route (cached F32 or
+     * F16 dequant + tensor-core / TF32 matmul) than the per-token warp8 kernel
+     * that N=1 plain decode uses.  Forcing the warp8 path makes the MTP batched
+     * verifier path bit-correspond to N=1 plain decode block-for-block, which
+     * is a precondition for an upcoming combined-forward strict mode that
+     * samples next-iter logits from the verifier.  Opt-in env so existing
+     * non-strict callers still get the cuBLAS perf win. */
+    const bool strict_batched = getenv("DS4_CUDA_STRICT_BATCHED") != NULL;
+    if (!strict_batched && g_cublas_ready && n_tok > 1) {
         const float *w_f32 = cuda_q8_f32_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
         if (w_f32) {
             const float alpha = 1.0f;
