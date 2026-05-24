@@ -18791,15 +18791,20 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
     ds4_engine *e = s->engine;
 
-    /* Path α (combined N=K+1 forward) — opt-in via DS4_MTP_COMBINED_FORWARD.
+    /* Path α (combined N=K+1 forward) — default-on for non-strict MTP.
      * Replaces the eval(first_token) + verifier sequence with a single
      * batched forward over [first_token, drafts[0..K-1]].  Requires a valid
      * prior-iter MTP draft (drafts[0]); falls back to the canonical path on
-     * cold start, K!=2, or any precondition gap.  See
+     * cold start, K!=2, or any precondition gap.  Strict mode
+     * (DS4_MTP_STRICT=1 or e->quality) falls back to canonical decode2_exact
+     * for byte-equality with plain decode — batched-N MoE / attention is not
+     * yet bit-identical to N=1 raw_swa, so combined-forward can drift one
+     * token from canonical (still coherent, just different).  See
      * ds4_session_eval_speculative_argmax_combined for the implementation. */
     const bool mtp_spec_disabled_env = getenv("DS4_MTP_SPEC_DISABLE") != NULL;
+    const bool strict_mtp = e->quality || getenv("DS4_MTP_STRICT") != NULL;
     const bool try_combined =
-        getenv("DS4_MTP_COMBINED_FORWARD") != NULL &&
+        !strict_mtp &&
         e->mtp_ready &&
         e->mtp_draft_tokens == 2 &&
         !mtp_spec_disabled_env &&
@@ -18845,7 +18850,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     int draft_n = 1;
     drafts[0] = s->mtp_draft_token;
     s->mtp_draft_valid = false;
-    const bool strict_mtp = e->quality || getenv("DS4_MTP_STRICT") != NULL;
     float mtp_margin_threshold = e->mtp_margin;
     const char *mtp_margin_env = getenv("DS4_MTP_MIN_MARGIN");
     if (mtp_margin_env && mtp_margin_env[0]) {
