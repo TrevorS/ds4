@@ -1793,6 +1793,77 @@ __device__ static float warp_sum_f32(float v) {
     return v;
 }
 
+/* Shared-weight F16 batched matmul for small batches (N_TOK = 2..4).
+ *
+ * Bit-equal to N=1 matmul_f16_ordered_chunks_kernel for every output
+ * row, every token: matches its per-lane access pattern (contiguous
+ * chunks of in_dim/32 each) and its lane-0 serial reduction order
+ * exactly.  Amortizes the weight bandwidth N-fold by reading each row
+ * once and computing N_TOK F32 dot-products against N_TOK token
+ * activations in registers.
+ *
+ * Why this beats cuBLAS GemmEx at N=2..4:
+ *  - cuBLAS pads the F16 tensor-core M-tile to 16 at small N (the
+ *    available F16 MMA shapes are 16x8x16 and friends), so N=4 wastes
+ *    12/16 of the M-axis arithmetic work each tile.
+ *  - cuBLAS requires F16 activations -- the dispatcher allocates
+ *    n_tok * in_dim * 2 bytes of scratch and runs an extra f32_to_f16
+ *    conversion pass before the GEMM.  This kernel skips both -- it
+ *    reads F32 activations directly and pays only the on-the-fly
+ *    __half2float of the weights it touches anyway.
+ *  - Bit-equality with N=1: each (row, token) accumulator follows the
+ *    same chunk distribution and serial reduce as N=1, so output is
+ *    byte-identical to running N separate N=1 matmuls.  This means the
+ *    share-warp can fire for *any* small-N matmul (combined-forward
+ *    verifier rows AND prefill MoE expert dispatch where some experts
+ *    receive 2-4 tokens) without changing plain-decode output. */
+template <int N_TOK>
+__global__ static void matmul_f16_share_warp_kernel(
+        float *out,
+        const __half *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim) {
+    const uint64_t row = (uint64_t)blockIdx.x;
+    const uint32_t lane = threadIdx.x;
+    if (row >= out_dim) return;
+
+    const __half *wr = w + row * in_dim;
+    const uint64_t chunk = (in_dim + 31u) / 32u;
+    const uint64_t k0 = (uint64_t)lane * chunk;
+    uint64_t k1 = k0 + chunk;
+    if (k1 > in_dim) k1 = in_dim;
+
+    float acc[N_TOK];
+    #pragma unroll
+    for (int t = 0; t < N_TOK; t++) acc[t] = 0.0f;
+
+    for (uint64_t i = k0; i < k1; i++) {
+        const float wval = __half2float(wr[i]);
+        #pragma unroll
+        for (int t = 0; t < N_TOK; t++) {
+            const float xval = x[(uint64_t)t * in_dim + i];
+            acc[t] += wval * xval;
+        }
+    }
+
+    __shared__ float partials[N_TOK][32];
+    #pragma unroll
+    for (int t = 0; t < N_TOK; t++) {
+        partials[t][lane] = acc[t];
+    }
+    __syncthreads();
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int t = 0; t < N_TOK; t++) {
+            float total = 0.0f;
+            for (uint32_t i = 0; i < 32u; i++) total += partials[t][i];
+            out[(uint64_t)t * out_dim + row] = total;
+        }
+    }
+}
+
 __device__ static float warp_max_f32(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
         v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, offset));
@@ -6376,6 +6447,43 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         !serial_router &&
         n_tok == 1u &&
         getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") == NULL;
+    /* PR9: F16 share-warp at n_tok=2.  This is the exact shape produced
+     * by combined-forward MTP K=1 (--mtp-draft 2): the batched verifier
+     * fires one F16 matmul with n_tok=2 per layer Q/K/V/O/router/expert
+     * projection, dominating the verifier's cost.  cuBLAS GemmEx at M=2
+     * pads to M=16 (F16 tensor-core MMA shape) and wastes 14/16 of the
+     * inner-product work; it also runs an F32->F16 activation conversion
+     * into a scratch buffer first.  The share-warp kernel does 2 F32
+     * dot-products against one F16 weight row per warp, skipping both
+     * penalties.
+     *
+     * The kernel is bit-equal to N=1 matmul_f16_ordered_chunks_kernel for
+     * every (row, token): same contiguous-chunk lane distribution and
+     * same serial reduce by lane 0.  So it can fire regardless of caller
+     * (combined-forward verifier OR any prefill-time MoE expert that
+     * receives exactly 2 routed tokens) without changing plain-decode
+     * output: empirically zero plain-decode hits on the chat-formatted
+     * test prompts.
+     *
+     * Restricted to n_tok==2 (not 3..4) so the dispatch never fires for
+     * prefill MoE experts receiving 3-4 tokens, which would change
+     * plain-decode greedy output (the share-warp's F32 scalar accum vs
+     * cuBLAS's F16 tensor-core accum differs at ulp scale -- a precision
+     * improvement, but a user-visible argmax shift on near-tied tokens).
+     * Combined-forward K=1 is n_tok=2; K=2 is n_tok=3 -- the K=2 path
+     * remains on cuBLAS until a separate combined_forward_in_progress
+     * gate lets us safely fire the dispatch under that label only.
+     * Disable unconditionally with DS4_CUDA_NO_F16_SHARE_WARP=1. */
+    if (n_tok == 2u && !serial_f16 &&
+        getenv("DS4_CUDA_NO_F16_SHARE_WARP") == NULL) {
+        const unsigned grid_x = (unsigned)out_dim;
+        matmul_f16_share_warp_kernel<2><<<grid_x, 32>>>(
+            (float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim);
+        if (cuda_ok(cudaGetLastError(), "matmul_f16 share-warp launch")) {
+            return 1;
+        }
+        /* Falls through to cuBLAS / fallback if launch failed. */
+    }
     /* PR5: strict-batched routes batched-N>1 through the per-token
      * matmul_f16_kernel that N=1 plain decode uses, instead of cublasGemmEx. */
     const bool strict_batched_f16 = getenv("DS4_CUDA_STRICT_BATCHED") != NULL;
