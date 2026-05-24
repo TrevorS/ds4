@@ -2181,13 +2181,37 @@ __global__ static void matmul_q8_0_preq_batch_share_warp_kernel(
         const __half *scale_h = (const __half *)(wr + b * 34);
         const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
         const float wscale = __half2float(*scale_h);
-        #pragma unroll
-        for (int t = 0; t < N_TOK; t++) {
-            const int8_t *xqb = xq + (uint64_t)t * blocks * 32 + b * 32;
-            const float xs = xscale[(uint64_t)t * blocks + b];
-            const int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
-            const float scaled = wscale * xs;
-            acc[t] = __fmaf_rn(scaled, (float)dot, acc[t]);
+        if (use_dp4a && bn == 32u) {
+            /* Load the weight quants for this row/block once (8 int32 words)
+             * and reuse them across all N_TOK tokens.  The previous form
+             * called dot_i8_block per token, reloading the weight N_TOK
+             * times -- defeating the share-warp's whole purpose.  The dp4a
+             * accumulation order (word 0..7) is identical to
+             * dot_i8x32_dp4a, and the dot is an exact int32, so the result
+             * is bit-identical to the per-token form and to the N=1 path. */
+            int32_t wq[8];
+            #pragma unroll
+            for (int k = 0; k < 8; k++) wq[k] = load_i8x4_i32_unaligned(qs + k * 4);
+            #pragma unroll
+            for (int t = 0; t < N_TOK; t++) {
+                const int8_t *xqb = xq + (uint64_t)t * blocks * 32 + b * 32;
+                int32_t dot = 0;
+                #pragma unroll
+                for (int k = 0; k < 8; k++) {
+                    dot = __dp4a(wq[k], load_i8x4_i32_aligned(xqb + k * 4), dot);
+                }
+                const float scaled = wscale * xscale[(uint64_t)t * blocks + b];
+                acc[t] = __fmaf_rn(scaled, (float)dot, acc[t]);
+            }
+        } else {
+            #pragma unroll
+            for (int t = 0; t < N_TOK; t++) {
+                const int8_t *xqb = xq + (uint64_t)t * blocks * 32 + b * 32;
+                const float xs = xscale[(uint64_t)t * blocks + b];
+                const int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+                const float scaled = wscale * xs;
+                acc[t] = __fmaf_rn(scaled, (float)dot, acc[t]);
+            }
         }
     }
     #pragma unroll
