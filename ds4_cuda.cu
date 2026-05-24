@@ -2223,11 +2223,9 @@ __global__ static void matmul_q8_0_preq_batch_warp8_kernel(
  *    (matters when the share-warp's t-loop body is more complex and the
  *    compiler might otherwise pick a different schedule).
  *
- * The PR7-era `blocks <= 32u` dispatcher gate that previously prevented
- * share-warp from firing at large block counts (out of caution against
- * accumulation-order drift) is no longer needed: per-lane accumulation
- * order is identical to N=1 at any block count, and the explicit fma
- * lock-step matches the N=1 SASS for the same arithmetic. */
+ * Dispatcher fires this for any blocks count -- the explicit fma lock-step
+ * keeps it bit-equal to N=1 even when the lane-stride loop iterates more
+ * than once (i.e. blocks > 32). */
 template <int N_TOK>
 __global__ static void matmul_q8_0_preq_batch_share_warp_kernel(
         float *out,
@@ -5806,7 +5804,7 @@ static int indexer_scores_launch(
                                                          scale, causal ? 1 : 0);
         return cuda_ok(cudaGetLastError(), "indexer score one direct launch");
     }
-    /* PR5: strict-batched routes indexer scoring through the scalar
+    /* DS4_CUDA_STRICT_BATCHED routes indexer scoring through the scalar
      * indexer_scores_kernel so batched-N matches the N=1 direct path.
      * The wmma kernels do f16 accumulation in tensor cores, which diverges
      * at ulp scale from the scalar f32 accumulation in indexer_scores_kernel. */
@@ -6109,24 +6107,12 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
      * cuBLAS Gemm because cuBLAS pads the M-tile to 16 for f16 tensor
      * cores and wastes ~7/8 of the work at M=2..4.
      *
-     * The share-warp kernel is NOT bit-identical to cuBLAS Gemm (different
-     * reduction structure), so under DS4_MTP_STRICT users that require
-     * byte-equality with plain decode, fall through to cuBLAS instead.
-     * Same opt-out shape as the combined-forward gate in
-     * ds4_session_eval_speculative_argmax.  Disable unconditionally with
-     * DS4_CUDA_NO_Q8_SHARE_BATCH=1.
-     *
-     * PR8: the previous `blocks <= 32u` constraint here is dropped.  The
-     * share-warp kernel is bit-equal to the N=1 warp8 reference at any
-     * block count -- per-lane block-stride loop and warp-reduce match
-     * block-for-block, and the explicit fma in the kernel body locks to
-     * the same FMA contraction as N=1.  See the comment block on
-     * matmul_q8_0_preq_batch_share_warp_kernel for the per-property
-     * argument.  (No observable perf delta on the current PR stack
-     * because combined-forward routes through F16 matmuls at n_tok=4,
-     * not Q8 -- the Q8 small-N dispatch is dead code in that flow.
-     * Dropping the gate removes a stale correctness-guard comment;
-     * recovering the perf is scoped for separate F16 small-N work.) */
+     * The share-warp kernel is bit-equal to N=1 matmul_q8_0_preq_warp8_kernel
+     * by construction (see the kernel-level comment), so it fires for any
+     * caller without changing N=1 plain-decode output.  Under DS4_MTP_STRICT
+     * users that require byte-equality with cuBLAS specifically, fall through
+     * to cuBLAS.  Disable the share-warp unconditionally with
+     * DS4_CUDA_NO_Q8_SHARE_BATCH=1. */
     const bool strict_mtp_env = getenv("DS4_MTP_STRICT") != NULL;
     if (n_tok >= 2u && n_tok <= 4u &&
         !strict_mtp_env &&
@@ -6173,15 +6159,14 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         }
         /* Falls through to cuBLAS / fallback if anything above failed. */
     }
-    /* PR5: when DS4_CUDA_STRICT_BATCHED is set, skip cuBLAS Sgemm/GemmEx at
-     * n_tok > 1 and fall through to the per-token Q8 batch_warp8 kernel.  The
-     * cuBLAS path takes a fundamentally different numerical route (cached F32 or
-     * F16 dequant + tensor-core / TF32 matmul) than the per-token warp8 kernel
-     * that N=1 plain decode uses.  Forcing the warp8 path makes the MTP batched
-     * verifier path bit-correspond to N=1 plain decode block-for-block, which
-     * is a precondition for an upcoming combined-forward strict mode that
-     * samples next-iter logits from the verifier.  Opt-in env so existing
-     * non-strict callers still get the cuBLAS perf win. */
+    /* DS4_CUDA_STRICT_BATCHED skips cuBLAS Sgemm/GemmEx at n_tok > 1 and
+     * falls through to the per-token Q8 batch_warp8 kernel.  The cuBLAS
+     * path takes a fundamentally different numerical route (cached F32 or
+     * F16 dequant + tensor-core / TF32 matmul) than the per-token warp8
+     * kernel that N=1 plain decode uses.  Forcing the warp8 path makes the
+     * MTP batched verifier path bit-correspond to N=1 plain decode
+     * block-for-block.  Opt-in env so non-strict callers still get the
+     * cuBLAS perf win. */
     const bool strict_batched = getenv("DS4_CUDA_STRICT_BATCHED") != NULL;
     if (!strict_batched && g_cublas_ready && n_tok > 1) {
         const float *w_f32 = cuda_q8_f32_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
@@ -6447,33 +6432,30 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         !serial_router &&
         n_tok == 1u &&
         getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") == NULL;
-    /* PR9: F16 share-warp at n_tok=2.  This is the exact shape produced
-     * by combined-forward MTP K=1 (--mtp-draft 2): the batched verifier
+    /* F16 share-warp at n_tok=2.  This is the exact shape produced by
+     * combined-forward MTP K=1 (--mtp-draft 2): the batched verifier
      * fires one F16 matmul with n_tok=2 per layer Q/K/V/O/router/expert
-     * projection, dominating the verifier's cost.  cuBLAS GemmEx at M=2
-     * pads to M=16 (F16 tensor-core MMA shape) and wastes 14/16 of the
-     * inner-product work; it also runs an F32->F16 activation conversion
-     * into a scratch buffer first.  The share-warp kernel does 2 F32
-     * dot-products against one F16 weight row per warp, skipping both
-     * penalties.
+     * projection.  cuBLAS GemmEx at M=2 pads to M=16 (F16 tensor-core
+     * MMA shape) and wastes 14/16 of the inner-product work; it also
+     * runs an F32->F16 activation conversion into a scratch buffer
+     * first.  The share-warp kernel does 2 F32 dot-products against one
+     * F16 weight row per warp, skipping both penalties.
      *
-     * The kernel is bit-equal to N=1 matmul_f16_ordered_chunks_kernel for
-     * every (row, token): same contiguous-chunk lane distribution and
-     * same serial reduce by lane 0.  So it can fire regardless of caller
-     * (combined-forward verifier OR any prefill-time MoE expert that
-     * receives exactly 2 routed tokens) without changing plain-decode
-     * output: empirically zero plain-decode hits on the chat-formatted
-     * test prompts.
+     * The kernel is bit-equal to N=1 matmul_f16_ordered_chunks_kernel
+     * for every (row, token): same contiguous-chunk lane distribution
+     * and same serial reduce by lane 0.  So it can fire regardless of
+     * caller (combined-forward verifier OR any prefill-time MoE expert
+     * that receives exactly 2 routed tokens) without changing
+     * plain-decode output.
      *
      * Restricted to n_tok==2 (not 3..4) so the dispatch never fires for
-     * prefill MoE experts receiving 3-4 tokens, which would change
-     * plain-decode greedy output (the share-warp's F32 scalar accum vs
-     * cuBLAS's F16 tensor-core accum differs at ulp scale -- a precision
-     * improvement, but a user-visible argmax shift on near-tied tokens).
-     * Combined-forward K=1 is n_tok=2; K=2 is n_tok=3 -- the K=2 path
-     * remains on cuBLAS until a separate combined_forward_in_progress
-     * gate lets us safely fire the dispatch under that label only.
-     * Disable unconditionally with DS4_CUDA_NO_F16_SHARE_WARP=1. */
+     * prefill MoE experts receiving 3-4 tokens; rerouting those would
+     * change plain-decode greedy output (share-warp F32 scalar accum vs
+     * cuBLAS F16 tensor-core accum: a precision improvement, but a
+     * user-visible argmax shift on near-tied tokens).  Combined-forward
+     * K=1 is n_tok=2; K=2 is n_tok=3 -- K=2 stays on cuBLAS until a
+     * combined-forward-context gate lets us fire the dispatch under
+     * that label only.  Disable with DS4_CUDA_NO_F16_SHARE_WARP=1. */
     if (n_tok == 2u && !serial_f16 &&
         getenv("DS4_CUDA_NO_F16_SHARE_WARP") == NULL) {
         const unsigned grid_x = (unsigned)out_dim;
@@ -6484,7 +6466,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         }
         /* Falls through to cuBLAS / fallback if launch failed. */
     }
-    /* PR5: strict-batched routes batched-N>1 through the per-token
+    /* DS4_CUDA_STRICT_BATCHED routes batched-N>1 through the per-token
      * matmul_f16_kernel that N=1 plain decode uses, instead of cublasGemmEx. */
     const bool strict_batched_f16 = getenv("DS4_CUDA_STRICT_BATCHED") != NULL;
     if (!strict_batched_f16 && !serial_f16 && g_cublas_ready && n_tok > 1) {
@@ -6592,7 +6574,7 @@ extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "f32");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
-    /* PR5: strict-batched routes batched-N>1 through the per-token
+    /* DS4_CUDA_STRICT_BATCHED routes batched-N>1 through the per-token
      * matmul_f32_kernel that N=1 plain decode uses, instead of cublasSgemm. */
     const bool strict_batched_f32 = getenv("DS4_CUDA_STRICT_BATCHED") != NULL;
     if (!strict_batched_f32 && g_cublas_ready && n_tok > 1) {
@@ -7503,7 +7485,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         if (!cuda_ok(cudaGetLastError(), "indexed attention topk sort launch")) return 0;
         topk_ptr = sorted;
     }
-    /* PR5: strict-batched routes indexed attention through the scalar
+    /* DS4_CUDA_STRICT_BATCHED routes indexed attention through the scalar
      * attention_indexed_mixed_kernel (matches N=1) instead of the heads8
      * online flash kernel.  The online kernel does running softmax with
      * recomputed normalizers, which diverges at ulp scale from the
@@ -7807,7 +7789,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         long v = strtol(out_a_min_env, &endp, 10);
         if (endp != out_a_min_env && v > 1 && v < 4096) out_a_cublas_min_tokens = (uint32_t)v;
     }
-    /* PR5: strict-batched skips the cuBLAS F16 strided-batched attn-output-A
+    /* DS4_CUDA_STRICT_BATCHED skips the cuBLAS F16 strided-batched attn-output-A
      * path so the batched verifier uses grouped_q8_0_a_preq_warp8_kernel,
      * the same kernel N=1 plain decode uses. */
     const bool strict_batched_aoa = getenv("DS4_CUDA_STRICT_BATCHED") != NULL;
