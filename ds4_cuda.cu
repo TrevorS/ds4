@@ -2131,7 +2131,32 @@ __global__ static void matmul_q8_0_preq_batch_warp8_kernel(
  * computes N_TOK dot products against N_TOK different token inputs.
  * Cuts weight-bandwidth N-fold vs the per-token kernel above.  Used for
  * small batches (MTP spec verify at N=2-4) where cuBLAS GEMM pads the
- * tensor-core M tile (16 for f16) and wastes ~7/8 of the M-axis work. */
+ * tensor-core M tile (16 for f16) and wastes ~7/8 of the M-axis work.
+ *
+ * Bit-equality with matmul_q8_0_preq_warp8_kernel (the N=1 reference)
+ * for every output row, at any block count:
+ *
+ *  - Per-lane stride loop `for (b = lane; b < blocks; b += 32u)` is the
+ *    same as N=1 -- each lane visits the same block sequence in the same
+ *    order, so the per-lane accumulation order matches block-for-block.
+ *  - Warp reduction is `warp_sum_f32` in both -- same butterfly shuffle
+ *    pattern, same lane-merging order.
+ *  - Per-block update uses an explicit `__fmaf_rn` of `(wscale * xs)`
+ *    against `(float)dot` with the running accumulator.  This matches
+ *    the FMA contraction nvcc chooses for the N=1 expression
+ *    `acc += __half2float(*scale_h) * xscale[b] * (float)dot` under
+ *    `--fmad=true` (the default with -O3 / --use_fast_math): the compiler
+ *    factors `(scale*xscale)` into a register, then issues one fma against
+ *    `(float)dot`.  Forcing the same explicit form here removes any
+ *    code-context-driven FMA-contraction divergence between the kernels
+ *    (matters when the share-warp's t-loop body is more complex and the
+ *    compiler might otherwise pick a different schedule).
+ *
+ * The PR7-era `blocks <= 32u` dispatcher gate that previously prevented
+ * share-warp from firing at large block counts (out of caution against
+ * accumulation-order drift) is no longer needed: per-lane accumulation
+ * order is identical to N=1 at any block count, and the explicit fma
+ * lock-step matches the N=1 SASS for the same arithmetic. */
 template <int N_TOK>
 __global__ static void matmul_q8_0_preq_batch_share_warp_kernel(
         float *out,
@@ -2161,8 +2186,9 @@ __global__ static void matmul_q8_0_preq_batch_share_warp_kernel(
         for (int t = 0; t < N_TOK; t++) {
             const int8_t *xqb = xq + (uint64_t)t * blocks * 32 + b * 32;
             const float xs = xscale[(uint64_t)t * blocks + b];
-            int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
-            acc[t] += wscale * xs * (float)dot;
+            const int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+            const float scaled = wscale * xs;
+            acc[t] = __fmaf_rn(scaled, (float)dot, acc[t]);
         }
     }
     #pragma unroll
@@ -6017,9 +6043,21 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
      * byte-equality with plain decode, fall through to cuBLAS instead.
      * Same opt-out shape as the combined-forward gate in
      * ds4_session_eval_speculative_argmax.  Disable unconditionally with
-     * DS4_CUDA_NO_Q8_SHARE_BATCH=1. */
+     * DS4_CUDA_NO_Q8_SHARE_BATCH=1.
+     *
+     * PR8: the previous `blocks <= 32u` constraint here is dropped.  The
+     * share-warp kernel is bit-equal to the N=1 warp8 reference at any
+     * block count -- per-lane block-stride loop and warp-reduce match
+     * block-for-block, and the explicit fma in the kernel body locks to
+     * the same FMA contraction as N=1.  See the comment block on
+     * matmul_q8_0_preq_batch_share_warp_kernel for the per-property
+     * argument.  (No observable perf delta on the current PR stack
+     * because combined-forward routes through F16 matmuls at n_tok=4,
+     * not Q8 -- the Q8 small-N dispatch is dead code in that flow.
+     * Dropping the gate removes a stale correctness-guard comment;
+     * recovering the perf is scoped for separate F16 small-N work.) */
     const bool strict_mtp_env = getenv("DS4_MTP_STRICT") != NULL;
-    if (n_tok >= 2u && n_tok <= 4u && blocks <= 32u &&
+    if (n_tok >= 2u && n_tok <= 4u &&
         !strict_mtp_env &&
         getenv("DS4_CUDA_NO_Q8_SHARE_BATCH") == NULL &&
         getenv("DS4_CUDA_NO_Q8_BATCH_WARP") == NULL) {
