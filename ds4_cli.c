@@ -1379,7 +1379,7 @@ static cli_config parse_options(int argc, char **argv) {
         .engine = {
             .model_path = "ds4flash.gguf",
             .backend = default_backend(),
-            .mtp_draft_tokens = 1,
+            .mtp_draft_tokens = 2,
             .mtp_margin = 3.0f,
         },
         .gen = {

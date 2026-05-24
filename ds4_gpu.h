@@ -152,6 +152,23 @@ int ds4_gpu_matmul_q8_0_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Pair-fused Q8_0 matmul: two weight matrices share a single prequantize of x
+ * and one warp-of-8 kernel launch.  out0/out1 can have asymmetric output
+ * dimensions (e.g. Q_A and KV_A in DSV4).  Falls back to two sequential
+ * ds4_gpu_matmul_q8_0_tensor calls for n_tok > 1. */
+int ds4_gpu_matmul_q8_0_pair_tensor(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *out1,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight0_offset,
+        uint64_t                weight1_offset,
+        uint64_t                in_dim,
+        uint64_t                out0_dim,
+        uint64_t                out1_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
 int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
@@ -282,6 +299,28 @@ int ds4_gpu_rope_tail_tensor(
         float             attn_factor,
         float             beta_fast,
         float             beta_slow);
+
+/* Fused per-head RMS norm + RoPE tail rotation on Q-style tensors.
+ * Mathematically equivalent to head_rms_norm_tensor + rope_tail_tensor
+ * applied back-to-back, but in a single kernel — saves one DRAM
+ * round-trip + one launch per call. ULP-scale FMA reordering may differ
+ * from the sequential pair. */
+int ds4_gpu_head_rms_norm_rope_tail_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          n_head,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        uint32_t          pos0,
+        uint32_t          n_ctx_orig,
+        bool              inverse,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow,
+        float             eps);
 
 /* Release decode fused KV finalizer: after the standalone RoPE kernel, this
  * performs DS4's FP8 non-RoPE KV round trip and writes the F16-rounded raw

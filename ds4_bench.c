@@ -39,6 +39,8 @@ typedef struct {
     double step_mul;
     const char *dump_frontier_logits_dir;
     ds4_dist_options dist;
+    const char *mtp_path;
+    int mtp_draft_tokens;
     bool warm_weights;
     bool quality;
 } bench_config;
@@ -159,6 +161,7 @@ static bench_config parse_options(int argc, char **argv) {
         .step_incr = 2048,
         .gen_tokens = 128,
         .step_mul = 1.0,
+        .mtp_draft_tokens = 2,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -230,6 +233,10 @@ static bench_config parse_options(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
+        } else if (!strcmp(arg, "--mtp")) {
+            c.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp-draft")) {
+            c.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
             usage(stderr, NULL);
@@ -457,6 +464,8 @@ int main(int argc, char **argv) {
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
         .distributed = cfg.dist,
+        .mtp_path = cfg.mtp_path,
+        .mtp_draft_tokens = cfg.mtp_draft_tokens,
     };
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
@@ -519,6 +528,9 @@ int main(int argc, char **argv) {
 
     const int eos = ds4_token_eos(engine);
     const bool distributed = cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR;
+    const bool use_mtp = cfg.mtp_path != NULL && ds4_engine_mtp_draft_tokens(engine) > 1;
+    fprintf(stderr, "ds4-bench: decode path = %s\n",
+            use_mtp ? "MTP speculative combined-forward" : "plain");
     ds4_session_snapshot snap = {0};
     char err[256];
     int previous = 0;
@@ -555,7 +567,8 @@ int main(int argc, char **argv) {
         }
 
         const double gen_t0 = bench_now_sec();
-        for (int i = 0; i < cfg.gen_tokens; i++) {
+        int produced = 0;
+        while (produced < cfg.gen_tokens) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
                 rc = 1;
@@ -567,10 +580,28 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
-                fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
-                rc = 1;
-                break;
+            if (use_mtp) {
+                /* Speculative decode: one batched verifier forward advances
+                 * the accepted prefix (first_token + matching drafts).  Mirrors
+                 * the CLI/server decode path so the bench measures the real
+                 * --mtp throughput, not a separate code path. */
+                int toks[17];
+                const int ntok = ds4_session_eval_speculative_argmax(
+                        session, token, cfg.gen_tokens - produced, eos,
+                        toks, (int)(sizeof(toks) / sizeof(toks[0])), err, sizeof(err));
+                if (ntok < 0) {
+                    fprintf(stderr, "ds4-bench: spec decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+                produced += ntok;
+            } else {
+                if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+                    fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+                produced += 1;
             }
         }
         const double gen_t1 = bench_now_sec();
@@ -598,8 +629,8 @@ int main(int argc, char **argv) {
                 frontier,
                 prefill_tokens,
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
-                cfg.gen_tokens,
-                gen_sec > 0.0 ? (double)cfg.gen_tokens / gen_sec : 0.0,
+                produced,
+                gen_sec > 0.0 ? (double)produced / gen_sec : 0.0,
                 (unsigned long long)(distributed ? 0 : snap.len));
         fflush(out);
 
