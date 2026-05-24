@@ -6006,20 +6006,23 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "q8_0");
     if (!wptr) return 0;
     /* Small-batch shared-weight path: at n_tok = 2..4, the hand-rolled warp
-     * kernel that reads each weight row once and computes N dot products
-     * against N tokens replaces the per-token batch_warp8 kernel and is
-     * bit-identical to it (same blocks, same per-block FMA order, same warp
-     * reduction).  Gate to the same conditions under which batch_warp8
-     * would have been chosen: no F32/F16 cuBLAS cache hit and blocks <= 32.
-     * Otherwise fall through so cuBLAS Gemm (the existing reference path)
-     * stays in charge for that weight.  Disable with
+     * kernel reads each weight row once and computes N dot products against
+     * N tokens, amortizing weight bandwidth N-fold over the per-token
+     * batch_warp8 fallback.  At small N this is meaningfully faster than
+     * cuBLAS Gemm because cuBLAS pads the M-tile to 16 for f16 tensor
+     * cores and wastes ~7/8 of the work at M=2..4.
+     *
+     * The share-warp kernel is NOT bit-identical to cuBLAS Gemm (different
+     * reduction structure), so under DS4_MTP_STRICT users that require
+     * byte-equality with plain decode, fall through to cuBLAS instead.
+     * Same opt-out shape as the combined-forward gate in
+     * ds4_session_eval_speculative_argmax.  Disable unconditionally with
      * DS4_CUDA_NO_Q8_SHARE_BATCH=1. */
+    const bool strict_mtp_env = getenv("DS4_MTP_STRICT") != NULL;
     if (n_tok >= 2u && n_tok <= 4u && blocks <= 32u &&
+        !strict_mtp_env &&
         getenv("DS4_CUDA_NO_Q8_SHARE_BATCH") == NULL &&
-        getenv("DS4_CUDA_NO_Q8_BATCH_WARP") == NULL &&
-        (!g_cublas_ready ||
-         (cuda_q8_f32_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label) == NULL &&
-          cuda_q8_f16_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label) == NULL))) {
+        getenv("DS4_CUDA_NO_Q8_BATCH_WARP") == NULL) {
         const uint64_t share_xq_bytes = n_tok * blocks * 32u;
         const uint64_t share_scale_offset = (share_xq_bytes + 15u) & ~15ull;
         const uint64_t share_tmp_bytes = share_scale_offset + n_tok * blocks * sizeof(float);
