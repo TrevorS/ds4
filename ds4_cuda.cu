@@ -2050,10 +2050,37 @@ __global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
         acc += __half2float(*scale_h) * xscale[b] * (float)dot;
     }
     acc = warp_sum_f32(acc);
-    if (lane == 0) {
-        const uint32_t d = (uint32_t)row;
-        block_out[d] = acc;
-        float block_v = acc;
+    /* Broadcast the per-row block_v from lane 0 to all 32 lanes so we can
+     * parallelize the n_hc HC outputs across lanes 0..n_hc-1.  The previous
+     * implementation collapsed to lane 0 for the entire HC epilogue, doing
+     * n_hc * n_hc serial HBM reads of residual_hc -- the dominant cost of
+     * this kernel.  Using lanes 0..n_hc-1 we issue n_hc parallel residual
+     * loads and share them across lanes via __shfl_sync, then each lane
+     * computes one dst_hc output and writes in parallel. */
+    const float block_v0 = __shfl_sync(0xffffffffu, acc, 0);
+    const uint32_t d = (uint32_t)row;
+    if (lane == 0) block_out[d] = block_v0;
+    if (n_hc <= 32u) {
+        float block_v = block_v0;
+        if (has_add) block_v += block_add[d];
+        const float *post = split + n_hc;
+        const float *comb = split + 2u * n_hc;
+        const float my_res = (lane < n_hc)
+            ? residual_hc[(uint64_t)lane * n_embd + d]
+            : 0.0f;
+        if (lane < n_hc) {
+            const uint32_t dst_hc = lane;
+            float hc_acc = block_v * post[dst_hc];
+            for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
+                const float src_res = __shfl_sync(0xffffffffu, my_res, src_hc);
+                hc_acc += comb[dst_hc + (uint64_t)src_hc * n_hc] * src_res;
+            }
+            out_hc[(uint64_t)dst_hc * n_embd + d] = hc_acc;
+        }
+    } else if (lane == 0) {
+        /* Fallback for unusual n_hc > warp size (not used by DSV4 which has
+         * n_hc = 4).  Same serial path as before. */
+        float block_v = block_v0;
         if (has_add) block_v += block_add[d];
         const float *post = split + n_hc;
         const float *comb = split + 2u * n_hc;
@@ -2099,6 +2126,77 @@ __global__ static void matmul_q8_0_preq_batch_warp8_kernel(
     }
     acc = warp_sum_f32(acc);
     if (lane == 0) out[tok * out_dim + row] = acc;
+}
+
+/* Shared-weight variant: each warp reads one row of weights once and
+ * computes N_TOK dot products against N_TOK different token inputs.
+ * Cuts weight-bandwidth N-fold vs the per-token kernel above.  Used for
+ * small batches (MTP spec verify at N=2-4) where cuBLAS GEMM pads the
+ * tensor-core M tile (16 for f16) and wastes ~7/8 of the M-axis work.
+ *
+ * Bit-equality with matmul_q8_0_preq_warp8_kernel (the N=1 reference)
+ * for every output row, at any block count:
+ *
+ *  - Per-lane stride loop `for (b = lane; b < blocks; b += 32u)` is the
+ *    same as N=1 -- each lane visits the same block sequence in the same
+ *    order, so the per-lane accumulation order matches block-for-block.
+ *  - Warp reduction is `warp_sum_f32` in both -- same butterfly shuffle
+ *    pattern, same lane-merging order.
+ *  - Per-block update uses an explicit `__fmaf_rn` of `(wscale * xs)`
+ *    against `(float)dot` with the running accumulator.  This matches
+ *    the FMA contraction nvcc chooses for the N=1 expression
+ *    `acc += __half2float(*scale_h) * xscale[b] * (float)dot` under
+ *    `--fmad=true` (the default with -O3 / --use_fast_math): the compiler
+ *    factors `(scale*xscale)` into a register, then issues one fma against
+ *    `(float)dot`.  Forcing the same explicit form here removes any
+ *    code-context-driven FMA-contraction divergence between the kernels
+ *    (matters when the share-warp's t-loop body is more complex and the
+ *    compiler might otherwise pick a different schedule).
+ *
+ * The kernel fires at any block count: per-lane accumulation order is
+ * identical to N=1, and the explicit fma lock-step matches the N=1 SASS
+ * for the same arithmetic, so there is no accumulation-order drift to
+ * guard against. */
+template <int N_TOK>
+__global__ static void matmul_q8_0_preq_batch_share_warp_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks,
+        int use_dp4a) {
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+
+    const unsigned char *wr = w + row * blocks * 34;
+    float acc[N_TOK];
+    #pragma unroll
+    for (int t = 0; t < N_TOK; t++) acc[t] = 0.0f;
+
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const uint64_t i0 = b * 32;
+        const uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
+        const __half *scale_h = (const __half *)(wr + b * 34);
+        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+        const float wscale = __half2float(*scale_h);
+        #pragma unroll
+        for (int t = 0; t < N_TOK; t++) {
+            const int8_t *xqb = xq + (uint64_t)t * blocks * 32 + b * 32;
+            const float xs = xscale[(uint64_t)t * blocks + b];
+            const int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+            const float scaled = wscale * xs;
+            acc[t] = __fmaf_rn(scaled, (float)dot, acc[t]);
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < N_TOK; t++) acc[t] = warp_sum_f32(acc[t]);
+    if (lane == 0) {
+        #pragma unroll
+        for (int t = 0; t < N_TOK; t++) out[(uint64_t)t * out_dim + row] = acc[t];
+    }
 }
 
 __global__ static void dequant_q8_0_to_f16_kernel(
@@ -2342,8 +2440,15 @@ __global__ static void head_rms_norm_rope_tail_kernel(
         float s = sinf(theta) * mscale;
         if (inverse) s = -s;
         float *tail = xr + n_nope;
-        float x0 = tail[i] * scale;
-        float x1 = tail[i + 1] * scale;
+        /* Match the sequential (rms-then-rope) numerical path: that path
+         * stores scale*tail[i] back to fp32 memory before the RoPE rotation
+         * reads it.  Use __fmul_rn to force a single-rounded fp32 multiply
+         * for the scale step, preventing the compiler from fusing scale*x
+         * into the c/s multiply via FMA.  Without this barrier the long-
+         * context (high pos0 -> large theta) drift compounds across layers
+         * and flips argmax decisions on long_memory_archive. */
+        float x0 = __fmul_rn(tail[i], scale);
+        float x1 = __fmul_rn(tail[i + 1], scale);
         tail[i] = x0 * c - x1 * s;
         tail[i + 1] = x0 * s + x1 * c;
     }
@@ -5921,6 +6026,70 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         out->bytes < n_tok * out_dim * sizeof(float)) return 0;
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "q8_0");
     if (!wptr) return 0;
+    /* Small-batch shared-weight path: at n_tok = 2..4, the hand-rolled warp
+     * kernel reads each weight row once and computes N dot products against
+     * N tokens, amortizing weight bandwidth N-fold over the per-token
+     * batch_warp8 fallback.  At small N this is meaningfully faster than
+     * cuBLAS Gemm because cuBLAS pads the M-tile to 16 for f16 tensor
+     * cores and wastes ~7/8 of the work at M=2..4.
+     *
+     * The share-warp kernel is bit-equal to the N=1 warp8 reference at any
+     * block count (see the comment block on
+     * matmul_q8_0_preq_batch_share_warp_kernel), so it fires for any caller
+     * without changing N=1 plain-decode output.  Under DS4_MTP_STRICT --
+     * where users want byte-equality with the cuBLAS path specifically --
+     * fall through to cuBLAS instead.  Disable unconditionally with
+     * DS4_CUDA_NO_Q8_SHARE_BATCH=1.
+     *
+     * This path carries the combined-forward win: the N=2 verifier issues
+     * its per-layer Q/K/V/O/expert Q8 projections here at n_tok=2, where
+     * cuBLAS would pad the f16 M-tile to 16 and waste most of the work. */
+    const bool strict_mtp_env = getenv("DS4_MTP_STRICT") != NULL;
+    if (n_tok >= 2u && n_tok <= 4u &&
+        !strict_mtp_env &&
+        getenv("DS4_CUDA_NO_Q8_SHARE_BATCH") == NULL &&
+        getenv("DS4_CUDA_NO_Q8_BATCH_WARP") == NULL) {
+        const uint64_t share_xq_bytes = n_tok * blocks * 32u;
+        const uint64_t share_scale_offset = (share_xq_bytes + 15u) & ~15ull;
+        const uint64_t share_tmp_bytes = share_scale_offset + n_tok * blocks * sizeof(float);
+        void *share_tmp = cuda_tmp_alloc(share_tmp_bytes, "q8_0 share prequant");
+        if (share_tmp) {
+            int8_t *share_xq = (int8_t *)share_tmp;
+            float *share_xscale = (float *)((char *)share_tmp + share_scale_offset);
+            const int share_dp4a = cuda_q8_use_dp4a();
+            dim3 share_qgrid((unsigned)blocks, (unsigned)n_tok, 1);
+            quantize_q8_0_f32_kernel<<<share_qgrid, 32>>>(share_xq, share_xscale,
+                                                          (const float *)x->ptr,
+                                                          in_dim, blocks);
+            if (cuda_ok(cudaGetLastError(), "matmul_q8_0 share quantize launch")) {
+                const unsigned grid_x = ((unsigned)out_dim + 7u) / 8u;
+                bool launched = false;
+                if (n_tok == 2u) {
+                    matmul_q8_0_preq_batch_share_warp_kernel<2><<<grid_x, 256>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        share_xq, share_xscale, in_dim, out_dim, blocks, share_dp4a);
+                    launched = true;
+                } else if (n_tok == 3u) {
+                    matmul_q8_0_preq_batch_share_warp_kernel<3><<<grid_x, 256>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        share_xq, share_xscale, in_dim, out_dim, blocks, share_dp4a);
+                    launched = true;
+                } else if (n_tok == 4u) {
+                    matmul_q8_0_preq_batch_share_warp_kernel<4><<<grid_x, 256>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        share_xq, share_xscale, in_dim, out_dim, blocks, share_dp4a);
+                    launched = true;
+                }
+                if (launched && cuda_ok(cudaGetLastError(), "matmul_q8_0 share warp launch")) {
+                    return 1;
+                }
+            }
+        }
+        /* Falls through to cuBLAS / fallback if anything above failed. */
+    }
     if (g_cublas_ready && n_tok > 1) {
         const float *w_f32 = cuda_q8_f32_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
         if (w_f32) {
