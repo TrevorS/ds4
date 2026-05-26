@@ -204,6 +204,47 @@ Phase-0/Phase-1 cond-node spikes stay as validated foundation for the residual
 sync IF a future workload (large N, batched serving) makes the accept round-trip
 dominate — but this profile says it doesn't today.
 
+### Stage 3 — MEASURED root cause of the verify-capture −2.3% (DS4_GRAPH_CAPTURE_STATS)
+
+Instrumented `ds4_gpu_graph_capture_update_launch` to tally ExecUpdate-vs-reinstantiate
+and print the `cudaGraphExecUpdateResultInfo.result`. Ran MTP verify-capture
+(`DS4_GRAPH_MTP_VERIFY=1`, knight n=48):
+
+**`update_ok=0  reinstantiate=21  cold=1` — ExecUpdate NEVER succeeds.**
+Failure reason: **`result=3` = `cudaGraphExecUpdateErrorNodeTypeChanged`.**
+
+So the −2.3% is 100% re-instantiate (~21 × ~1.67 ms ≈ 35 ms, ~1.4 % of the run)
+that the capture can never amortize — NOT capture overhead per se. Root cause
+(`ds4.c:12150-12209`, the per-token `else` branch the n_tok=3 verify always
+takes since `n_tokens % ratio != 0`): the compressor emit is **host-conditional**
+— `compressor_update` runs every token, but `fp8_kv_quantize` (kernel) +
+`commit_attn_comp_stage` (memcpy) + `n_comp++` only fire `if (emit)` at
+ratio-aligned positions. The verify advances `pos` by up to 3/iter, so which of
+the 3 rows hits a ratio boundary shifts almost every iter → the quantize/commit
+nodes land at different sequence indices → a kernel sits where a memcpy did →
+`NodeTypeChanged` → re-instantiate.
+
+**To make ExecUpdate succeed: stabilize the captured node structure** — emit must
+become **unconditional** (always launch quantize+commit; redirect the write to the
+not-yet-valid row `n_comp` so it's harmlessly overwritten at the real emit; keep
+`n_comp++` host-conditional). That touches the shared compressor hot path
+(`metal_graph_encode_layer_attention_batch`, used by prefill too) so it must be
+capture-mode-gated to stay bit-exact, AND it's only the FIRST node-structure
+variation — the indexer compressor (ratio==4) has the same pattern, and attention
+kernel *selection* (online vs non-online) + grid dims shift as n_raw/n_comp grow
+(grid changes ExecUpdate tolerates; selection changes it does not).
+
+**Verdict (now empirical, not theorized):** the decode-replay capture is blocked
+by per-iter node-structure drift; stabilizing it is a multi-week, correctness-
+critical refactor of the shared compressor/attention path for a marginal ceiling
+(the verify isn't launch-bound; even with ExecUpdate fixed the upside is ~0–2 %).
+The achievable, landed MTP gains are the **+10.9 % cascade** (N=3 combined-forward,
+already in baseline) and the **f16 prewarm ~2× prefill TTFT**. The cond-node
+device-accept (Phases 4-6) targets an even smaller slice. Recommendation: bank
+this precise scoping; pursue the topology-stabilization only if a future workload
+raises the ceiling. The `DS4_GRAPH_CAPTURE_STATS` instrumentation stays as the
+diagnostic to re-check after any stabilization attempt.
+
 ### Stage 3 — CORRECTION: the warmup is PREFILL, not decode (+97% prefill landed)
 
 The first profile windowed "steady decode" as "after the last >20 ms gap" — but
