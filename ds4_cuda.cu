@@ -9671,7 +9671,7 @@ __global__ static void moe_down_expert_tile4_row32_kernel(
     }
 }
 
-__global__ static void moe_down_expert_tile8_row32_kernel(
+__global__ static void __launch_bounds__(256, 2) moe_down_expert_tile8_row32_kernel(
         float *down_out,
         const char *down_base,
         const cuda_block_q8_K *midq,
