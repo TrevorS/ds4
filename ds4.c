@@ -12503,6 +12503,15 @@ static bool metal_graph_encode_layer_attention_batch(
                     ds4_gpu_tensor *kv_view = metal_graph_tensor_row_view(g->batch_comp_kv, t, comp_width);
                     ds4_gpu_tensor *sc_view = metal_graph_tensor_row_view(g->batch_comp_sc, t, comp_width);
                     const uint32_t comp_row = g->layer_n_comp[il];
+                    /* DS4_GRAPH_STABLE_EMIT: always run quantize+commit (to the
+                     * not-yet-live row comp_row, harmlessly overwritten until a
+                     * real emit increments n_comp — attention reads only
+                     * [0,n_comp)) so the captured graph has a fixed node
+                     * structure (no NodeTypeChanged → cudaGraphExecUpdate patches
+                     * it cheaply instead of re-instantiating per iter). n_comp++
+                     * stays emit-only, so decode output is bit-identical. */
+                    const bool stable_emit = getenv("DS4_GRAPH_STABLE_EMIT") != NULL;
+                    const bool do_emit = emit || (stable_emit && comp_row < g->layer_comp_cap[il]);
                     ok = kv_view && sc_view &&
                          ds4_gpu_compressor_update_tensor(kv_view,
                                                             sc_view,
@@ -12528,7 +12537,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             DS4_ROPE_YARN_BETA_FAST,
                                                             DS4_ROPE_YARN_BETA_SLOW,
                                                             DS4_RMS_EPS) != 0;
-                    if (ok && emit) {
+                    if (ok && do_emit) {
                         ds4_gpu_tensor *comp_row_view = metal_graph_attn_comp_row_view(g, il, comp_row);
                         ok = comp_row_view &&
                              ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view,
@@ -12797,6 +12806,12 @@ static bool metal_graph_encode_layer_attention_batch(
                         ds4_gpu_tensor *kv_view = metal_graph_tensor_row_view(g->batch_comp_kv, t, index_width);
                         ds4_gpu_tensor *sc_view = metal_graph_tensor_row_view(g->batch_comp_sc, t, index_width);
                         const uint32_t index_row = g->layer_n_index_comp[il];
+                        /* DS4_GRAPH_STABLE_EMIT: see the attn compressor above —
+                         * always-launch the indexer qat to the not-yet-live row
+                         * for a fixed captured node structure; n_index_comp++
+                         * stays emit-only (bit-identical output). */
+                        const bool stable_emit = getenv("DS4_GRAPH_STABLE_EMIT") != NULL;
+                        const bool do_emit = emit || (stable_emit && index_row < g->layer_comp_cap[il]);
                         ok = kv_view && sc_view &&
                              ds4_gpu_compressor_update_tensor(kv_view,
                                                                 sc_view,
@@ -12822,7 +12837,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                 DS4_ROPE_YARN_BETA_FAST,
                                                                 DS4_ROPE_YARN_BETA_SLOW,
                                                                 DS4_RMS_EPS) != 0;
-                        if (ok && emit) {
+                        if (ok && do_emit) {
                             ds4_gpu_tensor *index_row_view = ds4_gpu_tensor_view(
                                     g->layer_index_comp_cache[il],
                                     (uint64_t)index_row * DS4_N_INDEXER_HEAD_DIM * sizeof(float),
