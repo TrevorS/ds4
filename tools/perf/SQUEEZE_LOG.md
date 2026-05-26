@@ -132,6 +132,40 @@ sample as one graph, device-side accept via `cudaGraphCondTypeIf` per glint) so
 the per-iter host gap is reclaimed. Large build; next stage. Capture-infra (async
 clears, Relaxed mode, cuBLAS stream bind) is landed and reusable for it.
 
+### Stage 3 build — scout + two validation spikes (foundation laid)
+
+Scouted the exact device-residency surface for the whole-spec-iter capture. The
+per-iter host round-trip is **one** point, three coupled ops:
+1. **readback** `ds4_gpu_tensor_read(comp_selected → row_tops)` (`ds4.c:14338`),
+2. **accept compare** `commit` loop `row_tops[i-1]!=drafts[i]` (`ds4.c:19253-57`),
+3. **state advance** `checkpoint.len` / `mtp_n_raw` (`DS4_MTP_KEEP_ACCEPTED`) /
+   prefix1·prefix2 commit copies (`ds4.c:19300-19365`).
+
+Good news: the MTP verify path **already passes `pos0` as a kernel arg** where it
+matters — indexed-attn (`ds4_cuda.cu:7408+`), KV-store-batch (`6714`), compressor
+(`6770`). Only RoPE (`rope_tail_kernel`, 4 sites `ds4.c:9688/9715/9924/10076`)
+bakes scalar `pos0` and needs device-pointer conversion. The one *structural*
+blocker is the compressor count: `layer_n_comp[il]` is host-incremented after a
+**host-gated** emit (`emit=((pos+1)%ratio)==0`, `ds4_cuda.cu:6804` → `ds4.c:9816`),
+so device-side `pos` advance requires moving emit to a device `atomicAdd` counter
+(Phase 3, mandatory + invasive).
+
+Two spikes now validate the device-accept mechanism end-to-end on GB10/sm_121a,
+**before** touching the forward (production untouched):
+- **Phase 0** `tools/perf/cond_graph_spike.cu` — `cudaGraphCondTypeIf` +
+  device `cudaGraphSetConditional` fire drift-free (gated body exact over replays).
+- **Phase 1 keystone** `tools/perf/set_cond_from_accept_spike.cu` — the
+  `set_cond_from_accept_kernel` mirrors the host accept loop on-device (reads
+  device `row_tops[]`/`drafts[]`, computes `commit`, drives the IF cond from
+  `commit==draft_n`). **Differential vs host: commit-sum bit-exact + full-accept
+  tail gated exactly, over 10k replays (N=2 and N=3); compute-sanitizer memcheck
+  0 errors / racecheck 0 hazards.** This is the keystone that lets a captured
+  spec-iter decide accept-vs-rollback with no host round-trip.
+
+Next: device-resident `pos`/`mtp_n_raw`/`layer_n_comp[]` (ReplaySlot) + RoPE
+device-pos conversion + device-gated compressor emit, then wire the accept kernel
++ cond-node into the live (gated) MTP path, holding logit-exactness per phase.
+
 ## Bigger levers (owner-level — proposals, not done)
 
 The readily-available occupancy squeeze is extracted. Further decode gains need
