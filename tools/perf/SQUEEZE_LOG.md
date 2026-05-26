@@ -234,10 +234,22 @@ variation — the indexer compressor (ratio==4) has the same pattern, and attent
 kernel *selection* (online vs non-online) + grid dims shift as n_raw/n_comp grow
 (grid changes ExecUpdate tolerates; selection changes it does not).
 
+**Attempted the fix + measured (not inferred):** added `DS4_GRAPH_STABLE_EMIT`
+— always-launch the compressor quantize+commit to the not-yet-live row `n_comp`
+(harmless: attention reads only `[0,n_comp)`; row overwritten until a real emit
+increments), `n_comp++` stays emit-only.  Bit-identical confirmed (knight n=24).
+**Result: still `update_ok=0` / `NodeTypeChanged`** — stabilizing the emit does
+NOT make ExecUpdate succeed.  At least one more per-iter node-type source remains
+(NOT the prefix1/prefix2 snapshots — those are unconditional memcpys at fixed t).
+So topology-stabilization is an **open-ended multi-fix cascade**, not a single
+change: each barrier needs a fix+rebuild+measure cycle, and the residual ~−0.9 %
+(verify recording > its launch idle) caps the outcome near-neutral regardless.
+
 **Verdict (now empirical, not theorized):** the decode-replay capture is blocked
 by per-iter node-structure drift; stabilizing it is a multi-week, correctness-
 critical refactor of the shared compressor/attention path for a marginal ceiling
 (the verify isn't launch-bound; even with ExecUpdate fixed the upside is ~0–2 %).
+Measured the first fix (emit) — insufficient; the cascade has more barriers.
 The achievable, landed MTP gains are the **+10.9 % cascade** (N=3 combined-forward,
 already in baseline) and the **f16 prewarm ~2× prefill TTFT**. The cond-node
 device-accept (Phases 4-6) targets an even smaller slice. Recommendation: bank
