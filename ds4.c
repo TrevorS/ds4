@@ -19618,6 +19618,69 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
     return 0;
 }
 
+#ifndef DS4_NO_GPU
+/* Pre-populate the GPU Q8->f16 dense-weight cache that the prefill (n_tok>4)
+ * GEMM path fills lazily on first use per layer.  Profiled: the first prefill
+ * forward stalls ~218 ms across 344 synchronous cudaMalloc+dequant calls inside
+ * cuda_q8_f16_ptr (one per dense weight), all before the first decode token —
+ * pure time-to-first-token latency on a server's cold first request.  (Decode
+ * is unaffected: the combined-verify runs at n_tok<=4, which takes the share-
+ * warp path and never touches the f16 cache.)
+ *
+ * Driving the real, side-effect-free matmul (out = W.x; writes only the scratch
+ * out tensor, touches no KV/compressor/session state) over every dense weight
+ * at n_tok=8 warms exactly the caches prefill will reuse.  n_tok MUST exceed 4:
+ * at n_tok in [2,4] cuda_matmul_q8_0_tensor_labeled takes the share-warp path
+ * and returns before reaching the f16 cuBLAS path, so it would create no f16
+ * entry.  The f16 cache is keyed by weight offset/dims, not n_tok, so the
+ * n_tok=8 entries are exactly what prefill's larger batches reuse.  Opt out:
+ * DS4_NO_F16_PREWARM. */
+static void metal_graph_prewarm_one_f16(const ds4_model *model, const ds4_tensor *w,
+                                        int *warmed) {
+    if (!w || w->type != DS4_TENSOR_Q8_0 || w->ndim != 2) return;
+    /* Pass the weight's real name as the label so cuda_q8_f16_cache_allowed
+     * (which keys on substrings like attn_output_a / attn_q_b / ffn_*_shexp)
+     * admits exactly the weights the runtime would.  ds4_str is not guaranteed
+     * NUL-terminated, so copy into a bounded buffer. */
+    char label[128];
+    size_t n = w->name.len < sizeof(label) - 1 ? w->name.len : sizeof(label) - 1;
+    memcpy(label, w->name.ptr, n);
+    label[n] = '\0';
+    if (ds4_gpu_prewarm_q8_f16(model->map, model->size, w->abs_offset,
+                               w->dim[0], w->dim[1], label) != 0) {
+        (*warmed)++;
+    }
+}
+
+static void metal_graph_prewarm_dense_f16(const ds4_model *model,
+                                           const ds4_weights *weights) {
+    if (!model || !weights || getenv("DS4_NO_F16_PREWARM")) return;
+
+    /* Every dense Q8_0 projection the prefill (n_tok>1) GEMM path may f16-cache,
+     * plus the output head.  The admission policy (keyed on weight name) decides
+     * which actually get an f16 entry; the rest stay on the native Q8 path and
+     * metal_graph_prewarm_one_f16 leaves them untouched.  (Routed MoE experts
+     * use dedicated moe_* kernels, not this path.) */
+    const double t0 = now_sec();
+    int warmed = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *L = &weights->layer[il];
+        metal_graph_prewarm_one_f16(model, L->attn_q_a,      &warmed);
+        metal_graph_prewarm_one_f16(model, L->attn_q_b,      &warmed);
+        metal_graph_prewarm_one_f16(model, L->attn_kv,       &warmed);
+        metal_graph_prewarm_one_f16(model, L->attn_output_a, &warmed);
+        metal_graph_prewarm_one_f16(model, L->attn_output_b, &warmed);
+        metal_graph_prewarm_one_f16(model, L->ffn_gate_shexp,&warmed);
+        metal_graph_prewarm_one_f16(model, L->ffn_up_shexp,  &warmed);
+        metal_graph_prewarm_one_f16(model, L->ffn_down_shexp,&warmed);
+    }
+    metal_graph_prewarm_one_f16(model, weights->output, &warmed);
+    (void)ds4_gpu_synchronize();
+    fprintf(stderr, "ds4: prewarmed %d dense-weight f16 caches in %.3fs\n",
+            warmed, now_sec() - t0);
+}
+#endif
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
@@ -19827,6 +19890,17 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));
+        /* Front-load the Q8->f16 dense-weight cache the prefill (n_tok>1) GEMM
+         * path fills lazily, so the first prefill doesn't stall ~2s across
+         * hundreds of synchronous cudaMalloc+dequant calls (cuts time-to-first-
+         * token ~2x; see metal_graph_prewarm_dense_f16).  Prefill uses this
+         * path with or without MTP, so it is not gated on mtp_ready.  Gated on
+         * warm_weights (the server sets it unconditionally; CLI/bench opt in via
+         * --warm-weights) so it ties to the existing "accept slow startup for
+         * steady-state speed" intent and doesn't add ~2 s to every CLI launch. */
+        if (e->backend == DS4_BACKEND_CUDA && opt->warm_weights) {
+            metal_graph_prewarm_dense_f16(&e->model, &e->weights);
+        }
     }
 #else
     if (graph_backend) {

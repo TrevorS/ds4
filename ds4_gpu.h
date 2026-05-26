@@ -157,6 +157,14 @@ int ds4_gpu_matmul_q8_0_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Eagerly populate the Q8->f16 dense-weight cache for one weight (alloc+dequant
+ * the prefill path otherwise pays lazily).  `label` must be the weight's real
+ * name so the cache-admission policy selects the same weights as at runtime.
+ * Launches on the default stream; synchronize when the batch is done. */
+int ds4_gpu_prewarm_q8_f16(const void *model_map, uint64_t model_size,
+                           uint64_t weight_offset, uint64_t in_dim,
+                           uint64_t out_dim, const char *label);
+
 /* Pair-fused Q8_0 matmul: two weight matrices share a single prequantize of x
  * and one warp-of-8 kernel launch.  out0/out1 can have asymmetric output
  * dimensions (e.g. Q_A and KV_A in DSV4).  Falls back to two sequential
