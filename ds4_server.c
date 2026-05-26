@@ -11387,7 +11387,7 @@ static server_config parse_options(int argc, char **argv) {
         .engine = {
             .model_path = "ds4flash.gguf",
             .backend = default_server_backend(),
-            .mtp_draft_tokens = 1,
+            .mtp_draft_tokens = 2,
             .mtp_margin = 3.0f,
         },
         .host = "127.0.0.1",
