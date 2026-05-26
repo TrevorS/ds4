@@ -1571,15 +1571,37 @@ extern "C" int ds4_gpu_graph_capture_update_launch(void) {
     cudaGraph_t graph = NULL;
     if (!cuda_ok(cudaStreamEndCapture(cudaStreamPerThread, &graph), "end capture")) return 0;
     int need_inst = (g_decode_exec == NULL);
+    int update_reason = 0;  /* 0=ok, 1=cold, 2=update-failed-reinstantiate */
+    if (need_inst) update_reason = 1;
     if (!need_inst) {
         cudaGraphExecUpdateResultInfo info;
         memset(&info, 0, sizeof(info));
         cudaError_t e = cudaGraphExecUpdate(g_decode_exec, graph, &info);
         if (e != cudaSuccess) { /* topology changed → re-instantiate */
             cudaGetLastError();
+            if (getenv("DS4_GRAPH_CAPTURE_STATS")) {
+                static int once = 0;
+                if (!once) { once = 1;
+                    fprintf(stderr, "ds4: ExecUpdate FAIL result=%d (1=fn,2=topology,3=nodetype,"
+                            "4=unsupported,5=params,6=notDeleted,7=attrs) errNode=%p\n",
+                            (int)info.result, (void *)info.errorNode); }
+            }
             cudaGraphExecDestroy(g_decode_exec); g_decode_exec = NULL;
             need_inst = 1;
+            update_reason = 2;
         }
+    }
+    /* Crux instrumentation: is the per-iter cost cheap ExecUpdate, or forced
+     * re-instantiate (topology drift)?  DS4_GRAPH_CAPTURE_STATS prints a tally. */
+    if (getenv("DS4_GRAPH_CAPTURE_STATS")) {
+        static unsigned n_update_ok = 0, n_reinst = 0, n_cold = 0;
+        if (update_reason == 0) n_update_ok++;
+        else if (update_reason == 1) n_cold++;
+        else n_reinst++;
+        fprintf(stderr, "ds4: capture %s | tally update_ok=%u reinstantiate=%u cold=%u\n",
+                update_reason == 0 ? "EXECUPDATE(cheap)" :
+                update_reason == 1 ? "COLD-instantiate" : "REINSTANTIATE(topology drift)",
+                n_update_ok, n_reinst, n_cold);
     }
     int ok = 1;
     if (need_inst) ok = cuda_ok(cudaGraphInstantiate(&g_decode_exec, graph, 0), "instantiate");
