@@ -6287,6 +6287,27 @@ extern "C" int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model
                                            in_dim, out_dim, x, n_tok, "q8_0");
 }
 
+/* Eagerly populate the Q8->f16 dense-weight cache for one weight, matching the
+ * lazy population the n_tok>1 matmul path does on first use.  `label` must be
+ * the weight's real name (e.g. "blk.0.attn_output_a.weight") so the
+ * cuda_q8_f16_cache_allowed policy (which keys on label substrings like
+ * attn_output_a / attn_q_b / ffn_*_shexp) selects the same weights it would at
+ * runtime.  Returns 1 if a cache entry now exists for this weight, else 0 (e.g.
+ * the policy keeps this weight on the native Q8 path).  No GEMM, no scratch —
+ * just the alloc+dequant the runtime would otherwise pay lazily during prefill.
+ * Launches on the default stream; caller should synchronize when done. */
+extern "C" int ds4_gpu_prewarm_q8_f16(const void *model_map, uint64_t model_size,
+                                      uint64_t weight_offset, uint64_t in_dim,
+                                      uint64_t out_dim, const char *label) {
+    if (!model_map || in_dim == 0 || out_dim == 0 || !g_cublas_ready) return 0;
+    const uint64_t blocks = (in_dim + 31) / 32;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34)) return 0;
+    const uint64_t weight_bytes = out_dim * blocks * 34;
+    if (weight_bytes > model_size - weight_offset) return 0;
+    if (!cuda_q8_f16_cache_allowed(label, in_dim, out_dim)) return 0;
+    return cuda_q8_f16_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label) != NULL;
+}
+
 extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
         ds4_gpu_tensor *out0,
         ds4_gpu_tensor *out1,

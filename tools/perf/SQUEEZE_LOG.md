@@ -204,6 +204,38 @@ Phase-0/Phase-1 cond-node spikes stay as validated foundation for the residual
 sync IF a future workload (large N, batched serving) makes the accept round-trip
 dominate — but this profile says it doesn't today.
 
+### Stage 3 — CORRECTION: the warmup is PREFILL, not decode (+97% prefill landed)
+
+The first profile windowed "steady decode" as "after the last >20 ms gap" — but
+there's no >20 ms gap between model-cache-prep and the prefill forward, so the
+window **included prefill's tail**.  Re-windowed strictly after the first
+`embed_token_hc` (the real first decode token, 1098 ms in): **all 344
+`dequant_q8_0_to_f16` fire in prefill (367–1095 ms), ZERO in decode.** True
+decode idle is 7.7 % (192 ms), 156 ms of it sub-5 µs launch latency — the
+whole-iter-capture lever, unchanged conclusion.
+
+The 344 f16 dequants are **prefill** lazily filling the Q8->f16 dense-weight
+cache (`cuda_q8_f16_ptr`: per-weight `cudaMalloc`+dequant, first n_tok>4 use).
+Decode-verify runs at n_tok<=4 → share-warp path → never touches f16.  So the
+warmup is pure **time-to-first-token**, not decode.
+
+**Landed: `metal_graph_prewarm_dense_f16`** (engine-open, CUDA, gated on
+`warm_weights` — server sets it unconditionally, CLI/bench opt in via
+`--warm-weights`, so default CLI keeps fast launch).  Eagerly populates the f16
+cache for every dense Q8_0 weight via a new
+`ds4_gpu_prewarm_q8_f16(…, label)` that calls `cuda_q8_f16_ptr` directly (no
+GEMM/scratch).  Passing the weight's real name as the label is required: the
+admission policy `cuda_q8_f16_cache_allowed` keys on substrings
+(`attn_output_a`/`attn_q_b`/`ffn_*_shexp`) — the generic "q8_0" label admitted
+only 258/344 (the dims-allowlisted ones), missing the 86 attn_output_a/b
+(4096×8192 / 8192×4096, not in the dims list).  With real names: 344/344, 0 lazy.
+
+**Result: prefill 7.6 → 15.0 t/s (+97 %), MTP and non-MTP alike; decode
+unchanged (19.8); output bit-identical (n=24).**  Cost: ~2.8 s one-time at load
+(front-loads the same 10.8 GB f16 cache prefill builds lazily anyway — no extra
+HBM, just moved off the timed prefill).  Clear win for the server (cold-start /
+TTFT) and long-context prefill; opt out with DS4_NO_F16_PREWARM.
+
 ## Bigger levers (owner-level — proposals, not done)
 
 The readily-available occupancy squeeze is extracted. Further decode gains need
