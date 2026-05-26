@@ -38,6 +38,11 @@ int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
+#ifdef DS4_GRAPH_DECODE_BUILD
+int ds4_gpu_graph_capture_begin(void);
+int ds4_gpu_graph_capture_replay(void);
+int ds4_gpu_graph_capture_update_launch(void);
+#endif
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
@@ -660,7 +665,8 @@ int ds4_gpu_router_select_tensor(
         uint32_t                n_group_used,
         bool                    has_bias,
         bool                    hash_mode,
-        const ds4_gpu_tensor *logits);
+        const ds4_gpu_tensor *logits,
+        const ds4_gpu_tensor *dev_token);
 
 int ds4_gpu_router_select_batch_tensor(
         ds4_gpu_tensor       *selected,
