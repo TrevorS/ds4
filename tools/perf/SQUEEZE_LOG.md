@@ -166,6 +166,44 @@ Next: device-resident `pos`/`mtp_n_raw`/`layer_n_comp[]` (ReplaySlot) + RoPE
 device-pos conversion + device-gated compressor emit, then wire the accept kernel
 + cond-node into the live (gated) MTP path, holding logit-exactness per phase.
 
+### Stage 3 — PROFILE recalibration: device-accept is NOT the gain lever
+
+Before building the device-resident refactor, profiled the live eager MTP decode
+(`nsys -t cuda`, knight n=48, 19.63 t/s, ~104 ms/iter, ~2 tok/iter). Steady-state
+idle is **15.7% (470 ms)**, and it splits decisively:
+
+- **One-time cuBLAS-f16 warmup — ~218 ms, ~128 per-layer gaps (~1.7 ms each), ALL
+  in the first 494 ms of decode, none after.** Cause: `cuda_q8_f16_ptr`
+  (`ds4_cuda.cu:6200`) lazily dequantizes each Q8_0 weight → cached f16 buffer on
+  first f16-GEMM use (alloc + `dequant_q8_0_to_f16_kernel`). Amortized over any
+  real multi-response session; pre-warming only relocates it load→decode, no
+  wall-clock gain. **Not a recurring lever.**
+- **Recurring launch latency — 156 ms = 6.3%** (71.8k sub-5 µs gaps, post-warmup),
+  spread across the WHOLE iter: `quantize_q8_0` 18.5, cutlass 15.3, cublasLt
+  splitKreduce 15.0, `share_warp` 13.7, `f32_to_f16` 9.6, rope/rms/compressor …
+  i.e. both draft-gen AND the N=3 verify GEMM-prep sequences.
+- **Host accept round-trip — small** (only 14 of 48 token boundaries showed a big
+  `argmax→embed` gap; one end-of-iter sync).
+
+**Conclusion: the whole-spec-iter device-accept (cond-node, Phases 1-6) targets
+only the residual one-sync-per-iter — not justified.** The real 6.3% is plain
+launch latency, reclaimable with the SAME re-capture + `ExecUpdate` machinery that
+landed the +5% plain-greedy win — drift-free (re-capture resets the executor),
+bit-correct (host accept unchanged), no device-resident `pos`/cond-node needed.
+The earlier verify-only capture got −2.3% because it wrapped just the verify
+layer-batch (few, large kernels → ExecUpdate overhead > gap savings); capturing
+the WHOLE iter amortizes ExecUpdate over draft-gen's many small kernels too.
+
+Prereq: draft-gen does a host `top_id` readback BETWEEN draft steps (`ds4.c:13442`)
+to chain — that mid-iter sync blocks one-graph capture. Step 1 = device-chain
+draft-gen (Stage-2 device-token trick: argmax→`comp_selected`→device embed/router,
+read drafts back once at iter end). Independently a bit-correct win (removes N-1
+syncs/iter). Then capture the whole iter (draft-gen + verify) with re-capture.
+
+Phase-0/Phase-1 cond-node spikes stay as validated foundation for the residual
+sync IF a future workload (large N, batched serving) makes the accept round-trip
+dominate — but this profile says it doesn't today.
+
 ## Bigger levers (owner-level — proposals, not done)
 
 The readily-available occupancy squeeze is extracted. Further decode gains need
