@@ -1514,10 +1514,14 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
         return 0;
     }
     if (bytes == 0) return 1;
-    return cuda_ok(cudaMemcpy((char *)dst->ptr + dst_offset,
-                              (const char *)src->ptr + src_offset,
-                              (size_t)bytes,
-                              cudaMemcpyDeviceToDevice),
+    /* Async D2D on the default stream so it's capturable (prefix1/prefix2 spec
+     * rollback snapshots run inside the captured verify forward); stream-ordered
+     * with surrounding kernels, and host reads are gated by end_commands sync,
+     * so production behavior is unchanged. */
+    return cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
+                                   (const char *)src->ptr + src_offset,
+                                   (size_t)bytes,
+                                   cudaMemcpyDeviceToDevice, 0),
                    "tensor copy");
 }
 
@@ -1532,8 +1536,13 @@ extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(
  * token here (decode graph geometry varies with the compressor/indexer cadence),
  * which is fine for the correctness/drift probe; Stage 2 caches/updates execs. */
 extern "C" int ds4_gpu_graph_capture_begin(void) {
+    /* Relaxed mode: tolerate library (cuBLAS) workspace pool allocs during
+     * capture without aborting it — required for the n_tok>1 cuBLAS verify path
+     * (pre-warm cuBLAS so steady-state has no alloc anyway). Bind cuBLAS to the
+     * capture (per-thread) stream so its GEMMs are recorded into the graph. */
+    if (g_cublas_ready) (void)cublasSetStream(g_cublas, cudaStreamPerThread);
     return cuda_ok(cudaStreamBeginCapture(cudaStreamPerThread,
-                                          cudaStreamCaptureModeThreadLocal),
+                                          cudaStreamCaptureModeRelaxed),
                    "graph begin capture");
 }
 extern "C" int ds4_gpu_graph_capture_replay(void) {
@@ -10966,7 +10975,10 @@ static int routed_moe_launch(
                 tile16_total = use_down_tile16 ? (uint32_t *)(scratch + tile16_total_off) : NULL;
                 tile16_experts = use_down_tile16 ? (uint32_t *)(scratch + tile16_experts_off) : NULL;
                 tile16_starts = use_down_tile16 ? (uint32_t *)(scratch + tile16_starts_off) : NULL;
-                ok = cuda_ok(cudaMemset(counts, 0, counts_bytes), "routed_moe sorted counts clear");
+                /* Async on the default stream (= per-thread under the graph build)
+                 * so it's capturable; stream-ordered identically to the kernels
+                 * that follow, so production behavior is unchanged. */
+                ok = cuda_ok(cudaMemsetAsync(counts, 0, counts_bytes, 0), "routed_moe sorted counts clear");
                 if (ok) {
                     moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(
                         counts,

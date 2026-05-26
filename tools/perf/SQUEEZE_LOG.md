@@ -107,6 +107,31 @@ capture-once-style *launch* (graph collapses 73k host-launch gaps) + cheap
 per-token ExecUpdate. Scope to extend: the MTP/session decode path (this is wired
 into the plain-greedy CLI loop only).
 
+### Stage 3 — MTP combined-forward capture: bit-correct, but not yet a gain
+
+Reviewed ds4-spark/glint/llama.cpp first (the sm_121a captured-graph "drift bible"
+warns capture-replay drifts and greedy masks it). **Verified my own greedy win is
+NOT masked: 31/31 logit vectors bit-EXACT vs eager (worst |Δ|=0).** My re-capture
+(resets executor state, the drift-free property ds4-spark found) + cheap ExecUpdate
+(not their slow re-instantiate) is why.
+
+Wired capture into the n_tok=3 combined verify forward (`metal_graph_verify_suffix_tops`).
+Two capture-blockers fixed (both sync ops → async, stream-ordered so production
+unchanged): `routed_moe sorted counts clear` cudaMemset→cudaMemsetAsync; the
+prefix-snapshot `tensor_copy` cudaMemcpy→cudaMemcpyAsync. cuBLAS captures fine in
+`cudaStreamCaptureModeRelaxed` with the handle bound to the per-thread stream.
+
+**Result: tokens AND accept-rate identical (24/44 eager == graph) — bit-correct
+even on the accept-sensitive MTP path (no drift). But −2.3% (18.94 vs 19.38).**
+The n_tok=3 verify isn't launch-latency-bound (bigger kernels), and the real MTP
+idle is BETWEEN spec-iters (eager draft-gen + host accept), not in the verify.
+Gated off (`DS4_GRAPH_MTP_VERIFY`, opt-in); kept as drift-validation + scaffolding.
+
+**The real MTP gain needs the whole-spec-iter capture** (draft-gen + verify +
+sample as one graph, device-side accept via `cudaGraphCondTypeIf` per glint) so
+the per-iter host gap is reclaimed. Large build; next stage. Capture-infra (async
+clears, Relaxed mode, cuBLAS stream bind) is landed and reusable for it.
+
 ## Bigger levers (owner-level — proposals, not done)
 
 The readily-available occupancy squeeze is extracted. Further decode gains need
