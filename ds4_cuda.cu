@@ -1526,6 +1526,60 @@ extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchroni
 extern "C" int ds4_gpu_end_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "end commands"); }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
+#ifdef DS4_GRAPH_DECODE_BUILD
+/* CUDA-graph decode (Stage 1, non-strict, experimental). Capture the per-token
+ * forward on the per-thread stream, then instantiate+replay. Re-captured every
+ * token here (decode graph geometry varies with the compressor/indexer cadence),
+ * which is fine for the correctness/drift probe; Stage 2 caches/updates execs. */
+extern "C" int ds4_gpu_graph_capture_begin(void) {
+    return cuda_ok(cudaStreamBeginCapture(cudaStreamPerThread,
+                                          cudaStreamCaptureModeThreadLocal),
+                   "graph begin capture");
+}
+extern "C" int ds4_gpu_graph_capture_replay(void) {
+    cudaGraph_t graph = NULL;
+    if (!cuda_ok(cudaStreamEndCapture(cudaStreamPerThread, &graph),
+                 "graph end capture")) return 0;
+    cudaGraphExec_t exec = NULL;
+    if (!cuda_ok(cudaGraphInstantiate(&exec, graph, 0), "graph instantiate")) {
+        cudaGraphDestroy(graph);
+        return 0;
+    }
+    int ok = cuda_ok(cudaGraphLaunch(exec, cudaStreamPerThread), "graph launch");
+    if (ok) ok = cuda_ok(cudaStreamSynchronize(cudaStreamPerThread), "graph sync");
+    cudaGraphExecDestroy(exec);
+    cudaGraphDestroy(graph);
+    return ok;
+}
+
+/* Persistent instantiated exec, patched per token via cudaGraphExecUpdate. */
+static cudaGraphExec_t g_decode_exec = NULL;
+/* End capture and patch the cached exec via cudaGraphExecUpdate (cheap, no
+ * re-instantiate) so a re-recorded graph with this token's pos/kv params reuses
+ * the instantiated exec. Falls back to full instantiate if topology changed.
+ * Then launch (no sync). Measures whether re-capture+update beats eager. */
+extern "C" int ds4_gpu_graph_capture_update_launch(void) {
+    cudaGraph_t graph = NULL;
+    if (!cuda_ok(cudaStreamEndCapture(cudaStreamPerThread, &graph), "end capture")) return 0;
+    int need_inst = (g_decode_exec == NULL);
+    if (!need_inst) {
+        cudaGraphExecUpdateResultInfo info;
+        memset(&info, 0, sizeof(info));
+        cudaError_t e = cudaGraphExecUpdate(g_decode_exec, graph, &info);
+        if (e != cudaSuccess) { /* topology changed → re-instantiate */
+            cudaGetLastError();
+            cudaGraphExecDestroy(g_decode_exec); g_decode_exec = NULL;
+            need_inst = 1;
+        }
+    }
+    int ok = 1;
+    if (need_inst) ok = cuda_ok(cudaGraphInstantiate(&g_decode_exec, graph, 0), "instantiate");
+    if (ok) ok = cuda_ok(cudaGraphLaunch(g_decode_exec, cudaStreamPerThread), "graph launch");
+    cudaGraphDestroy(graph);
+    return ok;
+}
+#endif
+
 static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
     cuda_model_range_release_all();
@@ -8053,10 +8107,14 @@ extern "C" int ds4_gpu_directional_steering_project_tensor(
             scale);
     return cuda_ok(cudaGetLastError(), "directional steering launch");
 }
-extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits) {
+extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits, const ds4_gpu_tensor *dev_token) {
     if (!selected || !weights || !probs || !logits || !model_map || n_expert_groups > 1u || n_group_used > 0u) return 0;
     if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
     int32_t tok = (int32_t)token;
+    /* Device-token decode (CUDA-graph Stage 2): read the token id from a device
+     * buffer instead of the host scalar, so the per-token forward needs no host
+     * round-trip. The router kernels already select tokens[t] when non-NULL. */
+    const int32_t *dev_tok_ptr = dev_token ? (const int32_t *)dev_token->ptr : NULL;
     int ok = 1;
     const float *bias = NULL;
     const int32_t *hash = NULL;
@@ -8076,15 +8134,15 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
             getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
             dim3 block(32, 4, 1);
             router_select_warp_topk_kernel<<<1, block>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
-                                                         bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
+                                                         bias, hash, (const float *)logits->ptr, dev_tok_ptr, tok, hash_rows, 1,
                                                          has_bias && !hash_mode, hash_mode);
         } else if (getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
             router_select_parallel_kernel<<<1, 256>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
-                                                      bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
+                                                      bias, hash, (const float *)logits->ptr, dev_tok_ptr, tok, hash_rows, 1,
                                                       has_bias && !hash_mode, hash_mode);
         } else {
             router_select_kernel<<<1, 1>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
-                                          bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
+                                          bias, hash, (const float *)logits->ptr, dev_tok_ptr, tok, hash_rows, 1,
                                           has_bias && !hash_mode, hash_mode);
         }
         ok = cuda_ok(cudaGetLastError(), "router_select launch");

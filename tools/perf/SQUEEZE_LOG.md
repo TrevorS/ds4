@@ -89,13 +89,23 @@ no win. Stage 2 (device-token, no per-token sync) only removed the ~80µs/token
 boundary gap (2% of idle), not the intra-forward launch latency. The win needs
 **capture-once + launch-cached** (proven above).
 
-**Remaining work for a CORRECT +6.5% (the real Stage 2):** a single cached graph
-bakes per-token-varying state — pos/raw_row (KV slot), kv_len (attention grid),
-the 4-token compressor cadence, indexer n_comp grid. The TOKEN already flows
-device-side (comp_selected) so it needs no update. The varying nodes need either
-(a) per-token cudaGraphExecKernelNodeSetParams (no re-record), or (b) fixed-max
-grids + device-resident pos/kv so one graph serves all tokens. Substantial but
-now justified by the measured +6.5%.
+**DONE — correct +5% landed.** The winning recipe (`DS4_GRAPH_DECODE=1`,
+plain-greedy): each token, re-capture the device-token forward, patch the cached
+exec via **`cudaGraphExecUpdate`** (cheap — falls back to re-instantiate only on
+topology change: compressor emit / indexer growth), launch as ONE submit, no
+per-token sync. Two surprises that broke my earlier "dead end":
+1. Recording 1562 kernels in capture mode is **cheaper** than eager-launching them.
+2. `ExecUpdate` (vs the 1.67ms instantiate Stage 1 used) is cheap enough per token.
+
+Measured: knight n=48 **16.50→17.41 t/s (+5.5%)**; essay n=192
+**16.04→16.86 (+5.1%)** — both **BIT-IDENTICAL** to eager. Ceiling (launch cached,
+no re-capture, wrong output) is 17.55 (+6.5%); re-capture costs ~1%.
+
+**Lesson: I twice declared "dead end" prematurely.** Stage 1 (re-instantiate/token)
+and Stage 2-eager (device-token, no graph) each tested only half; the win needed
+capture-once-style *launch* (graph collapses 73k host-launch gaps) + cheap
+per-token ExecUpdate. Scope to extend: the MTP/session decode path (this is wired
+into the plain-greedy CLI loop only).
 
 ## Bigger levers (owner-level — proposals, not done)
 

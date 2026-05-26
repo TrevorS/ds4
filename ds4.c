@@ -9339,6 +9339,10 @@ typedef struct {
     ds4_gpu_tensor *indexer_scores;
     ds4_gpu_tensor *comp_mask;
     ds4_gpu_tensor *comp_selected;
+    /* CUDA-graph Stage 2: when non-NULL, decode layers' router reads the token
+     * id from this device buffer instead of the host scalar (set per device-token
+     * forward, NULL otherwise). */
+    ds4_gpu_tensor *decode_dev_token;
     ds4_gpu_tensor *heads;
     ds4_gpu_tensor *attn_low;
     ds4_gpu_tensor *attn_out;
@@ -11275,7 +11279,8 @@ static bool metal_graph_encode_decode_layer(
                                                 0,
                                                 layer->ffn_exp_probs_b != NULL,
                                                 layer->ffn_gate_tid2eid != NULL,
-                                                g->router_logits) != 0;
+                                                g->router_logits,
+                                                g->decode_dev_token) != 0;
     DS4_METAL_PROFILE_DECODE_STAGE("router");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_logits", g->router_logits, DS4_N_EXPERT, il, pos);
@@ -12333,6 +12338,39 @@ static bool metal_graph_encode_token_raw_swa(
     }
     return ok;
 }
+
+#ifdef DS4_GRAPH_DECODE_BUILD
+/* CUDA-graph Stage 2: one device-token decode forward. The current token id is
+ * read from g->comp_selected (device) by both embed and router, and the next
+ * token's argmax is written back to g->comp_selected — no host round-trip, so
+ * the host can pipeline many of these without a per-token sync. Non-strict,
+ * plain-greedy only. Bit-identical to the eager forward (same kernels). */
+static bool metal_graph_decode_step_devtok(
+        ds4_gpu_graph *g, const ds4_model *model, const ds4_weights *weights,
+        uint32_t pos, ds4_gpu_tensor *in_tok, ds4_gpu_tensor *out_tok) {
+    if (g->raw_cap == 0) return false;
+    const uint32_t raw_row = pos % g->raw_cap;
+    const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
+    /* embed + router read the current token id from in_tok (device int32, n=1) */
+    bool ok = ds4_gpu_embed_tokens_hc_tensor(g->cur_hc, in_tok,
+                                             model->map, model->size,
+                                             weights->token_embd->abs_offset,
+                                             (uint32_t)weights->token_embd->dim[1],
+                                             1, DS4_N_EMBD, DS4_N_HC) != 0;
+    g->decode_dev_token = in_tok;  /* layer router reads token device-side */
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        ok = metal_graph_encode_decode_layer(g, model, &weights->layer[il], il, pos,
+                                             g->layer_raw_cache[il], g->raw_cap,
+                                             raw_row, n_raw, 0 /*token via decode_dev_token*/);
+        ds4_gpu_tensor *tmp = g->cur_hc; g->cur_hc = g->after_ffn_hc; g->after_ffn_hc = tmp;
+    }
+    g->decode_dev_token = NULL;
+    if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+    /* device argmax → out_tok (next token); no host readback, stays on stream */
+    if (ok) ok = ds4_gpu_argmax_tensor(out_tok, g->logits, DS4_N_VOCAB) != 0;
+    return ok;
+}
+#endif
 
 static ds4_gpu_tensor *metal_graph_tensor_row_view(
         ds4_gpu_tensor *base,
@@ -14297,6 +14335,23 @@ static bool metal_graph_eval_token_raw_swa(
     const bool profile = getenv("DS4_METAL_GRAPH_TOKEN_PROFILE") != NULL;
     const bool throttle = graph_power_throttle_enabled(g);
     const double t0 = (profile || throttle) ? now_sec() : 0.0;
+
+#ifdef DS4_GRAPH_DECODE_BUILD
+    /* Stage 1 CUDA-graph decode (non-strict, experimental): capture the
+     * per-token forward on the per-thread stream and replay it, instead of an
+     * eager launch. Requires DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS=0 (no mid-forward
+     * sync, which would break capture). Re-captured each token. */
+    if (getenv("DS4_GRAPH_DECODE")) {
+        bool gok = ds4_gpu_graph_capture_begin() != 0;
+        if (gok) gok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL, true);
+        if (gok) gok = ds4_gpu_graph_capture_replay() != 0;
+        if (gok && logits) {
+            gok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+        }
+        if (!gok) (void)ds4_gpu_synchronize();
+        return gok;
+    }
+#endif
 
     bool ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL, true);
@@ -17138,6 +17193,61 @@ static int generate_metal_graph_raw_swa(
     int n_generated = 0;
     int n_decode_eval = 0;
     const double t_decode0 = now_sec();
+#ifdef DS4_GRAPH_DECODE_BUILD
+    /* CUDA-graph Stage 2: device-token pipelined decode (non-strict, plain-greedy
+     * only). The token flows GPU→GPU via comp_selected, so the host issues all
+     * forwards without a per-token sync, logs each token device-side, then syncs
+     * once and emits (trimming at EOS). Bit-identical to the eager loop. */
+    if (getenv("DS4_GRAPH_DECODE")) {
+        int token = sample_argmax(logits, DS4_N_VOCAB);  /* first token (host, once) */
+        int32_t seed = (int32_t)token;
+        /* token_log[i] holds token (i+2); the chain reads slot i-1 and writes slot
+         * i, so each forward feeds the next entirely on the stream — no per-token
+         * host sync. We need n_predict-1 more tokens after the first. */
+        int n_slots = n_predict > 0 ? n_predict : 0;
+        ds4_gpu_tensor *tok_log = ds4_gpu_tensor_alloc((uint64_t)(n_slots > 0 ? n_slots : 1) * sizeof(int32_t));
+        ds4_gpu_tensor **slot = (ds4_gpu_tensor **)calloc((size_t)(n_slots > 0 ? n_slots : 1), sizeof(*slot));
+        bool gok = tok_log != NULL && slot != NULL &&
+                   ds4_gpu_tensor_write(g.comp_selected, 0, &seed, sizeof(seed)) != 0;
+        ds4_gpu_tensor *prev = g.comp_selected;  /* holds token1 */
+        /* The win (+5%, bit-identical): each token, re-capture the device-token
+         * forward, patch the cached exec via cudaGraphExecUpdate (cheap — not a
+         * re-instantiate), and launch it as ONE submit. Recording 1562 kernels in
+         * capture mode is cheaper than eager-launching them, and the single graph
+         * launch collapses the per-kernel host-launch gaps. No per-token sync.
+         * DS4_GRAPH_NO_UPDATE falls back to eager device-token launches. */
+        const int eager_burst = getenv("DS4_GRAPH_NO_UPDATE") != NULL;
+        int n_burst = 0;
+        for (int i = 0; gok && i < n_slots - 1 && pos < ctx_size; i++) {
+            if (pos + 1 >= ctx_size) break;
+            slot[i] = ds4_gpu_tensor_view(tok_log, (uint64_t)i * sizeof(int32_t), sizeof(int32_t));
+            if (!slot[i]) { gok = false; break; }
+            if (!eager_burst) gok = ds4_gpu_graph_capture_begin() != 0;
+            if (gok) gok = metal_graph_decode_step_devtok(&g, model, weights, (uint32_t)pos, prev, slot[i]);
+            if (gok && !eager_burst) gok = ds4_gpu_graph_capture_update_launch() != 0;
+            prev = slot[i];
+            pos++; n_burst++;
+        }
+        if (gok) gok = ds4_gpu_synchronize() != 0;  /* single sync for the whole burst */
+        int32_t *logbuf = (int32_t *)malloc((size_t)(n_burst > 0 ? n_burst : 1) * sizeof(int32_t));
+        if (gok && logbuf && n_burst > 0)
+            gok = ds4_gpu_tensor_read(tok_log, 0, logbuf, (uint64_t)n_burst * sizeof(int32_t)) != 0;
+        if (gok && token != vocab->eos_id) {
+            if (emit) emit(emit_ud, token);
+            n_generated++;
+            for (int i = 0; i < n_burst; i++) {
+                if (logbuf[i] == vocab->eos_id) break;
+                if (emit) emit(emit_ud, logbuf[i]);
+                n_generated++;
+            }
+        }
+        free(logbuf);
+        for (int i = 0; i < n_slots; i++) if (slot && slot[i]) ds4_gpu_tensor_free(slot[i]);
+        free(slot);
+        if (tok_log) ds4_gpu_tensor_free(tok_log);
+        ok = gok;
+    } else
+#endif
     for (int i = 0; i < n_predict && pos < ctx_size; i++) {
         if (trace_top) {
             char label[64];
