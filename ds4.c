@@ -14610,17 +14610,40 @@ static bool metal_graph_verify_suffix_tops(
      * after it (the N=3 cascaded-MTP commit==1 rewind target). */
     g->spec_capture_prefix2 = capture_prefix1 && n_tokens >= 3;
 
-    ok = ds4_gpu_begin_commands() != 0;
-    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        ok = metal_graph_encode_layer_batch(g,
-                                            model,
-                                            &weights->layer[il],
-                                            il,
-                                            start,
-                                            n_tokens);
+    /* Stage 3: capture the n_tok>1 combined verify forward as a CUDA graph
+     * (re-capture + ExecUpdate + one launch), same proven-bit-exact mechanism as
+     * plain-greedy decode. Gated DS4_GRAPH_DECODE, non-strict. Host accept logic
+     * stays after the forward (synced via the output-head end_commands below). */
+    /* Verify-only capture is bit-correct (tokens + accept-rate identical) but a
+     * net loss (~-2%): the n_tok>1 verify isn't launch-latency-bound, and the
+     * real MTP idle is BETWEEN spec-iters (eager draft-gen + host accept), not
+     * inside the verify. So it's its own opt-in flag (off by default) — kept for
+     * drift-validation + as scaffolding for the whole-spec-iter capture (the
+     * glint device-accept blueprint) that would actually reclaim the gap. */
+#ifdef DS4_GRAPH_DECODE_BUILD
+    const int vgraph = getenv("DS4_GRAPH_MTP_VERIFY") != NULL;
+#else
+    const int vgraph = 0;
+#endif
+    if (vgraph) {
+#ifdef DS4_GRAPH_DECODE_BUILD
+        ok = ds4_gpu_graph_capture_begin() != 0;
+        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+            ok = metal_graph_encode_layer_batch(g, model, &weights->layer[il], il, start, n_tokens);
+        }
+        /* Always end the capture (clean the stream) + launch the cached exec. */
+        int launch_ok = ds4_gpu_graph_capture_update_launch();
+        ok = ok && (launch_ok != 0);
+        if (!ok) (void)ds4_gpu_synchronize();
+#endif
+    } else {
+        ok = ds4_gpu_begin_commands() != 0;
+        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+            ok = metal_graph_encode_layer_batch(g, model, &weights->layer[il], il, start, n_tokens);
+        }
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
     }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    else (void)ds4_gpu_synchronize();
     g->spec_capture_prefix1 = saved_capture1;
     g->spec_capture_prefix2 = saved_capture2;
     if (!ok) return false;
@@ -16435,6 +16458,13 @@ static int generate_metal_graph_raw_swa(
     int n_decode_eval = 0;
     const double t_decode0 = now_sec();
 #ifdef DS4_GRAPH_DECODE_BUILD
+    /* Drift verification: dump per-token logits to compare graph vs eager at the
+     * LOGIT level (greedy argmax masks sub-LSB drift; MTP accept would not). */
+    FILE *dbg_lf = NULL; float *dbg_lbuf = NULL;
+    if (getenv("DS4_GRAPH_DUMP_LOGITS")) {
+        dbg_lf = fopen(getenv("DS4_GRAPH_DECODE") ? "/tmp/lg_graph.bin" : "/tmp/lg_eager.bin", "wb");
+        dbg_lbuf = (float *)malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    }
     /* CUDA-graph Stage 2: device-token pipelined decode (non-strict, plain-greedy
      * only). The token flows GPU→GPU via comp_selected, so the host issues all
      * forwards without a per-token sync, logs each token device-side, then syncs
@@ -16466,6 +16496,11 @@ static int generate_metal_graph_raw_swa(
             if (!eager_burst) gok = ds4_gpu_graph_capture_begin() != 0;
             if (gok) gok = metal_graph_decode_step_devtok(&g, model, weights, (uint32_t)pos, prev, slot[i]);
             if (gok && !eager_burst) gok = ds4_gpu_graph_capture_update_launch() != 0;
+            if (gok && dbg_lf && dbg_lbuf) {  /* drift check: capture this token's logits */
+                ds4_gpu_synchronize();
+                ds4_gpu_tensor_read(g.logits, 0, dbg_lbuf, (uint64_t)DS4_N_VOCAB * sizeof(float));
+                fwrite(dbg_lbuf, sizeof(float), DS4_N_VOCAB, dbg_lf);
+            }
             prev = slot[i];
             pos++; n_burst++;
         }
@@ -16515,6 +16550,9 @@ static int generate_metal_graph_raw_swa(
                                             (uint32_t)pos,
                                             logits);
         if (!ok) break;
+#ifdef DS4_GRAPH_DECODE_BUILD
+        if (dbg_lf) fwrite(logits, sizeof(float), DS4_N_VOCAB, dbg_lf);
+#endif
         if (token_timing) {
             const double t_eval1 = now_sec();
             fprintf(stderr, "ds4: gpu decode eval %d took %.3f ms\n", n_decode_eval + 1, (t_eval1 - t_eval0) * 1000.0);
@@ -16522,6 +16560,10 @@ static int generate_metal_graph_raw_swa(
         n_decode_eval++;
         pos++;
     }
+#ifdef DS4_GRAPH_DECODE_BUILD
+    if (dbg_lf) fclose(dbg_lf);
+    free(dbg_lbuf);
+#endif
     const double t_decode1 = now_sec();
     if (done) done(emit_ud);
 
