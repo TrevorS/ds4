@@ -18761,6 +18761,18 @@ void ds4_session_get_steering(ds4_session *s, float *attn, float *ffn, bool *loa
 #endif
 }
 
+bool ds4_session_steering_is_cached(ds4_session *s, const char *name) {
+#ifndef DS4_NO_GPU
+    if (!s || ds4_session_is_cpu(s) || !name || !name[0]) return false;
+    for (uint32_t i = 0; i < s->graph.steering_cache_len; i++)
+        if (!strcmp(s->graph.steering_cache[i].name, name)) return true;
+    return false;
+#else
+    (void)s; (void)name;
+    return false;
+#endif
+}
+
 int ds4_session_steering_select(ds4_session *s, const char *name, const char *path,
                                 float attn, float ffn, char *err, size_t errlen) {
 #ifndef DS4_NO_GPU
