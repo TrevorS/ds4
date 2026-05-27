@@ -9998,9 +9998,9 @@ static char *steering_resolve_profile(server *s, const char *name, char *err, si
  * No tier = default. send_models advertises them; generate_job parses the
  * suffix into per-request steering. */
 static const struct { const char *suffix; float ffn; } k_steer_tiers[] = {
-    { "",        6.0f },   /* deepseek-v4-flash:<profile>           */
-    { ":subtle", 3.0f },   /* deepseek-v4-flash:<profile>:subtle    */
-    { ":strong", 10.0f },  /* deepseek-v4-flash:<profile>:strong    */
+    { "",        2.0f },   /* deepseek-v4-flash:<profile>         (validated default) */
+    { ":subtle", 1.0f },   /* deepseek-v4-flash:<profile>:subtle  */
+    { ":strong", 3.0f },   /* deepseek-v4-flash:<profile>:strong  */
 };
 
 static void generate_job(server *s, job *j) {
@@ -10022,7 +10022,7 @@ static void generate_job(server *s, job *j) {
                 char prof[128];
                 memcpy(prof, spec, plen);
                 prof[plen] = '\0';
-                float ffn = 6.0f;                         /* default tier */
+                float ffn = 2.0f;                         /* default tier (k_steer_tiers[0]) */
                 if (tier) {
                     for (size_t t = 0; t < sizeof(k_steer_tiers) / sizeof(k_steer_tiers[0]); t++)
                         if (k_steer_tiers[t].suffix[0] && !strcmp(tier, k_steer_tiers[t].suffix)) {
