@@ -681,6 +681,7 @@ typedef struct {
     bool steering_ffn_set;
     char *steering_name;
     bool steering_is_get;
+    bool steering_is_list;   /* GET /v1/steering/profiles */
 } request;
 
 static void tool_call_free(tool_call *tc) {
@@ -11065,10 +11066,11 @@ static job *dequeue(server *s) {
 
 /* Parse the POST /v1/steering admin body: {"name":"profile","attn":F,"ffn":F}
  * (all optional; name also accepts "profile"/"file").  GET carries no body. */
-static bool parse_steering_request(const char *body, bool is_get,
+static bool parse_steering_request(const char *body, bool is_get, bool is_list,
                                    request *r, char *err, size_t errlen) {
     request_init(r, REQ_STEERING_CONTROL, 0);
     r->steering_is_get = is_get;
+    r->steering_is_list = is_list;
     if (is_get) return true;
     const char *p = body ? body : "";
     json_ws(&p);
@@ -11124,6 +11126,38 @@ static char *steering_resolve_profile(server *s, const char *name, char *err, si
 static void handle_steering_control(server *s, job *j) {
     request *r = &j->req;
     char err[200]; err[0] = '\0';
+    if (r->steering_is_list) {
+        /* List profiles available in --steering-dir, flagging cached + default.
+         * Runs in the worker so the cache read is serialized w.r.t. decode. */
+        buf b = {0};
+        buf_puts(&b, "{\"steering_dir\":");
+        if (s->steering_dir) json_escape(&b, s->steering_dir); else buf_puts(&b, "null");
+        buf_puts(&b, ",\"default\":");
+        if (s->steering_current_name) json_escape(&b, s->steering_current_name);
+        else buf_puts(&b, "null");
+        buf_puts(&b, ",\"profiles\":[");
+        int n = 0;
+        DIR *d = s->steering_dir ? opendir(s->steering_dir) : NULL;
+        if (d) {
+            struct dirent *de;
+            while ((de = readdir(d)) != NULL) {
+                if (de->d_name[0] == '.') continue;            /* skip ., .., hidden */
+                if (strchr(de->d_name, '/')) continue;
+                if (n++) buf_putc(&b, ',');
+                buf_puts(&b, "{\"name\":");
+                json_escape(&b, de->d_name);
+                buf_printf(&b, ",\"cached\":%s,\"default\":%s}",
+                           ds4_session_steering_is_cached(s->session, de->d_name) ? "true" : "false",
+                           (s->steering_current_name && !strcmp(s->steering_current_name, de->d_name))
+                               ? "true" : "false");
+            }
+            closedir(d);
+        }
+        buf_puts(&b, "]}\n");
+        http_response(j->fd, s->enable_cors, 200, "application/json", b.ptr);
+        buf_free(&b);
+        return;
+    }
     if (!r->steering_is_get) {
         const float new_attn = r->steering_attn_set ? r->steering_attn : s->default_steering_attn;
         const float new_ffn  = r->steering_ffn_set ? r->steering_ffn : s->default_steering_ffn;
@@ -11397,9 +11431,11 @@ static void *client_main(void *arg) {
         ok = parse_completion_request(s->engine, hr.body, s->default_tokens,
                                       ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/steering")) {
-        ok = parse_steering_request(hr.body, false, &req, err, sizeof(err));
+        ok = parse_steering_request(hr.body, false, false, &req, err, sizeof(err));
+    } else if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/steering/profiles")) {
+        ok = parse_steering_request(NULL, true, true, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/steering")) {
-        ok = parse_steering_request(NULL, true, &req, err, sizeof(err));
+        ok = parse_steering_request(NULL, true, false, &req, err, sizeof(err));
     } else {
         http_error(fd, s->enable_cors, 404, "unknown endpoint");
         http_request_free(&hr);

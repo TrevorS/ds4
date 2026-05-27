@@ -218,6 +218,8 @@ bool ds4_session_is_distributed(ds4_session *s);
  *    scales.  Returns 0 on success, nonzero on load failure (err filled). */
 int ds4_session_set_steering_scale(ds4_session *s, float attn, float ffn);
 void ds4_session_get_steering(ds4_session *s, float *attn, float *ffn, bool *loaded);
+/* True if profile `name` is already resident in the session's steering cache. */
+bool ds4_session_steering_is_cached(ds4_session *s, const char *name);
 /* Select profile `name` as active (loading it from `path` into a per-graph cache
  * on first use, so repeat selections are a pointer swap) and set the scales.  An
  * empty/NULL name turns steering off.  On load failure the active profile is
