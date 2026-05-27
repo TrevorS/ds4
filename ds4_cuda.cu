@@ -1810,11 +1810,36 @@ extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_
     return 1;
 }
 
+static uint64_t cuda_host_mem_available_bytes(void) {
+    /* On GB10's unified memory the OS page cache and the CUDA pool share the
+     * same DRAM, so /proc/meminfo MemAvailable is the truer ceiling for a
+     * demand-paged managed KV cache than cudaMemGetInfo's free count.  Returns
+     * 0 when unreadable (non-Linux / parse failure), and callers fall back. */
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256];
+    unsigned long long kb = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) break;
+    }
+    fclose(f);
+    return (uint64_t)kb * 1024ull;
+}
+
 extern "C" void ds4_gpu_print_memory_report(const char *label) {
     size_t free_b = 0, total_b = 0;
     (void)cudaMemGetInfo(&free_b, &total_b);
-    fprintf(stderr, "ds4: CUDA memory report %s: free %.2f MiB total %.2f MiB\n",
-            label ? label : "", (double)free_b / 1048576.0, (double)total_b / 1048576.0);
+    const uint64_t avail = cuda_host_mem_available_bytes();
+    if (avail) {
+        fprintf(stderr,
+                "ds4: CUDA memory report %s: free %.2f MiB total %.2f MiB | host MemAvailable %.2f MiB\n",
+                label ? label : "",
+                (double)free_b / 1048576.0, (double)total_b / 1048576.0,
+                (double)avail / 1048576.0);
+    } else {
+        fprintf(stderr, "ds4: CUDA memory report %s: free %.2f MiB total %.2f MiB\n",
+                label ? label : "", (double)free_b / 1048576.0, (double)total_b / 1048576.0);
+    }
 }
 
 extern "C" void ds4_gpu_set_quality(bool quality) {

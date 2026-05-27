@@ -15781,7 +15781,8 @@ static int metal_graph_prompt_logits_test(
         fprintf(stderr, "ds4: failed to initialize Metal graph prompt test runtime\n");
         return 1;
     }
-    const bool memory_report = getenv("DS4_METAL_MEMORY_REPORT") != NULL;
+    const bool memory_report =
+        getenv("DS4_METAL_MEMORY_REPORT") != NULL || getenv("DS4_LOG_MEM") != NULL;
     if (memory_report) ds4_gpu_print_memory_report("after graph alloc");
 
     ds4_kv_cache cpu_cache;
@@ -17221,7 +17222,8 @@ static int generate_metal_graph_raw_swa(
         metal_graph_free(&g);
         return 1;
     }
-    const bool memory_report = getenv("DS4_METAL_MEMORY_REPORT") != NULL;
+    const bool memory_report =
+        getenv("DS4_METAL_MEMORY_REPORT") != NULL || getenv("DS4_LOG_MEM") != NULL;
     if (memory_report) ds4_gpu_print_memory_report("after graph alloc");
 
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
@@ -20048,12 +20050,33 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->ctx_size = ctx_size;
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
+    const bool log_mem = getenv("DS4_LOG_MEM") != NULL;
+    if (log_mem) {
+        /* Advisory only: managed KV is intentionally demand-paged on a
+         * unified-memory box (see ds4_gpu_should_use_managed_kv_cache), so a
+         * projection over MemAvailable is informational, not a refusal. */
+        const ds4_context_memory m = ds4_context_memory_estimate(e->backend, ctx_size);
+        const int managed = ds4_gpu_should_use_managed_kv_cache(m.total_bytes, m.total_bytes);
+        fprintf(stderr,
+                "ds4: [DS4_LOG_MEM] session open ctx=%d: projected context buffers %.0f MiB "
+                "(raw %.0f + comp %.0f + scratch %.0f) caps[prefill=%u raw=%u comp=%u] "
+                "residency=%s\n",
+                ctx_size,
+                (double)m.total_bytes / 1048576.0,
+                (double)m.raw_bytes / 1048576.0,
+                (double)m.compressed_bytes / 1048576.0,
+                (double)m.scratch_bytes / 1048576.0,
+                m.prefill_cap, m.raw_cap, m.comp_cap,
+                managed ? "managed (demand-paged)" : "device-resident");
+        ds4_gpu_print_memory_report("before session KV alloc");
+    }
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[0],
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready))
     {
         free(s);
         return 1;
     }
+    if (log_mem) ds4_gpu_print_memory_report("after session KV alloc");
     s->graph.quality = e->quality;
     s->graph.power_percent = (uint32_t)e->power_percent;
     if (!metal_graph_load_directional_steering(&s->graph,
