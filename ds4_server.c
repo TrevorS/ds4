@@ -9996,9 +9996,48 @@ static bool should_canonicalize_tool_checkpoint(const server *s, const tool_call
  * moves forward. */
 static char *steering_resolve_profile(server *s, const char *name, char *err, size_t errlen);
 
+/* Steering strength tiers exposed in model ids: "<base>:<profile>[:<tier>]".
+ * No tier = default. send_models advertises them; generate_job parses the
+ * suffix into per-request steering. */
+static const struct { const char *suffix; float ffn; } k_steer_tiers[] = {
+    { "",        6.0f },   /* deepseek-v4-flash:<profile>           */
+    { ":subtle", 3.0f },   /* deepseek-v4-flash:<profile>:subtle    */
+    { ":strong", 10.0f },  /* deepseek-v4-flash:<profile>:strong    */
+};
+
 static void generate_job(server *s, job *j) {
     char err[160];
     err[0] = '\0';
+    /* Model-name steering (client model dropdown): a model id of the form
+     * "<base>:<profile>[:<tier>]" selects a steering profile + strength tier
+     * (see send_models / k_steer_tiers).  Translate it into the per-request
+     * steering fields below, unless the request already set steering explicitly.
+     * The model id is left intact (echoed back to match the client's request). */
+    if (!j->req.steering_name && !j->req.steering_ffn_set && !j->req.steering_attn_set &&
+        j->req.model) {
+        const char *colon = strchr(j->req.model, ':');
+        if (colon && colon[1]) {
+            const char *spec = colon + 1;                 /* profile[:tier] */
+            const char *tier = strchr(spec, ':');
+            const size_t plen = tier ? (size_t)(tier - spec) : strlen(spec);
+            if (plen > 0 && plen < 128) {
+                char prof[128];
+                memcpy(prof, spec, plen);
+                prof[plen] = '\0';
+                float ffn = 6.0f;                         /* default tier */
+                if (tier) {
+                    for (size_t t = 0; t < sizeof(k_steer_tiers) / sizeof(k_steer_tiers[0]); t++)
+                        if (k_steer_tiers[t].suffix[0] && !strcmp(tier, k_steer_tiers[t].suffix)) {
+                            ffn = k_steer_tiers[t].ffn;
+                            break;
+                        }
+                }
+                j->req.steering_name = xstrdup(prof);
+                j->req.steering_ffn = ffn;
+                j->req.steering_ffn_set = true;
+            }
+        }
+    }
     /* Resolve this job's effective steering profile + scale before any forward
      * (prefill + decode).  Set every job (serial worker) so it resets to the
      * server default unless this request overrides — no save/restore needed.
@@ -11365,6 +11404,26 @@ static bool send_models(server *s, int fd) {
     append_model_json(&b, s, "deepseek-v4-flash");
     buf_putc(&b, ',');
     append_model_json(&b, s, "deepseek-v4-pro");
+    /* Steered variants: one model id per (profile in --steering-dir) x tier, so a
+     * client's model dropdown becomes the persona+strength selector. */
+    if (s->steering_dir && s->steering_dir[0]) {
+        DIR *d = opendir(s->steering_dir);
+        if (d) {
+            struct dirent *de;
+            while ((de = readdir(d)) != NULL) {
+                if (de->d_name[0] == '.') continue;                 /* ., .., hidden */
+                if (strchr(de->d_name, '/') || strchr(de->d_name, ':')) continue;
+                for (size_t t = 0; t < sizeof(k_steer_tiers) / sizeof(k_steer_tiers[0]); t++) {
+                    char id[256];
+                    snprintf(id, sizeof(id), "deepseek-v4-flash:%s%s",
+                             de->d_name, k_steer_tiers[t].suffix);
+                    buf_putc(&b, ',');
+                    append_model_json(&b, s, id);
+                }
+            }
+            closedir(d);
+        }
+    }
     buf_puts(&b, "]}\n");
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
