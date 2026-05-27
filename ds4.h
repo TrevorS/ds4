@@ -205,6 +205,21 @@ void ds4_session_free(ds4_session *s);
 int ds4_session_power(ds4_session *s);
 int ds4_session_set_power(ds4_session *s, int power_percent);
 bool ds4_session_is_distributed(ds4_session *s);
+
+/* Runtime directional-steering control (GPU backend).  Steering scale is read
+ * fresh every forward, so changes take effect on the next eval; scale 0 on both
+ * axes is bit-identical to no steering (the projection is skipped).
+ *  - set_steering_scale: change attn/ffn strength (direction vectors must already
+ *    be loaded — at launch via --dir-steering-file, or via reload_steering).
+ *  - get_steering: read current scales + whether vectors are loaded.
+ *  - reload_steering: (re)load direction vectors from `path` and set scales.  A
+ *    non-empty path force-loads the vectors even at scale 0 (so a profile can be
+ *    staged for later per-request activation); an empty/NULL path only sets the
+ *    scales.  Returns 0 on success, nonzero on load failure (err filled). */
+int ds4_session_set_steering_scale(ds4_session *s, float attn, float ffn);
+void ds4_session_get_steering(ds4_session *s, float *attn, float *ffn, bool *loaded);
+int ds4_session_reload_steering(ds4_session *s, const char *path,
+                                float attn, float ffn, char *err, size_t errlen);
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
 /* UI-only progress. It may report fine-grained progress inside a prefill chunk;
  * callers must not treat it as a durable KV checkpoint boundary. */
