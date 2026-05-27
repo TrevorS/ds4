@@ -20,6 +20,8 @@ LABEL=""; REBUILD=0; DO_NCU=0
 MODEL="ds4flash.gguf"
 MTP="/home/trevor/models/ds4/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"
 PROMPT="knight"; NTOK=48
+# Prod-flag matrix knobs (defaults preserve the original synthetic capture).
+CTX=""; TEMP="0"; PROMPTFILE=""; WARM=0; THINKFLAG="--nothink"
 KERNELS="moe_down_expert_tile8_row32|matmul_q8_0_preq_batch_share_warp|moe_gate_up_mid_expert_tile8_row32"
 
 while [ $# -gt 0 ]; do
@@ -31,6 +33,11 @@ while [ $# -gt 0 ]; do
     --mtp) MTP="$2"; shift 2;;
     -p) PROMPT="$2"; shift 2;;
     -n) NTOK="$2"; shift 2;;
+    --ctx) CTX="$2"; shift 2;;
+    --temp) TEMP="$2"; shift 2;;
+    --prompt-file) PROMPTFILE="$2"; shift 2;;
+    --warm) WARM=1; shift;;
+    --think) THINKFLAG="--think"; shift;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
@@ -39,7 +46,10 @@ done
 cd "$ROOT"
 RUNS="$HERE/runs"; mkdir -p "$RUNS"
 T="/tmp/${LABEL}"
-ARGS=(-m "$MODEL" --mtp "$MTP" -p "$PROMPT" -n "$NTOK" --temp 0 --nothink -sys "")
+ARGS=(-m "$MODEL" --mtp "$MTP" -n "$NTOK" --temp "$TEMP" "$THINKFLAG" -sys "")
+if [ -n "$PROMPTFILE" ]; then ARGS+=(--prompt-file "$PROMPTFILE"); else ARGS+=(-p "$PROMPT"); fi
+[ -n "$CTX" ] && ARGS+=(--ctx "$CTX")
+[ "$WARM" = 1 ] && ARGS+=(--warm-weights)
 
 [ "$REBUILD" = 1 ] && { echo "## rebuild"; make cuda-spark >/dev/null; }
 
