@@ -11401,9 +11401,10 @@ static bool send_model(server *s, int fd, const char *id) {
 static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    append_model_json(&b, s, "deepseek-v4-flash");
-    buf_putc(&b, ',');
-    append_model_json(&b, s, "deepseek-v4-pro");
+    /* Advertise only the variant actually loaded (flash vs pro is detected from
+     * the GGUF; the other has no weights), plus its steered variants. */
+    const char *base = server_model_id_from_engine(s->engine);
+    append_model_json(&b, s, base);
     /* Steered variants: one model id per (profile in --steering-dir) x tier, so a
      * client's model dropdown becomes the persona+strength selector. */
     if (s->steering_dir && s->steering_dir[0]) {
@@ -11415,8 +11416,8 @@ static bool send_models(server *s, int fd) {
                 if (strchr(de->d_name, '/') || strchr(de->d_name, ':')) continue;
                 for (size_t t = 0; t < sizeof(k_steer_tiers) / sizeof(k_steer_tiers[0]); t++) {
                     char id[256];
-                    snprintf(id, sizeof(id), "deepseek-v4-flash:%s%s",
-                             de->d_name, k_steer_tiers[t].suffix);
+                    snprintf(id, sizeof(id), "%s:%s%s",
+                             base, de->d_name, k_steer_tiers[t].suffix);
                     buf_putc(&b, ',');
                     append_model_json(&b, s, id);
                 }
