@@ -1,3 +1,44 @@
+> **This is a fork.** [`TrevorS/ds4`](https://github.com/TrevorS/ds4) is a GB10 / DGX Spark (NVIDIA `sm_121a`) performance fork of [`antirez/ds4`](https://github.com/antirez/ds4). Fork `main` carries the changes below on top of upstream `main` and is rebased on upstream periodically. Everything below this section is the upstream README, unchanged.
+
+## What's different in this fork
+
+- **GB10 / DGX Spark CUDA backend** — `sm_121a` support with the model kept resident in the unified GPU memory pool, instead of streaming weights per step. [`971d92a`](https://github.com/TrevorS/ds4/commit/971d92a0ba76ef6b8306ebc96cc4f3245d2e6857)
+- **MTP speculative decode** — combined-forward, cascaded N=3 (two draft tokens verified in a single forward pass); `--mtp-draft` defaults to 2. ~10% sustained decode uplift over plain on GB10 (bursts higher). [`fa06b5b`](https://github.com/TrevorS/ds4/commit/fa06b5bf2ca25a90b4983fc77533ad5a352160ce), [`b7a65f5`](https://github.com/TrevorS/ds4/commit/b7a65f52221bf55669d32260555be80bb46f970c)
+- **CUDA kernel & graph perf** — share-warp Q8 (load weight quants once across tokens), `__launch_bounds__` tuning (+5.5% decode), bit-identical CUDA-graph decode (+5%), and a Q8→f16 dense-weight prewarm (~2× prefill TTFT). [`2bcb683`](https://github.com/TrevorS/ds4/commit/2bcb68391d4ee0f0b103769cd5fd55eb1ce0b92d), [`00145a2`](https://github.com/TrevorS/ds4/commit/00145a264908c009bdfb21ce10e745702361af83), [`c9f979d`](https://github.com/TrevorS/ds4/commit/c9f979d5e9a79e1e67681a45cdf1a4640bf3fa58), [`c703b63`](https://github.com/TrevorS/ds4/commit/c703b6315ce9537f7eebd5e5e09692cdaf11d999)
+- **Runtime directional steering** — per-request scale plus an admin endpoint, named profiles, and model-name steering where `model:profile:tier` selects a steering vector and strength. [`aba5187`](https://github.com/TrevorS/ds4/commit/aba5187d3f6e3e2e96f2a1aa2f974e4aa9b66829), [`1cb2a31`](https://github.com/TrevorS/ds4/commit/1cb2a315add07a80e68689bf91ed165563032167)
+- **Perf & debug tooling** — a `tools/perf` gamut profiling suite for GB10 decode, plus a streaming-reasoning client and a mobile-friendly LAN log viewer. [`bc5558a`](https://github.com/TrevorS/ds4/commit/bc5558a4bda4b0eb83ea2b972db715048f10931f), [`66690f8`](https://github.com/TrevorS/ds4/commit/66690f8a9bd13fcf79932427e4ca462642ddd464)
+
+### Recommended GB10 settings
+
+What we run for best perf on a DGX Spark (128 GB unified memory) with DeepSeek-V4-Flash IQ2-XXS:
+
+```sh
+DS4_METAL_PREFILL_CHUNK=2048 ./ds4-server -m ds4flash.gguf \
+  --mtp DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf \
+  --warm-weights --ctx 524288
+```
+
+`--mtp` (with the default `--mtp-draft 2`) enables combined-forward speculative decode; `--warm-weights` front-loads the Q8→f16 dense-weight cache (~2× prefill TTFT); `DS4_METAL_PREFILL_CHUNK=2048` frees context-buffer headroom at no throughput cost (the `4096` default wastes memory on this model). `--ctx 524288` keeps the KV cache device-resident — the model's full **1M** context also fits, via demand-paged managed memory.
+
+Benched with `ds4-bench` (greedy, `--gen-tokens 256`, MTP on):
+
+| context | prefill (t/s) | decode (t/s) |
+| ------: | ------------: | -----------: |
+|   4,096 |           413 |         15.0 |
+|  16,384 |           387 |         15.5 |
+
+Those are *prose* numbers (the bench greedily continues an Italian novel). MTP shines on low-entropy output: on real **code or structured generation** the draft accept rate is higher and sustained decode clears **20+ t/s**. Reproducible — AVL-tree codegen holds ~23 t/s (greedy, so deterministic):
+
+```sh
+curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
+  "model":"deepseek-v4-flash","reasoning_effort":"none","temperature":0,"max_tokens":1200,
+  "messages":[{"role":"user","content":"Write a complete Python implementation of a balanced AVL tree: node class, insert, delete, search, rotations, in-order traversal, and height-balancing. Full docstrings. Output only code, no prose."}]
+}'
+# server log -> gen=1200 ... avg~=23.3 t/s   (JSON-array generation lands ~25; prose ~15)
+```
+
+---
+
 # DwarfStar
 
 **DwarfStar** is a small native inference engine optimized first for
