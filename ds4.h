@@ -177,6 +177,12 @@ int ds4_session_set_power(ds4_session *s, int power_percent);
  *    scales.  Returns 0 on success, nonzero on load failure (err filled). */
 int ds4_session_set_steering_scale(ds4_session *s, float attn, float ffn);
 void ds4_session_get_steering(ds4_session *s, float *attn, float *ffn, bool *loaded);
+/* Select profile `name` as active (loading it from `path` into a per-graph cache
+ * on first use, so repeat selections are a pointer swap) and set the scales.  An
+ * empty/NULL name turns steering off.  On load failure the active profile is
+ * left unchanged.  reload_steering is a path-based wrapper (name = basename). */
+int ds4_session_steering_select(ds4_session *s, const char *name, const char *path,
+                                float attn, float ffn, char *err, size_t errlen);
 int ds4_session_reload_steering(ds4_session *s, const char *path,
                                 float attn, float ffn, char *err, size_t errlen);
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
