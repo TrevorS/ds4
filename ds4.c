@@ -16172,6 +16172,65 @@ static int sample_candidate_cmp_desc(const void *a, const void *b) {
     return (cb->logit > ca->logit) - (cb->logit < ca->logit);
 }
 
+/* Exact nucleus sample by sorting ALL finite candidates.  This is the original
+ * sample_full_vocab top_p<1 body, kept only as the correctness fallback for
+ * sample_full_vocab's bounded fast path (reached when the bounded top-K can't
+ * cover top_p — a near-flat distribution at very high top_p).  `max_logit` and
+ * `best` are passed in since the caller already computed them. */
+static int sample_full_vocab_exact(
+        const float *logits,
+        uint32_t     n_vocab,
+        float        temperature,
+        float        top_p,
+        float        min_p,
+        float        max_logit,
+        int          best,
+        uint64_t    *rng) {
+    sample_candidate *cand = xmalloc((size_t)n_vocab * sizeof(cand[0]));
+    uint32_t n = 0;
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (!isfinite(v)) continue;
+        const float p = expf((v - max_logit) / temperature);
+        cand[n++] = (sample_candidate){.id = (int)i, .logit = v, .prob = p};
+        sum += p;
+    }
+    if (sum <= 0.0f || !isfinite(sum)) {
+        free(cand);
+        return best;
+    }
+
+    qsort(cand, n, sizeof(cand[0]), sample_candidate_cmp_desc);
+    const float min_prob = (cand[0].prob / sum) * (min_p > 0.0f ? min_p : 0.0f);
+    float filtered_sum = 0.0f;
+    uint32_t filtered = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const float p = cand[i].prob / sum;
+        if (i > 0 && p < min_prob) break;
+        filtered_sum += cand[i].prob;
+        filtered++;
+        if (filtered_sum / sum >= top_p) break;
+    }
+    if (filtered == 0) {
+        free(cand);
+        return best;
+    }
+
+    float r = sample_rng_f32(rng) * filtered_sum;
+    for (uint32_t i = 0; i < filtered; i++) {
+        r -= cand[i].prob;
+        if (r <= 0.0f) {
+            const int id = cand[i].id;
+            free(cand);
+            return id;
+        }
+    }
+    const int id = cand[filtered - 1].id;
+    free(cand);
+    return id;
+}
+
 static int sample_full_vocab(
         const float *logits,
         uint32_t     n_vocab,
@@ -16216,49 +16275,60 @@ static int sample_full_vocab(
         return best;
     }
 
-    sample_candidate *cand = xmalloc((size_t)finite * sizeof(cand[0]));
-    uint32_t n = 0;
+    /* top_p < 1 (and/or min_p): only the prob-ranked prefix whose cumulative
+     * (over the FULL softmax denominator) reaches top_p matters, and that prefix
+     * is tiny for peaked LM logits (top_p=0.95 is usually <256 tokens).  Maintain
+     * a bounded top-K by prob instead of sorting all ~129k candidates — the old
+     * full qsort was a fixed ~11 ms/token host tax (see tools/perf/SQUEEZE_LOG.md).
+     * `sum` is still the exact full-softmax denominator (accumulated over every
+     * finite logit in this same O(n) pass), so the sampled distribution is
+     * unchanged vs the exact sort.  No per-token malloc: the buffers are on-stack. */
+    enum { SAMPLE_TOPK = 1024 };
+    int   topk_id[SAMPLE_TOPK];
+    float topk_prob[SAMPLE_TOPK];
+    int   k = 0;
     float sum = 0.0f;
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = logits[i];
         if (!isfinite(v)) continue;
         const float p = expf((v - max_logit) / temperature);
-        cand[n++] = (sample_candidate){.id = (int)i, .logit = v, .prob = p};
         sum += p;
+        if (k == SAMPLE_TOPK && p <= topk_prob[SAMPLE_TOPK - 1]) continue;
+        int j = (k < SAMPLE_TOPK) ? k++ : k - 1;
+        while (j > 0 && topk_prob[j - 1] < p) {
+            topk_prob[j] = topk_prob[j - 1];
+            topk_id[j]   = topk_id[j - 1];
+            j--;
+        }
+        topk_prob[j] = p;
+        topk_id[j]   = (int)i;
     }
-    if (sum <= 0.0f || !isfinite(sum)) {
-        free(cand);
-        return best;
-    }
+    if (sum <= 0.0f || !isfinite(sum) || k == 0) return best;
 
-    qsort(cand, n, sizeof(cand[0]), sample_candidate_cmp_desc);
-    const float min_prob = (cand[0].prob / sum) * (min_p > 0.0f ? min_p : 0.0f);
+    const float min_prob = (topk_prob[0] / sum) * (min_p > 0.0f ? min_p : 0.0f);
     float filtered_sum = 0.0f;
-    uint32_t filtered = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        const float p = cand[i].prob / sum;
+    int filtered = 0;
+    for (int i = 0; i < k; i++) {
+        const float p = topk_prob[i] / sum;
         if (i > 0 && p < min_prob) break;
-        filtered_sum += cand[i].prob;
+        filtered_sum += topk_prob[i];
         filtered++;
         if (filtered_sum / sum >= top_p) break;
     }
-    if (filtered == 0) {
-        free(cand);
-        return best;
+    /* Bounded set exhausted without reaching top_p (only on a near-flat
+     * distribution at very high top_p) — fall back to the exact full sort. */
+    if (filtered == k && filtered_sum / sum < top_p) {
+        return sample_full_vocab_exact(logits, n_vocab, temperature,
+                                       top_p, min_p, max_logit, best, rng);
     }
+    if (filtered == 0) return best;
 
     float r = sample_rng_f32(rng) * filtered_sum;
-    for (uint32_t i = 0; i < filtered; i++) {
-        r -= cand[i].prob;
-        if (r <= 0.0f) {
-            const int id = cand[i].id;
-            free(cand);
-            return id;
-        }
+    for (int i = 0; i < filtered; i++) {
+        r -= topk_prob[i];
+        if (r <= 0.0f) return topk_id[i];
     }
-    const int id = cand[filtered - 1].id;
-    free(cand);
-    return id;
+    return topk_id[filtered - 1];
 }
 
 static int sample_top_p_min_p(
