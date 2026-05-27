@@ -16086,6 +16086,65 @@ static DS4_MAYBE_UNUSED void logits_top2(const float *logits, uint32_t n_vocab,
     if (logit1) *logit1 = v1;
 }
 
+/* MTP speculative-sampling acceptance probe.  Given the target logits p and the
+ * one-ahead MTP draft logits q for the SAME next position, accumulates the
+ * expected spec-sampling accept rate
+ *     alpha = sum_x min(p_T(x), q_T(x)) = 1 - TV(p_T, q_T)
+ * at a few temperatures, plus the greedy top-1 match (argmax p == argmax q) for
+ * calibration.  alpha is the per-draft accept prob under exact speculative
+ * sampling (Leviathan/Chen); greedy match is the current argmax-verify rate and
+ * an upper bound on what sampling can hope for.  Enabled by DS4_MTP_TV; prints a
+ * running mean every 16 tokens to stderr.  Measures the K=1 (one-ahead) draft
+ * only; the chained second-draft accept needs the combined-path probe. */
+static void mtp_alpha_probe(const float *p, const float *q, uint32_t n_vocab) {
+    static const float temps[] = { 0.3f, 0.7f, 1.0f };
+    enum { NT = (int)(sizeof(temps) / sizeof(temps[0])) };
+    static double sum_alpha[NT];
+    static double sum_greedy;
+    static uint64_t count;
+
+    /* T-independent maxima for numerically stable softmax. */
+    float pmax = DS4_NEG_INF, qmax = DS4_NEG_INF;
+    int parg = 0, qarg = 0;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        if (p[i] > pmax) { pmax = p[i]; parg = (int)i; }
+        if (q[i] > qmax) { qmax = q[i]; qarg = (int)i; }
+    }
+    sum_greedy += (parg == qarg) ? 1.0 : 0.0;
+
+    for (int t = 0; t < NT; t++) {
+        const float invT = 1.0f / temps[t];
+        double Zp = 0.0, Zq = 0.0;
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            Zp += (double)expf((p[i] - pmax) * invT);
+            Zq += (double)expf((q[i] - qmax) * invT);
+        }
+        if (Zp <= 0.0 || Zq <= 0.0) continue;
+        double overlap = 0.0;
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const double pp = (double)expf((p[i] - pmax) * invT) / Zp;
+            const double qq = (double)expf((q[i] - qmax) * invT) / Zq;
+            overlap += pp < qq ? pp : qq;
+        }
+        sum_alpha[t] += overlap;
+    }
+    count++;
+
+    if (count == 1u || (count % 16u) == 0u) {
+        fprintf(stderr, "ds4: mtp-alpha n=%llu greedy=%.3f",
+                (unsigned long long)count, sum_greedy / (double)count);
+        for (int t = 0; t < NT; t++) {
+            const double a = sum_alpha[t] / (double)count;
+            /* K=1 tokens/iter = 1 + alpha.  The K=2 combined verify costs
+             * ~1.45 D on GB10, so sx@1.45 is the rough speedup vs plain decode
+             * if the chained second draft matched this rate (optimistic). */
+            fprintf(stderr, " | T=%.1f a=%.3f tpi=%.2f sx@1.45=%.2f",
+                    (double)temps[t], a, 1.0 + a, (1.0 + a) / 1.45);
+        }
+        fputc('\n', stderr);
+    }
+}
+
 static uint64_t sample_rng_next(uint64_t *state) {
     uint64_t x = *state;
     if (x == 0) x = 0x9e3779b97f4a7c15ULL;
@@ -19217,9 +19276,10 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
 #else
     ds4_engine *e = s->engine;
     const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
+    const bool mtp_tv_probe = getenv("DS4_MTP_TV") != NULL;
     const bool mtp_should_draft =
         probe_mtp && e->mtp_ready && s->mtp_logits &&
-        (e->mtp_draft_tokens > 1 || mtp_probe_log);
+        (e->mtp_draft_tokens > 1 || mtp_probe_log || mtp_tv_probe);
     if (probe_mtp && s->mtp_draft_valid) {
         if (mtp_probe_log) {
             s->mtp_probe_total++;
@@ -19252,10 +19312,11 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                        &e->mtp_weights,
                                        token,
                                        (uint32_t)(s->checkpoint.len - 1),
-                                       getenv("DS4_MTP_FULL_LOGITS") ? s->mtp_logits : NULL,
+                                       (getenv("DS4_MTP_FULL_LOGITS") || mtp_tv_probe) ? s->mtp_logits : NULL,
                                        &mtp_top)) {
             s->mtp_draft_token = mtp_top >= 0 ? mtp_top : sample_argmax(s->mtp_logits, DS4_N_VOCAB);
             s->mtp_draft_valid = true;
+            if (mtp_tv_probe) mtp_alpha_probe(s->logits, s->mtp_logits, DS4_N_VOCAB);
         } else if (getenv("DS4_MTP_PROBE")) {
             fprintf(stderr, "ds4: mtp probe draft failed\n");
         }
