@@ -309,3 +309,71 @@ structural change (surface as proposals per the contributor role):
 occupancy is a means, not the goal. The gamut diff caught it instantly: occ↑ but
 ms↑↑, %peakBW↓, stall reason flipped to `lg_throttle` (spill traffic). Always
 read ms + stall-reason alongside occupancy.
+
+## Prod-flag matrix — accept regime, depth, sampling (2026-05-27)
+
+All prior rows profiled the *synthetic* capture (knight, greedy, shallow ctx).
+This matrix profiled the axes that actually vary in production: **content/accept**
+(code = high accept, prose = low), **depth** (managed KV at `--ctx 524288`,
+~14k filled), and **temp** (greedy/MTP vs sampled/plain). Decode t/s below are
+the **clean** (non-nsys) timing-run numbers; the deep cells' per-kernel tables
+are nsys+managed-KV perturbed (`accept-code-deep` trace 11.0 vs measured 19.76 —
+trust measured t/s + accept, not deep kernel ms). Runs in `runs/{accept-*,
+prod-*,gb10-postrebase-*}`.
+
+Throughput ladder (measured decode t/s):
+
+| config | accept | tok/iter | t/s |
+|--------|-------:|---------:|----:|
+| code, greedy, shallow (high accept) | 68.8% | 2.38 | 21.68 |
+| knight, greedy, shallow | 54.5% | 2.09 | 19.61 |
+| code, greedy, **deep** | 70.0% | 2.40 | 19.76 |
+| prose, greedy, shallow (low accept) | 43.6% | 1.86 | 17.49 |
+| diverse, greedy, deep | 56.8% | 2.14 | 16.86 |
+| sampled, deep, top_p 1.0 | — | — | 12.11 |
+| **sampled, deep, top_p 0.95** (prod chat) | — | — | **10.66** |
+
+Real-prod span is **10.66 → 21.68 = 2.0×**; the knight baseline we'd been tuning
+sits near the top, so it is ~1.6–2× optimistic for sampled chat.
+
+Findings:
+
+- **Accept is the master throughput variable, and it is content-driven, not
+  engine.** Shallow greedy is monotonic in accept (prose 17.49 → knight 19.61 →
+  code 21.68) with a **near-identical per-kernel table** — the whole spread is
+  tokens/iter. The R1 false-bisect rule in spades: low accept looks like a
+  regression, no kernel moved.
+- **Accept holds across depth; depth is a separate ~10–14% managed-KV tax**
+  (orthogonal). Code accept 68.8% → 70.0% shallow→deep. So a high-accept coding
+  agent stays fast at depth (19.76); diverse/low-accept chat is slower before you
+  even sample.
+- **Prose sits at the cascade break-even** (1.86 tok/iter vs the ~1.9 where N=3
+  stops paying). Slightly harder content pushes MTP net-negative → the lever
+  there is **adaptive cascade depth (N=3→2)**, not kernels.
+- **Sampling (temp>0) drops MTP entirely** → plain N=1 kernel path (no
+  `share_warp<3>`): −26% at shallow (20.33 → 15.09).
+- **NEW — qsort sampler tax (greedy-only profiling never saw this).**
+  `top_p < 1` with `top_k == 0` takes `sample_full_vocab`'s sort branch, which
+  **`qsort`s all 129k logits per token** — a fixed **~11 ms/token = −14%**
+  (shallow 15.09 → 13.01). `top_p == 1.0` takes the cheap no-sort branch and
+  hides it, which is why the matrix's first sampled cells missed it. Production
+  chat sends `top_p≈0.95`, so every sampled token pays it.
+
+### Verdict — where the squeeze actually is
+
+The greedy path is exhausted (kernel ledger above + the landed +5% graph-capture).
+The remaining squeeze is almost entirely on the **sampled path**, invisible to the
+greedy-only profiling:
+
+1. **qsort sampler — ~+14%, easy, pure host.** Replace the full 129k `qsort` with
+   a partial-select (only the top tokens until cumulative-p ≥ top_p are needed;
+   top_p=0.95 typically needs <~256). No kernel/model/correctness risk. Highest
+   ROI lever found. Scoped separately.
+2. **MTP-for-sampling — ~+14–26%, medium.** Recover MTP for temp>0 via the
+   distribution-preserving rejection sampler (scoped + α-validated in
+   `docs/mtp-nongreedy-sampling.md`; α≈0.78 → keeps ~99% of the greedy MTP win).
+3. **Depth** — managed-KV tax ~14–19%; config lever (right-size `--ctx`) or an
+   owner-level managed-KV optimization.
+
+Realistic chat (~10.7 t/s) could reach ~14+ with (1)+(2) — both engine-side, both
+missed by every prior greedy capture.
