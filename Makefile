@@ -127,6 +127,17 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu
 
 cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
+
+# Shared library for in-process embedding via ctypes/cffi (Linux + CUDA).
+# Core engine API lives in ds4.c (+ ds4_cuda.cu); no server/cli objects needed.
+ds4_pic.o: ds4.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -fPIC -c -o $@ ds4.c
+
+ds4_cuda_pic.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc
+	$(NVCC) $(NVCCFLAGS) -Xcompiler -fPIC -c -o $@ ds4_cuda.cu
+
+libds4.so: ds4_pic.o ds4_cuda_pic.o
+	$(NVCC) $(NVCCFLAGS) -shared -Xcompiler -fPIC -o $@ $^ $(CUDA_LDLIBS)
 endif
 
 ds4.o: ds4.c ds4.h ds4_distributed.h ds4_gpu.h
@@ -214,4 +225,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test tests/test_q4k_dot *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test tests/test_q4k_dot libds4.so *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
