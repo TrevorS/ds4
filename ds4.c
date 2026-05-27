@@ -18705,6 +18705,68 @@ int ds4_session_set_power(ds4_session *s, int power_percent) {
     return 0;
 }
 
+int ds4_session_set_steering_scale(ds4_session *s, float attn, float ffn) {
+#ifndef DS4_NO_GPU
+    if (!s || ds4_session_is_cpu(s)) return 1;
+    s->graph.directional_steering_attn_scale = attn;
+    s->graph.directional_steering_ffn_scale = ffn;
+    return 0;
+#else
+    (void)s; (void)attn; (void)ffn;
+    return 1;
+#endif
+}
+
+void ds4_session_get_steering(ds4_session *s, float *attn, float *ffn, bool *loaded) {
+#ifndef DS4_NO_GPU
+    const bool gpu = s && !ds4_session_is_cpu(s);
+    if (attn) *attn = gpu ? s->graph.directional_steering_attn_scale : 0.0f;
+    if (ffn) *ffn = gpu ? s->graph.directional_steering_ffn_scale : 0.0f;
+    if (loaded) *loaded = gpu && s->graph.directional_steering_dirs != NULL;
+#else
+    (void)s;
+    if (attn) *attn = 0.0f;
+    if (ffn) *ffn = 0.0f;
+    if (loaded) *loaded = false;
+#endif
+}
+
+int ds4_session_reload_steering(ds4_session *s, const char *path,
+                                float attn, float ffn, char *err, size_t errlen) {
+#ifndef DS4_NO_GPU
+    if (!s || ds4_session_is_cpu(s)) {
+        snprintf(err, errlen, "steering is only available on the GPU backend");
+        return 1;
+    }
+    /* Force the vectors to load even when the requested scales are 0 (so a
+     * profile can be staged for later per-request activation): the loader
+     * early-returns when both scales are 0, so load at 1.0 then set the real
+     * scales below.  An empty path keeps the existing vectors and only updates
+     * the scales.  Load into a fresh slot and only free the previous vectors on
+     * success, so a failed load leaves the prior steering state intact. */
+    if (path && path[0]) {
+        ds4_gpu_tensor *prev = s->graph.directional_steering_dirs;
+        s->graph.directional_steering_dirs = NULL;
+        if (!metal_graph_load_directional_steering(&s->graph, path, 1.0f, 1.0f)) {
+            if (s->graph.directional_steering_dirs) {
+                ds4_gpu_tensor_free(s->graph.directional_steering_dirs);
+            }
+            s->graph.directional_steering_dirs = prev;  /* restore prior vectors */
+            snprintf(err, errlen, "failed to load steering vectors from %s", path);
+            return 1;
+        }
+        if (prev) ds4_gpu_tensor_free(prev);
+    }
+    s->graph.directional_steering_attn_scale = attn;
+    s->graph.directional_steering_ffn_scale = ffn;
+    return 0;
+#else
+    (void)s; (void)path; (void)attn; (void)ffn;
+    snprintf(err, errlen, "GPU support is not compiled in");
+    return 1;
+#endif
+}
+
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud) {
     if (!s) return;
     s->progress = fn;
