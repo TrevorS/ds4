@@ -132,6 +132,9 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens);
 int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
+/* Host-only exactness self-test for the speculative-sampling math (no model/GPU
+ * needed).  Returns failing-case count (0 = pass). */
+int ds4_spec_sampling_selftest(void);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt);

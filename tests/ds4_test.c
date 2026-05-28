@@ -1599,6 +1599,10 @@ static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
 
+static void test_spec_sampling_group(void) {
+    test_failures += ds4_spec_sampling_selftest();
+}
+
 typedef void (*test_fn)(void);
 
 typedef struct {
@@ -1619,6 +1623,7 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
+    {"--spec-sampling", "spec-sampling", "speculative-sampling math exactness (host-only, no model)", test_spec_sampling_group},
 };
 
 static void test_print_help(const char *prog) {
