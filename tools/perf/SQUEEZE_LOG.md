@@ -365,10 +365,13 @@ The greedy path is exhausted (kernel ledger above + the landed +5% graph-capture
 The remaining squeeze is almost entirely on the **sampled path**, invisible to the
 greedy-only profiling:
 
-1. **qsort sampler — ~+14%, easy, pure host.** Replace the full 129k `qsort` with
-   a partial-select (only the top tokens until cumulative-p ≥ top_p are needed;
-   top_p=0.95 typically needs <~256). No kernel/model/correctness risk. Highest
-   ROI lever found. Scoped separately.
+1. **qsort sampler — LANDED, +14.8%.** `sample_full_vocab`'s `top_p<1` path now
+   maintains a bounded top-K=1024 partial-select over the same full-softmax
+   denominator instead of `qsort`-ing all ~129k logits (exact-sort fallback kept
+   for the near-flat/high-top_p edge). Verified **bit-identical** token stream vs
+   the exact sort at a fixed seed; **13.05 → 14.98 t/s at top_p=0.95** (recovers
+   the full ~11 ms/token tax, matches the top_p=1.0 no-sort baseline). Also drops
+   a ~2 MB/token malloc. Commit `4748b3a`.
 2. **MTP-for-sampling — ~+14–26%, medium.** Recover MTP for temp>0 via the
    distribution-preserving rejection sampler (scoped + α-validated in
    `docs/mtp-nongreedy-sampling.md`; α≈0.78 → keeps ~99% of the greedy MTP win).
