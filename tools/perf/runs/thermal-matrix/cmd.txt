@@ -1,0 +1,18 @@
+## label:    thermal-matrix
+## started:  2026-05-27T19:47:40-07:00
+## host:     spark-ebf0 — uptime: up 33 minutes
+## matrix:   on
+## iter:     3
+## cells:    plain|0|0 mtp-greedy|1|0 mtp-sample|1|1
+## plan:     3 cells × 3 iter = 9 bench invocations
+## prompt:   /home/trevor/Projects/ds4/tools/perf/runs/thermal-matrix/prompt.txt
+## ctx-max:  32768
+## label:    thermal-matrix
+## started:  2026-05-27T19:59:56-07:00
+## host:     spark-ebf0 — uptime: up 45 minutes
+## matrix:   on
+## iter:     3
+## cells:    plain|0|0 mtp-greedy|1|0 mtp-sample|1|1
+## plan:     3 cells × 3 iter = 9 bench invocations
+## prompt:   /home/trevor/Projects/ds4/tools/perf/runs/thermal-matrix/prompt.txt
+## ctx-max:  32768

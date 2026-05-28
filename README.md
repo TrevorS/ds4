@@ -3,11 +3,11 @@
 ## What's different in this fork
 
 - **GB10 / DGX Spark CUDA backend** — `sm_121a` support with the model kept resident in the unified GPU memory pool, instead of streaming weights per step. [`35466ad`](https://github.com/TrevorS/ds4/commit/35466addc5131363d02b1f2c196cccc5e6dead83)
-- **MTP speculative decode (greedy + sampling)** — combined-forward, cascaded N=3 (two draft tokens verified in a single forward pass); `--mtp-draft` defaults to 2. ~10% sustained decode uplift over plain on GB10 (bursts higher). Now covers **temperature sampling** too, via distribution-preserving rejection sampling (output is identical to plain sampling, just faster: +14–41% measured); on by default, `DS4_MTP_SPEC_DISABLE` turns it off. [`fe9f316`](https://github.com/TrevorS/ds4/commit/fe9f316129a77fca66c516b211b4f0e12f04b057), [`0529fad`](https://github.com/TrevorS/ds4/commit/0529fad79e3170e0a9b5918044a570efedcb5472)
-- **CUDA kernel & graph perf** — share-warp Q8 (load weight quants once across tokens), `__launch_bounds__` tuning (+5.5% decode), bit-identical CUDA-graph decode (+5%), and a Q8→f16 dense-weight prewarm (~2× prefill TTFT). [`cacfce1`](https://github.com/TrevorS/ds4/commit/cacfce1757e4277ce0d0fbfddea2cbb8669ff78e), [`b9135aa`](https://github.com/TrevorS/ds4/commit/b9135aae5602d29fe93a1a10490bec181ce083e2), [`300430c`](https://github.com/TrevorS/ds4/commit/300430c911d33e6efa5897e6362d18698bd6d9d3), [`2f0955c`](https://github.com/TrevorS/ds4/commit/2f0955c2d5cdd511df148c099ef415ad1c29da66)
+- **MTP speculative decode (greedy + sampling)** — combined-forward, cascaded N=3 (two draft tokens verified in a single forward pass); `--mtp-draft` defaults to 2. **~1.5× sustained decode uplift over plain** on GB10 across 4k–32k ctx (greedy; see Benchmarks). Now covers **temperature sampling** too, via distribution-preserving rejection sampling (output is identical to plain sampling, just faster: 1.25–1.43× measured); on by default for `temp>0`, `DS4_MTP_SPEC_DISABLE=1` turns it off. [`fe9f316`](https://github.com/TrevorS/ds4/commit/fe9f316129a77fca66c516b211b4f0e12f04b057), [`0529fad`](https://github.com/TrevorS/ds4/commit/0529fad79e3170e0a9b5918044a570efedcb5472), [`339c59e`](https://github.com/TrevorS/ds4/commit/339c59e255bbaa4f0a7b71acc7354140213053b1), [`38a7570`](https://github.com/TrevorS/ds4/commit/38a757038507266409bf06da46f1beea71433515)
+- **CUDA kernel & graph perf** — share-warp Q8 (load weight quants once across tokens), `__launch_bounds__` tuning (+5.5% decode), bit-identical CUDA-graph decode (+5%), a Q8→f16 dense-weight prewarm (~2× prefill TTFT), and a bounded top-K nucleus sampler that drops the per-token 129k qsort (+14.8% on the sampled path). [`cacfce1`](https://github.com/TrevorS/ds4/commit/cacfce1757e4277ce0d0fbfddea2cbb8669ff78e), [`b9135aa`](https://github.com/TrevorS/ds4/commit/b9135aae5602d29fe93a1a10490bec181ce083e2), [`300430c`](https://github.com/TrevorS/ds4/commit/300430c911d33e6efa5897e6362d18698bd6d9d3), [`2f0955c`](https://github.com/TrevorS/ds4/commit/2f0955c2d5cdd511df148c099ef415ad1c29da66), [`4748b3a`](https://github.com/TrevorS/ds4/commit/4748b3a37a754a6e417e0ecfa6ebe3fd3c9bda68)
 - **Runtime directional steering** — per-request scale plus an admin endpoint, named profiles, and model-name steering where `model:profile:tier` selects a steering vector and strength. [`d812335`](https://github.com/TrevorS/ds4/commit/d8123355aa3a3b3399e768ab687ee3431c97372b), [`2c1fd09`](https://github.com/TrevorS/ds4/commit/2c1fd095da2e688dbcbc68d37715db121dd65b50)
 - **In-process Python binding** — `make libds4.so` builds an fPIC shared library, and `python/ds4.py` is a ctypes wrapper over the full `ds4.h` API (engine/session lifecycle, tokenization, sampling/logprobs, MTP decode, steering, KV persistence). No server process needed. [`09e3813`](https://github.com/TrevorS/ds4/commit/09e38136a76dabddb8a8273ab36a32c9b005b7d9)
-- **Perf & debug tooling** — a `tools/perf` gamut profiling suite for GB10 decode, a streaming-reasoning client and a mobile-friendly LAN log viewer, and a `DS4_MTP_TV` probe that measures speculative-sampling acceptance (`1 − TV`) — see `docs/mtp-nongreedy-sampling.md` for the non-greedy-MTP feasibility analysis. [`b79856c`](https://github.com/TrevorS/ds4/commit/b79856cfa134b063186c138f49242c929be58ffb), [`ce976a0`](https://github.com/TrevorS/ds4/commit/ce976a0d27971c0fa77eac30e8b5eb3885f100b2), [`1b526b1`](https://github.com/TrevorS/ds4/commit/1b526b10e1cc89df88e9fd36bac4ad159a61689a)
+- **Perf & debug tooling** — `tools/perf/bench-with-monitor.sh` runs the 3-cell decode matrix (plain · MTP-greedy · MTP-sample) under continuous GPU/CPU/thermal/dmesg monitors with per-stage tagging; the `tools/perf` gamut profiling suite for GB10 decode; a streaming-reasoning client and mobile-friendly LAN log viewer; and a `DS4_MTP_TV` probe that measures speculative-sampling acceptance (`1 − TV`) — see `docs/mtp-nongreedy-sampling.md` for the non-greedy-MTP feasibility analysis. [`b79856c`](https://github.com/TrevorS/ds4/commit/b79856cfa134b063186c138f49242c929be58ffb), [`ce976a0`](https://github.com/TrevorS/ds4/commit/ce976a0d27971c0fa77eac30e8b5eb3885f100b2), [`1b526b1`](https://github.com/TrevorS/ds4/commit/1b526b10e1cc89df88e9fd36bac4ad159a61689a)
 
 ### Recommended GB10 settings
 
@@ -21,14 +21,62 @@ DS4_METAL_PREFILL_CHUNK=2048 ./ds4-server -m ds4flash.gguf \
 
 `--mtp` (with the default `--mtp-draft 2`) enables combined-forward speculative decode; `--warm-weights` front-loads the Q8→f16 dense-weight cache (~2× prefill TTFT); `DS4_METAL_PREFILL_CHUNK=2048` frees context-buffer headroom at no throughput cost (the `4096` default wastes memory on this model). `--ctx 524288` keeps the KV cache device-resident — the model's full **1M** context also fits, via demand-paged managed memory.
 
-Benched with `ds4-bench` (greedy, `--gen-tokens 256`, MTP on):
+### Fork knobs
 
-| context | prefill (t/s) | decode (t/s) |
-| ------: | ------------: | -----------: |
-|   4,096 |           413 |         15.0 |
-|  16,384 |           387 |         15.5 |
+CLI flags (server + bench, fork additions to upstream):
 
-Those are *prose* numbers (the bench greedily continues an Italian novel). MTP shines on low-entropy output: on real **code or structured generation** the draft accept rate is higher and sustained decode clears **20+ t/s**. Reproducible — AVL-tree codegen holds ~23 t/s (greedy, so deterministic):
+| flag                         | default      | what it does                                                                       |
+| ---------------------------- | ------------ | ---------------------------------------------------------------------------------- |
+| `--mtp PATH`                 | off          | load MTP draft model; enables combined-forward speculative decode                  |
+| `--mtp-draft N`              | 2            | draft tokens verified per forward (cascaded N=3 verifier)                          |
+| `--warm-weights`             | off          | front-load Q8→f16 dense-weight cache (~2× prefill TTFT)                            |
+| `--ctx N`                    | 4096         | KV cache size; `524288` keeps device-resident, full 1M fits via demand-paged       |
+| `--temp F` (bench)           | 0 (greedy)   | `>0` measures the sampled decode path (spec-sampling when `--mtp` set)             |
+| `--top-p`/`--min-p`/`--seed` | 0.95 / 0 / 1234 | sampler params for the sampled bench cell                                       |
+
+Environment variables (perf / observability):
+
+| env                                | default | effect                                                                  |
+| ---------------------------------- | ------- | ----------------------------------------------------------------------- |
+| `DS4_METAL_PREFILL_CHUNK=N`        | 4096    | prefill chunk tokens; **2048** frees ctx-buffer headroom (zero TPS cost on DS4-Flash). Name is historical — applies to CUDA too. |
+| `DS4_MTP_SPEC_DISABLE=1`           | off     | disable speculative sampling (greedy MTP still active)                  |
+| `DS4_GRAPH_DECODE=1`               | off     | enable bit-identical CUDA-graph decode (+5% sustained, greedy-only)     |
+| `DS4_CUDA_DIRECT_MODEL=1`          | off     | register model mapping without the startup prewarm scan (debug)         |
+| `DS4_CUDA_WEIGHT_PRELOAD_SPAN_MB=N`| 1024    | Q8→f16 dense-weight preload span size                                   |
+| `DS4_LOG_MEM=1`                    | off     | KV/buffer memory log lines on session open                              |
+| `DS4_MTP_TV=1`                     | off     | speculative-sampling acceptance probe (`1 − TV`); see `docs/mtp-nongreedy-sampling.md` |
+| `DS4_MTP_SPEC_LOG=1`               | off     | log every spec-decode miss/verifier fallback                            |
+
+`bench-with-monitor.sh` wrapper knobs: `--label NAME`, `--matrix`, `--iter N`, `--no-mtp`, `--no-temp`, `--rebuild`, `--prompt-file FILE`, `-m MODEL`, `--mtp PATH`, and `-- <pass-through-to-ds4-bench>`.
+
+### Benchmarks (GB10 / DGX Spark)
+
+Reproduce the full 3-cell decode matrix (plain · MTP-greedy · MTP-sample), 3 iterations each at 4k–32k context:
+
+```sh
+tools/perf/bench-with-monitor.sh --label thermal-matrix --matrix --iter 3
+```
+
+Or a single-cell sanity check (defaults to MTP-sample, 1 iter, same ctx sweep):
+
+```sh
+tools/perf/bench-with-monitor.sh --label sanity
+```
+
+Defaults the wrapper bakes in: model `DeepSeek-V4-Flash-IQ2XXS` chat-v2, draft `DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32` with `--mtp-draft 2`, prompt `tests/long_context_story_prompt.txt` (auto-stitched to fit `--ctx-max`), `--gen-tokens 32`, ctx sweep `--ctx-start 4096 --ctx-max 32768 --step-mul 2`; the sample cell adds `--temp 1.0 --top-p 0.95 --seed 1234`. Per-cell GPU/CPU/throttle monitors stream into `tools/perf/runs/<label>/` alongside the bench CSVs.
+
+**Decode t/s** (median of 3 iters per cell, `tools/perf/runs/thermal-matrix/`):
+
+| context | plain | mtp-greedy   | mtp-sample   |
+| ------: | ----: | -----------: | -----------: |
+|   4,096 |  14.4 | 21.7 (1.50×) | 18.1 (1.25×) |
+|   8,192 |  14.4 | 22.1 (1.54×) | 20.6 (1.43×) |
+|  16,384 |  14.2 | 20.7 (1.45×) | 19.8 (1.39×) |
+|  32,768 |  13.2 | 20.0 (1.51×) | 17.4 (1.32×) |
+
+MTP-greedy holds ~1.5× across the whole ctx range; MTP-sample stays in the 1.25–1.43× band (slightly lower at the extremes where spec-sampling acceptance and the qsort-sampler path pull against each other). Prefill is identical across cells (340–400 t/s at 4k–32k) — MTP doesn't affect prefill.
+
+Those are *prose* numbers (the bench greedily continues an Italian novel). MTP shines harder on low-entropy output: on real **code or structured generation** the draft accept rate climbs and sustained decode clears **23+ t/s** greedy. Reproducible via the server — AVL-tree codegen:
 
 ```sh
 curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{

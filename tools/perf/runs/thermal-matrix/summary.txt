@@ -1,0 +1,188 @@
+
+## ended:    2026-05-27T19:53:13-07:00  exit=130
+## global    samples=332  peak_temp=87C  peak_power=92.98W  peak_sm=2541MHz
+## global    throttle masks (non-zero):
+    0x0000000000000020  x40
+    0x0000000000000004  x5
+    0x0000000000000048  x9
+## per-cell  (execution order, idle samples between cells excluded):
+    plain#1                samples=102  peak_temp=85C peak_power=92.98W peak_sm=2541MHz  masks=0x0000000000000004,0x0000000000000020
+    plain#2                samples=104  peak_temp=87C peak_power=90.97W peak_sm=2496MHz  masks=0x0000000000000020,0x0000000000000048
+    plain#3                samples=107  peak_temp=87C peak_power=91.62W peak_sm=2496MHz  masks=0x0000000000000020,0x0000000000000048,0x0000000000000004
+    mtp-greedy#1           samples=19   peak_temp=83C peak_power=88.63W peak_sm=2496MHz
+## throttle (Active) snapshots in gpu-detail.txt: 13
+        HW Slowdown                                    : Active
+            HW Thermal Slowdown                        : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        HW Slowdown                                    : Active
+            HW Thermal Slowdown                        : Active
+## outputs: /home/trevor/Projects/ds4/tools/perf/runs/thermal-matrix
+
+## ended:    2026-05-27T19:53:16-07:00  exit=130
+## global    samples=332  peak_temp=87C  peak_power=92.98W  peak_sm=2541MHz
+## global    throttle masks (non-zero):
+    0x0000000000000020  x40
+    0x0000000000000004  x5
+    0x0000000000000048  x9
+## per-cell  (execution order, idle samples between cells excluded):
+    plain#1                samples=102  peak_temp=85C peak_power=92.98W peak_sm=2541MHz  masks=0x0000000000000004,0x0000000000000020
+    plain#2                samples=104  peak_temp=87C peak_power=90.97W peak_sm=2496MHz  masks=0x0000000000000020,0x0000000000000048
+    plain#3                samples=107  peak_temp=87C peak_power=91.62W peak_sm=2496MHz  masks=0x0000000000000020,0x0000000000000048,0x0000000000000004
+    mtp-greedy#1           samples=19   peak_temp=83C peak_power=88.63W peak_sm=2496MHz
+    mtp-greedy#2           samples=0    peak_temp=0C peak_power=0.00W peak_sm=0MHz
+## throttle (Active) snapshots in gpu-detail.txt: 13
+        HW Slowdown                                    : Active
+            HW Thermal Slowdown                        : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        HW Slowdown                                    : Active
+            HW Thermal Slowdown                        : Active
+## outputs: /home/trevor/Projects/ds4/tools/perf/runs/thermal-matrix
+
+## ended:    2026-05-27T19:53:21-07:00  exit=130
+## global    samples=332  peak_temp=87C  peak_power=92.98W  peak_sm=2541MHz
+## global    throttle masks (non-zero):
+    0x0000000000000020  x40
+    0x0000000000000004  x5
+    0x0000000000000048  x9
+## per-cell  (execution order, idle samples between cells excluded):
+    plain#1                samples=102  peak_temp=85C peak_power=92.98W peak_sm=2541MHz  masks=0x0000000000000004,0x0000000000000020
+    plain#2                samples=104  peak_temp=87C peak_power=90.97W peak_sm=2496MHz  masks=0x0000000000000020,0x0000000000000048
+    plain#3                samples=107  peak_temp=87C peak_power=91.62W peak_sm=2496MHz  masks=0x0000000000000020,0x0000000000000048,0x0000000000000004
+    mtp-greedy#1           samples=19   peak_temp=83C peak_power=88.63W peak_sm=2496MHz
+    mtp-greedy#2           samples=0    peak_temp=0C peak_power=0.00W peak_sm=0MHz
+    mtp-greedy#3           samples=0    peak_temp=0C peak_power=0.00W peak_sm=0MHz
+## throttle (Active) snapshots in gpu-detail.txt: 13
+        HW Slowdown                                    : Active
+            HW Thermal Slowdown                        : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        HW Slowdown                                    : Active
+            HW Thermal Slowdown                        : Active
+## outputs: /home/trevor/Projects/ds4/tools/perf/runs/thermal-matrix
+
+## ended:    2026-05-27T19:53:21-07:00  exit=130
+## global    samples=332  peak_temp=87C  peak_power=92.98W  peak_sm=2541MHz
+## global    throttle masks (non-zero):
+    0x0000000000000020  x40
+    0x0000000000000004  x5
+    0x0000000000000048  x9
+## per-cell  (execution order, idle samples between cells excluded):
+    plain#1                samples=102  peak_temp=85C peak_power=92.98W peak_sm=2541MHz  masks=0x0000000000000004,0x0000000000000020
+    plain#2                samples=104  peak_temp=87C peak_power=90.97W peak_sm=2496MHz  masks=0x0000000000000020,0x0000000000000048
+    plain#3                samples=107  peak_temp=87C peak_power=91.62W peak_sm=2496MHz  masks=0x0000000000000020,0x0000000000000048,0x0000000000000004
+    mtp-greedy#1           samples=19   peak_temp=83C peak_power=88.63W peak_sm=2496MHz
+    mtp-greedy#2           samples=0    peak_temp=0C peak_power=0.00W peak_sm=0MHz
+    mtp-greedy#3           samples=0    peak_temp=0C peak_power=0.00W peak_sm=0MHz
+    mtp-sample#1           samples=0    peak_temp=0C peak_power=0.00W peak_sm=0MHz
+## throttle (Active) snapshots in gpu-detail.txt: 13
+        HW Slowdown                                    : Active
+            HW Thermal Slowdown                        : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        HW Slowdown                                    : Active
+            HW Thermal Slowdown                        : Active
+## outputs: /home/trevor/Projects/ds4/tools/perf/runs/thermal-matrix
+
+## ended:    2026-05-27T19:53:25-07:00  exit=130
+## global    samples=332  peak_temp=87C  peak_power=92.98W  peak_sm=2541MHz
+## global    throttle masks (non-zero):
+    0x0000000000000020  x40
+    0x0000000000000004  x5
+    0x0000000000000048  x9
+## per-cell  (execution order, idle samples between cells excluded):
+    plain#1                samples=102  peak_temp=85C peak_power=92.98W peak_sm=2541MHz  masks=0x0000000000000004,0x0000000000000020
+    plain#2                samples=104  peak_temp=87C peak_power=90.97W peak_sm=2496MHz  masks=0x0000000000000020,0x0000000000000048
+    plain#3                samples=107  peak_temp=87C peak_power=91.62W peak_sm=2496MHz  masks=0x0000000000000020,0x0000000000000048,0x0000000000000004
+    mtp-greedy#1           samples=19   peak_temp=83C peak_power=88.63W peak_sm=2496MHz
+    mtp-greedy#2           samples=0    peak_temp=0C peak_power=0.00W peak_sm=0MHz
+    mtp-greedy#3           samples=0    peak_temp=0C peak_power=0.00W peak_sm=0MHz
+    mtp-sample#1           samples=0    peak_temp=0C peak_power=0.00W peak_sm=0MHz
+    mtp-sample#2           samples=0    peak_temp=0C peak_power=0.00W peak_sm=0MHz
+## throttle (Active) snapshots in gpu-detail.txt: 13
+        HW Slowdown                                    : Active
+            HW Thermal Slowdown                        : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        HW Slowdown                                    : Active
+            HW Thermal Slowdown                        : Active
+## outputs: /home/trevor/Projects/ds4/tools/perf/runs/thermal-matrix
+
+## ended:    2026-05-27T19:53:30-07:00  exit=130
+## global    samples=332  peak_temp=87C  peak_power=92.98W  peak_sm=2541MHz
+## global    throttle masks (non-zero):
+    0x0000000000000020  x40
+    0x0000000000000004  x5
+    0x0000000000000048  x9
+## per-cell  (execution order, idle samples between cells excluded):
+    plain#1                samples=102  peak_temp=85C peak_power=92.98W peak_sm=2541MHz  masks=0x0000000000000004,0x0000000000000020
+    plain#2                samples=104  peak_temp=87C peak_power=90.97W peak_sm=2496MHz  masks=0x0000000000000020,0x0000000000000048
+    plain#3                samples=107  peak_temp=87C peak_power=91.62W peak_sm=2496MHz  masks=0x0000000000000020,0x0000000000000048,0x0000000000000004
+    mtp-greedy#1           samples=19   peak_temp=83C peak_power=88.63W peak_sm=2496MHz
+    mtp-greedy#2           samples=0    peak_temp=0C peak_power=0.00W peak_sm=0MHz
+    mtp-greedy#3           samples=0    peak_temp=0C peak_power=0.00W peak_sm=0MHz
+    mtp-sample#1           samples=0    peak_temp=0C peak_power=0.00W peak_sm=0MHz
+    mtp-sample#2           samples=0    peak_temp=0C peak_power=0.00W peak_sm=0MHz
+    mtp-sample#3           samples=0    peak_temp=0C peak_power=0.00W peak_sm=0MHz
+## throttle (Active) snapshots in gpu-detail.txt: 13
+        HW Slowdown                                    : Active
+            HW Thermal Slowdown                        : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        HW Slowdown                                    : Active
+            HW Thermal Slowdown                        : Active
+## outputs: /home/trevor/Projects/ds4/tools/perf/runs/thermal-matrix
+
+## ended:    2026-05-27T19:53:30-07:00  exit=130
+## global    samples=332  peak_temp=87C  peak_power=92.98W  peak_sm=2541MHz
+## global    throttle masks (non-zero):
+    0x0000000000000020  x40
+    0x0000000000000004  x5
+    0x0000000000000048  x9
+## per-cell  (execution order, idle samples between cells excluded):
+    plain#1                samples=102  peak_temp=85C peak_power=92.98W peak_sm=2541MHz  masks=0x0000000000000004,0x0000000000000020
+    plain#2                samples=104  peak_temp=87C peak_power=90.97W peak_sm=2496MHz  masks=0x0000000000000020,0x0000000000000048
+    plain#3                samples=107  peak_temp=87C peak_power=91.62W peak_sm=2496MHz  masks=0x0000000000000020,0x0000000000000048,0x0000000000000004
+    mtp-greedy#1           samples=19   peak_temp=83C peak_power=88.63W peak_sm=2496MHz
+    mtp-greedy#2           samples=0    peak_temp=0C peak_power=0.00W peak_sm=0MHz
+    mtp-greedy#3           samples=0    peak_temp=0C peak_power=0.00W peak_sm=0MHz
+    mtp-sample#1           samples=0    peak_temp=0C peak_power=0.00W peak_sm=0MHz
+    mtp-sample#2           samples=0    peak_temp=0C peak_power=0.00W peak_sm=0MHz
+    mtp-sample#3           samples=0    peak_temp=0C peak_power=0.00W peak_sm=0MHz
+## throttle (Active) snapshots in gpu-detail.txt: 13
+        HW Slowdown                                    : Active
+            HW Thermal Slowdown                        : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        SW Thermal Slowdown                            : Active
+        HW Slowdown                                    : Active
+            HW Thermal Slowdown                        : Active
+## outputs: /home/trevor/Projects/ds4/tools/perf/runs/thermal-matrix

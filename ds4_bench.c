@@ -43,6 +43,10 @@ typedef struct {
     int mtp_draft_tokens;
     bool warm_weights;
     bool quality;
+    float temperature;   /* >0 => sampled decode (spec-sampling when --mtp); 0 => greedy */
+    float top_p;
+    float min_p;
+    uint64_t seed;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -162,6 +166,10 @@ static bench_config parse_options(int argc, char **argv) {
         .gen_tokens = 128,
         .step_mul = 1.0,
         .mtp_draft_tokens = 2,
+        .temperature = 0.0f,        /* greedy by default */
+        .top_p = 0.95f,
+        .min_p = 0.0f,
+        .seed = 1234,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -237,6 +245,14 @@ static bench_config parse_options(int argc, char **argv) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--temp")) {
+            c.temperature = (float)parse_double_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--top-p")) {
+            c.top_p = (float)parse_double_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--min-p")) {
+            c.min_p = (float)parse_double_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--seed")) {
+            c.seed = (uint64_t)strtoull(need_arg(&i, argc, argv, arg), NULL, 10);
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
             usage(stderr, NULL);
@@ -567,6 +583,8 @@ int main(int argc, char **argv) {
         }
 
         const double gen_t0 = bench_now_sec();
+        const bool sampled = cfg.temperature > 0.0f;
+        uint64_t rng = cfg.seed;   /* reset per frontier for reproducible sampled runs */
         int produced = 0;
         while (produced < cfg.gen_tokens) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
@@ -574,7 +592,12 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
-            const int token = ds4_session_argmax_excluding(session, eos);
+            /* Greedy default keeps rows comparable; --temp>0 measures the real
+             * sampled decode path (spec-sampling when --mtp).  Sampled spec calls
+             * pass eos=-1 so generation never early-stops (full gen_tokens/row). */
+            const int token = sampled
+                ? ds4_session_sample(session, cfg.temperature, 0, cfg.top_p, cfg.min_p, &rng)
+                : ds4_session_argmax_excluding(session, eos);
             if (token < 0) {
                 fprintf(stderr, "ds4-bench: failed to choose non-EOS token at frontier %d\n", frontier);
                 rc = 1;
@@ -586,7 +609,12 @@ int main(int argc, char **argv) {
                  * the CLI/server decode path so the bench measures the real
                  * --mtp throughput, not a separate code path. */
                 int toks[17];
-                const int ntok = ds4_session_eval_speculative_argmax(
+                const int ntok = sampled
+                    ? ds4_session_eval_speculative_sample(
+                        session, token, cfg.gen_tokens - produced, /*eos*/ -1,
+                        cfg.temperature, 0, cfg.top_p, cfg.min_p, &rng,
+                        toks, (int)(sizeof(toks) / sizeof(toks[0])), err, sizeof(err))
+                    : ds4_session_eval_speculative_argmax(
                         session, token, cfg.gen_tokens - produced, eos,
                         toks, (int)(sizeof(toks) / sizeof(toks[0])), err, sizeof(err));
                 if (ntok < 0) {
