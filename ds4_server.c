@@ -10501,8 +10501,7 @@ decode_again:
             }
         } else if (temperature > 0.0f &&
                    ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
-                   getenv("DS4_MTP_SPEC_DISABLE") == NULL &&
-                   getenv("DS4_MTP_SAMPLE") != NULL)
+                   getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
             ntok = ds4_session_eval_speculative_sample(s->session,
                                                        token,

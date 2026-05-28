@@ -485,7 +485,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                 return 1;
             }
         } else if (cfg->gen.temperature > 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
-                   getenv("DS4_MTP_SPEC_DISABLE") == NULL && getenv("DS4_MTP_SAMPLE") != NULL) {
+                   getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             ntok = ds4_session_eval_speculative_sample(session,
                                                        token,
                                                        max_tokens - generated,
@@ -1172,7 +1172,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                 return 1;
             }
         } else if (cfg->gen.temperature > 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
-                   getenv("DS4_MTP_SPEC_DISABLE") == NULL && getenv("DS4_MTP_SAMPLE") != NULL) {
+                   getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             ntok = ds4_session_eval_speculative_sample(chat->session,
                                                        token,
                                                        max_tokens - generated,

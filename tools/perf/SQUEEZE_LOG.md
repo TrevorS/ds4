@@ -383,10 +383,12 @@ greedy-only profiling:
    19.48 t/s (+30%, high accept), prose 14.95 → 16.16 (+8%, low accept)** — win
    scales with accept, as predicted.  Verified coherent, deterministic (seeded),
    and reduces to greedy in the low-temp limit.  Stacks on the qsort win for the
-   whole sampled-chat path.  Gated for rollout; flip the env / drop the gate once
-   the math is now verified exact by `./ds4_test --spec-sampling` (host-only:
-  TV(out,p)<0.004 and empirical accept == Σmin(p,q) across q==p / sharper /
-  flatter / disjoint-modes / random); drop the gate after a GPU-path soak.
+   whole sampled-chat path.  **Default-on** (the `DS4_MTP_SAMPLE` enable-gate was
+   removed; `DS4_MTP_SPEC_DISABLE` is the off-switch).  Math verified exact by
+   `./ds4_test --spec-sampling` (host-only: TV(out,p)<0.004 and empirical accept ==
+   Σmin(p,q) across q==p / sharper / flatter / disjoint-modes / random), and a
+   content×temp×ctx soak found **every cell ≥ plain, no slower-than-plain regime,
+   no crash** — code +26–41%, prose +14–22%, deep (managed KV) +14–26%.
 3. **Depth** — managed-KV tax ~14–19%; config lever (right-size `--ctx`) or an
    owner-level managed-KV optimization.
 
