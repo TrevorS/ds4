@@ -11223,37 +11223,24 @@ static int routed_moe_launch(
                             write_gate_up, clamp);
                     }
                 } else if (expert_tile_m == 8u) {
-                    /* Scout: opt-in small-batch rowspan for MTP decode (n_tokens 2-8).
-                     * The existing rowspan template only fires at n_tokens >= 128;
-                     * SMs show only 30% warp occupancy on tile8_row32 at decode,
-                     * so a wider row span per block should help latency hiding. */
-                    if (getenv("DS4_CUDA_MOE_GATE_SMALL_ROW256") != NULL) {
-                        dim3 tgrid((expert_mid_dim + 255u) / 256u, tile_capacity, 1);
-                        moe_gate_up_mid_expert_tile8_rowspan_kernel<256><<<tgrid, 256>>>(
-                            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
-                            gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
-                            tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
-                            gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
-                            write_gate_up, clamp);
-                    } else if (getenv("DS4_CUDA_MOE_GATE_SMALL_ROW128") != NULL) {
-                        dim3 tgrid((expert_mid_dim + 127u) / 128u, tile_capacity, 1);
-                        moe_gate_up_mid_expert_tile8_rowspan_kernel<128><<<tgrid, 256>>>(
-                            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
-                            gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
-                            tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
-                            gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
-                            write_gate_up, clamp);
-                    } else if (getenv("DS4_CUDA_MOE_GATE_SMALL_ROW64") != NULL) {
-                        dim3 tgrid((expert_mid_dim + 63u) / 64u, tile_capacity, 1);
-                        moe_gate_up_mid_expert_tile8_rowspan_kernel<64><<<tgrid, 256>>>(
+                    /* Default to rowspan<128>: validated +2% to +18% across
+                     * 6k-148k ctx with --mtp-draft 2 sampled MTP, no
+                     * regressions across 12 paired runs. The wider row span
+                     * gives each block more rows to amortise the shared
+                     * mid-q load and warp reductions, which lifts the
+                     * 30% compute-warp occupancy that row32 was leaving on
+                     * the table.  Opt-out via DS4_CUDA_MOE_NO_SMALL_ROW128. */
+                    if (getenv("DS4_CUDA_MOE_NO_SMALL_ROW128") != NULL) {
+                        dim3 tgrid((expert_mid_dim + 31u) / 32u, tile_capacity, 1);
+                        moe_gate_up_mid_expert_tile8_row32_kernel<<<tgrid, 256>>>(
                             (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                             gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                             tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
                             gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
                             write_gate_up, clamp);
                     } else {
-                        dim3 tgrid((expert_mid_dim + 31u) / 32u, tile_capacity, 1);
-                        moe_gate_up_mid_expert_tile8_row32_kernel<<<tgrid, 256>>>(
+                        dim3 tgrid((expert_mid_dim + 127u) / 128u, tile_capacity, 1);
+                        moe_gate_up_mid_expert_tile8_rowspan_kernel<128><<<tgrid, 256>>>(
                             (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                             gate_w, up_w, xq, sorted_pairs, sorted_offsets, sorted_counts,
                             tile_total, tile_experts, tile_starts, (const float *)weights->ptr,
@@ -11506,23 +11493,18 @@ static int routed_moe_launch(
                         down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
                         midq_blocks, out_dim, n_expert, use_atomic_down);
                 } else if (expert_tile_m == 8u) {
-                    if (getenv("DS4_CUDA_MOE_DOWN_SMALL_ROW128") != NULL) {
-                        dim3 tgrid((out_dim + 127u) / 128u, down_tile_capacity, 1);
-                        moe_down_expert_tile8_rowspan_kernel<128><<<tgrid, 256>>>(
-                            use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
-                            down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
-                            down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
-                            midq_blocks, out_dim, n_expert, use_atomic_down);
-                    } else if (getenv("DS4_CUDA_MOE_DOWN_SMALL_ROW64") != NULL) {
-                        dim3 tgrid((out_dim + 63u) / 64u, down_tile_capacity, 1);
-                        moe_down_expert_tile8_rowspan_kernel<64><<<tgrid, 256>>>(
+                    /* Mirror of gate_up: rowspan<128> default, with the same
+                     * opt-out env var so both sides flip together. */
+                    if (getenv("DS4_CUDA_MOE_NO_SMALL_ROW128") != NULL) {
+                        dim3 tgrid((out_dim + 31u) / 32u, down_tile_capacity, 1);
+                        moe_down_expert_tile8_row32_kernel<<<tgrid, 256>>>(
                             use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
                             down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                             down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
                             midq_blocks, out_dim, n_expert, use_atomic_down);
                     } else {
-                        dim3 tgrid((out_dim + 31u) / 32u, down_tile_capacity, 1);
-                        moe_down_expert_tile8_row32_kernel<<<tgrid, 256>>>(
+                        dim3 tgrid((out_dim + 127u) / 128u, down_tile_capacity, 1);
+                        moe_down_expert_tile8_rowspan_kernel<128><<<tgrid, 256>>>(
                             use_atomic_down ? (float *)out->ptr : (float *)down->ptr,
                             down_w, midq, sorted_pairs, sorted_offsets, sorted_counts,
                             down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
