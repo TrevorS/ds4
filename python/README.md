@@ -1,15 +1,14 @@
-# Python embedding — `ds4.py`
+# Python embedding
 
-In-process binding for the ds4 engine. `ds4.py` loads `libds4.so` and drives the
-full public C API from `ds4.h` via `ctypes` — no server, no HTTP, shared address
-space with direct access to logits, sampling, steering, and KV state.
+Three layers:
 
-Use this when you want in-process control. For plain chat, the OpenAI/Anthropic
-routes on `ds4-server` are the easier call; this path pays off for logit access,
-custom decode loops, steering experiments, and KV snapshot reuse.
+- **`ds4.py`** — pure ctypes binding to the full `ds4.h` public API. Stdlib-only; loads `libds4.so` and exposes `Engine` / `Session` / `ChatBuilder` directly over the C calls. Use this when you want the lowest-overhead in-process control.
+- **`ds4_steering.py`** — Pythonic SDK on top, numpy-shaped. Adds `capture_activations`, `build_direction`, `save_direction`, `load_direction`, and the chat-prompt helpers used by the direction-steering workflow.
+- **Scripts** (`dir-steering/tools/build_direction.py`, `run_sweep.py`) — thin CLIs over the SDK.
 
-This binding lives in `python/`; the engine sources and `Makefile` are in the
-repo root.
+No server, no HTTP, shared address space with direct access to logits, sampling, steering, and KV state. Use this when you want in-process control. For plain chat, the OpenAI/Anthropic routes on `ds4-server` are the easier call; this path pays off for logit access, custom decode loops, steering experiments, and KV snapshot reuse.
+
+The binding lives in `python/`; the engine sources and `Makefile` are in the repo root. Numpy (used by `ds4_steering.py` and the scripts) is declared in the repo-root `pyproject.toml` — run with `uv run python ...` or activate `.venv` after `uv sync`.
 
 ## Build
 
@@ -115,14 +114,59 @@ if eng.has_mtp and tok != eng.eos:
 
 ## Directional steering
 
-Load a profile and set attn/ffn scales at runtime (scales are read fresh each
-forward; 0/0 is bit-identical to no steering):
+Low level — load a profile and set attn/ffn scales at runtime (scales are read fresh each forward; 0/0 is bit-identical to no steering):
 
 ```python
 s.steering_select("refusal", "/tmp/steer/refusal.bin", attn=0.0, ffn=2.0)
 print(s.get_steering())               # (attn, ffn, loaded)
 s.set_steering_scale(0.0, 0.0)        # disable without unloading
 ```
+
+Or scope a scale change to a block via the context manager (auto-restores on exit) — ergonomic for sweeps:
+
+```python
+with s.steering(attn=0.0, ffn=2.0):
+    for _ in range(64):
+        s.eval(s.sample(temperature=0.0))
+# scale is back to whatever it was before the `with`
+```
+
+High level — `ds4_steering.py` covers the whole "build a direction from paired prompts" workflow without leaving Python:
+
+```python
+import ds4, ds4_steering as steering
+
+eng = ds4.Engine("ds4flash.gguf")
+good = ["...desired-style prompt 1...", "...prompt 2..."]
+bad  = ["...contrast-style prompt 1...", "...prompt 2..."]
+
+directions = steering.build_direction(
+    eng, good, bad,
+    component="ffn_out",       # or "attn_out"
+    system="You are a helpful assistant.",
+    think=False,
+    ctx=512,
+    pair_normalize=False,
+    orthogonalize=True,
+)
+# (n_layers, n_embd) float32 ndarray — single model load for the whole sweep.
+
+steering.save_direction(directions, "out/direction.json",
+                        meta={"component": "ffn_out", "label": "refusal"})
+
+# load later:
+directions, meta = steering.load_direction("out/direction.json")
+```
+
+Or just capture one prompt's per-layer activations (used internally by `build_direction`, exposed for ad-hoc probing):
+
+```python
+prompt = steering.render_ds4_prompt("You are helpful.", "What is 2+2?", think=False)
+acts = steering.capture_activations(eng, prompt, component="ffn_out")
+# acts.shape == (43, 4096), float32
+```
+
+Under the hood `capture_activations` calls `Session.collect_layer_activations(...)` (the low-level API) which wraps the file-based `DS4_METAL_GRAPH_DUMP_*` hooks in `ds4.c`: env vars are set around a `sync()` call, per-layer .bin files are read back, and the env is restored on exit.
 
 ## KV persistence
 

@@ -25,6 +25,8 @@ this alongside a live ds4-server (single-instance lock + 81 GB weights).
 import array
 import ctypes as C
 import os
+import tempfile
+from pathlib import Path
 
 # ── enums (mirror ds4.h) ────────────────────────────────────────────────────
 BACKEND_METAL, BACKEND_CUDA, BACKEND_CPU = 0, 1, 2
@@ -678,6 +680,30 @@ class Session:
     def set_steering_scale(self, attn, ffn):
         return lib().ds4_session_set_steering_scale(self.h, attn, ffn)
 
+    def steering(self, attn, ffn):
+        """Context manager: temporarily set the steering scale, restoring
+        the prior (attn, ffn) on exit. Ergonomic for sweeps.
+
+        Requires the direction tensor to already be loaded on this session
+        — pass non-zero ``steering_attn``/``steering_ffn`` at engine open OR
+        call :meth:`reload_steering` first. Setting a scale here without
+        loaded dirs has no effect on the forward pass (the C side gates
+        load on a non-zero scale at session create)."""
+        sess = self
+
+        class _Scoped:
+            def __enter__(self):
+                prior_attn, prior_ffn, _ = sess.get_steering()
+                self._prior = (prior_attn, prior_ffn)
+                sess.set_steering_scale(attn, ffn)
+                return sess
+
+            def __exit__(self, *_exc):
+                sess.set_steering_scale(*self._prior)
+                return False
+
+        return _Scoped()
+
     def get_steering(self):
         attn, ffn, loaded = C.c_float(), C.c_float(), C.c_bool()
         lib().ds4_session_get_steering(
@@ -711,6 +737,74 @@ class Session:
         if rc != 0:
             raise RuntimeError(f"reload_steering failed: {err.value.decode()}")
         return rc
+
+    # activation capture (file-based dump hooks in ds4.c)
+    def collect_layer_activations(
+        self,
+        prompt_tokens,
+        *,
+        component,
+        n_layers,
+        n_embd,
+        pos=0,
+        work_dir=None,
+    ):
+        """Sync prompt_tokens with per-layer activation dumps enabled, then
+        read back the captured rows. Returns list[array.array("f")] of length
+        n_layers, each entry n_embd floats long.
+
+        Wraps the file-based DS4_METAL_GRAPH_DUMP_{PREFIX,NAME,POS} hooks
+        in ds4.c: env vars are set around the underlying sync() call and
+        the prior values are restored on exit. component must match a
+        dumpable tensor name (e.g. "ffn_out", "attn_out").
+
+        Disturbs the session's KV cache (sync writes through it). If
+        work_dir is None, a private tempdir is created and cleaned up.
+        """
+        own_work = work_dir is None
+        work = Path(tempfile.mkdtemp(prefix="ds4-act-") if own_work else work_dir)
+        if not own_work:
+            work.mkdir(parents=True, exist_ok=True)
+        prefix = work / "dump"
+        keys = (
+            "DS4_METAL_GRAPH_DUMP_PREFIX",
+            "DS4_METAL_GRAPH_DUMP_NAME",
+            "DS4_METAL_GRAPH_DUMP_POS",
+        )
+        prev = {k: os.environ.get(k) for k in keys}
+        try:
+            os.environ["DS4_METAL_GRAPH_DUMP_PREFIX"] = str(prefix)
+            os.environ["DS4_METAL_GRAPH_DUMP_NAME"] = component
+            os.environ["DS4_METAL_GRAPH_DUMP_POS"] = str(pos)
+            self.sync(prompt_tokens)
+            rows = []
+            for layer in range(n_layers):
+                path = work / f"dump_{component}-{layer}_pos{pos}.bin"
+                if not path.exists():
+                    raise RuntimeError(f"dump file missing: {path}")
+                data = array.array("f")
+                with path.open("rb") as f:
+                    data.fromfile(f, path.stat().st_size // 4)
+                if len(data) < n_embd or len(data) % n_embd != 0:
+                    raise RuntimeError(f"bad dump shape {path}: {len(data)} floats")
+                rows.append(data[-n_embd:])
+            return rows
+        finally:
+            for k, v in prev.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            if own_work:
+                for p in work.glob("*"):
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+                try:
+                    work.rmdir()
+                except OSError:
+                    pass
 
     def set_progress(self, callback, display=False):
         """callback(event:str, current:int, total:int). Pass None to clear."""
