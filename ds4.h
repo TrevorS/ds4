@@ -268,6 +268,17 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
+/* Distribution-preserving speculative SAMPLING decode (MTP at temperature > 0): drafts
+ * are sampled from the MTP draft distribution and verified by rejection sampling, so the
+ * committed stream is distributed exactly as plain sampling from the (truncated) target.
+ * first_token is the caller's freshly-sampled token; rng/params must match the sampler
+ * the caller uses.  Returns committed token count (>=1), or -1 on error. */
+int ds4_session_eval_speculative_sample(ds4_session *s, int first_token,
+                                        int max_tokens, int eos_token,
+                                        float temperature, int top_k, float top_p, float min_p,
+                                        uint64_t *rng,
+                                        int *accepted, int accepted_cap,
+                                        char *err, size_t errlen);
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
