@@ -16393,6 +16393,131 @@ static int sample_top_p_min_p(
     return ids[filtered - 1];
 }
 
+/* ===== Speculative sampling (MTP draft + verify at temperature > 0) ================
+ * Distribution-preserving spec decode (Leviathan/Chen rejection sampling): draft
+ * tokens are SAMPLED from the MTP draft distribution q (not argmaxed), then accepted
+ * or rejected against the target p so the committed stream is distributed EXACTLY as
+ * plain sampling from the target would be.
+ *
+ * Design: we preserve the *truncated* target — temperature + top_k + top_p + min_p
+ * applied (matching sample_full_vocab's nucleus), so the output equals what plain
+ * truncated sampling produces.  Both p and q are truncated/renormalized the same way;
+ * accept draft~q_trunc with prob min(1, p_trunc[draft]/q_trunc[draft]); on reject draw
+ * from the normalized residual max(0, p_trunc - q_trunc).  All host-side; the nucleus
+ * is tiny (top_p=0.95 ~ <256 ids) so the O(nucleus^2) residual is cheap.
+ * ================================================================================== */
+#define DS4_SPEC_NUCLEUS_CAP 1024
+
+typedef struct { int id; float prob; } spec_prob;   /* prob renormalized within nucleus */
+
+/* Build the truncated+renormalized sampling distribution as a sorted-desc sparse list,
+ * matching sample_full_vocab's nucleus (full-softmax denominator for the top_p cutoff,
+ * renormalized within the kept set).  Writes out[0..n); probs sum to ~1.  top_k>0 caps
+ * the nucleus size.  out must hold DS4_SPEC_NUCLEUS_CAP entries. */
+static int spec_build_trunc_dist(const float *logits, uint32_t n_vocab,
+                                 float temperature, int top_k, float top_p, float min_p,
+                                 spec_prob *out) {
+    if (temperature <= 0.0f) temperature = 1.0f;
+    if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
+    if (min_p < 0.0f) min_p = 0.0f;
+
+    float max_logit = DS4_NEG_INF;
+    for (uint32_t i = 0; i < n_vocab; i++)
+        if (isfinite(logits[i]) && logits[i] > max_logit) max_logit = logits[i];
+    if (max_logit == DS4_NEG_INF) return 0;
+
+    int   topk_id[DS4_SPEC_NUCLEUS_CAP];
+    float topk_prob[DS4_SPEC_NUCLEUS_CAP];
+    int   k = 0;
+    double sum = 0.0;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        if (!isfinite(v)) continue;
+        const float p = expf((v - max_logit) / temperature);
+        sum += (double)p;
+        if (k == DS4_SPEC_NUCLEUS_CAP && p <= topk_prob[DS4_SPEC_NUCLEUS_CAP - 1]) continue;
+        int j = (k < DS4_SPEC_NUCLEUS_CAP) ? k++ : k - 1;
+        while (j > 0 && topk_prob[j - 1] < p) {
+            topk_prob[j] = topk_prob[j - 1];
+            topk_id[j]   = topk_id[j - 1];
+            j--;
+        }
+        topk_prob[j] = p;
+        topk_id[j]   = (int)i;
+    }
+    if (sum <= 0.0 || k == 0) return 0;
+
+    int cap = k;
+    if (top_k > 0 && top_k < cap) cap = top_k;
+    const float min_prob = (topk_prob[0] / (float)sum) * min_p;   /* topk_prob[0] == max prob */
+    double filtered_sum = 0.0;
+    int n = 0;
+    for (int i = 0; i < cap; i++) {
+        const float pn = topk_prob[i] / (float)sum;
+        if (i > 0 && pn < min_prob) break;
+        filtered_sum += (double)topk_prob[i];
+        out[n].id   = topk_id[i];
+        out[n].prob = topk_prob[i];                  /* unnormalized; renormalized below */
+        n++;
+        if (filtered_sum / sum >= (double)top_p) break;
+    }
+    if (n == 0 || filtered_sum <= 0.0) { out[0].id = topk_id[0]; out[0].prob = 1.0f; return 1; }
+    const float inv = (float)(1.0 / filtered_sum);
+    for (int i = 0; i < n; i++) out[i].prob *= inv;
+    return n;
+}
+
+/* Sample an id from a sparse normalized distribution (probs ~sum to 1). */
+static int spec_sample_from_dist(const spec_prob *dist, int n, uint64_t *rng) {
+    if (n <= 0) return -1;
+    float r = sample_rng_f32(rng);
+    for (int i = 0; i < n; i++) {
+        r -= dist[i].prob;
+        if (r <= 0.0f) return dist[i].id;
+    }
+    return dist[n - 1].id;
+}
+
+/* prob assigned to `id` by a sparse dist (0 if outside its support). */
+static float spec_dist_prob(const spec_prob *dist, int n, int id) {
+    for (int i = 0; i < n; i++) if (dist[i].id == id) return dist[i].prob;
+    return 0.0f;
+}
+
+/* One speculative-sampling acceptance step at a single position.  `q_trunc` (q_n) is
+ * the truncated draft distribution `draft` was sampled from; `p_logits` is the target
+ * row.  Returns the committed token and sets *accepted.  Accept: returns `draft`.
+ * Reject: returns a token drawn from norm(max(0, p_trunc - q_trunc)). */
+static DS4_MAYBE_UNUSED int spec_sample_step(const float *p_logits, uint32_t n_vocab,
+                            const spec_prob *q_trunc, int q_n, int draft,
+                            float temperature, int top_k, float top_p, float min_p,
+                            uint64_t *rng, bool *accepted) {
+    spec_prob p_trunc[DS4_SPEC_NUCLEUS_CAP];
+    int p_n = spec_build_trunc_dist(p_logits, n_vocab, temperature, top_k, top_p, min_p, p_trunc);
+    if (p_n <= 0) { *accepted = false; return spec_sample_from_dist(q_trunc, q_n, rng); }
+
+    const float p_draft = spec_dist_prob(p_trunc, p_n, draft);
+    const float q_draft = spec_dist_prob(q_trunc, q_n, draft);
+
+    /* accept iff u <= p_draft/q_draft (q_draft>0 since draft was drawn from q_trunc) */
+    const float u = sample_rng_f32(rng);
+    if (q_draft <= 0.0f || u * q_draft <= p_draft) { *accepted = true; return draft; }
+    *accepted = false;
+
+    /* residual norm(max(0, p_trunc - q_trunc)) over p_trunc's support */
+    spec_prob resid[DS4_SPEC_NUCLEUS_CAP];
+    int r_n = 0;
+    double rsum = 0.0;
+    for (int i = 0; i < p_n; i++) {
+        const float d = p_trunc[i].prob - spec_dist_prob(q_trunc, q_n, p_trunc[i].id);
+        if (d > 0.0f) { resid[r_n].id = p_trunc[i].id; resid[r_n].prob = d; rsum += (double)d; r_n++; }
+    }
+    if (r_n == 0 || rsum <= 0.0) return spec_sample_from_dist(p_trunc, p_n, rng);  /* p≈q corner */
+    const float inv = (float)(1.0 / rsum);
+    for (int i = 0; i < r_n; i++) resid[i].prob *= inv;
+    return spec_sample_from_dist(resid, r_n, rng);
+}
+
 static void print_top_logits(
         FILE          * fp,
         const char    * label,
@@ -19618,6 +19743,160 @@ static int ds4_session_eval_speculative_argmax_combined(
 
     return n_accept;
 }
+
+/* Combined N=K+1 speculative *sampling* decode.  Same batched-forward structure as
+ * ds4_session_eval_speculative_argmax_combined, but drafts are SAMPLED from the MTP
+ * draft distribution q (not argmaxed) and verified by distribution-preserving
+ * rejection sampling (spec_sample_step) against the target p, so the committed stream
+ * is distributed as plain sampling from the (truncated) target.  On the first reject
+ * the residual token is drawn and committed via one extra main forward (argmax defers
+ * its correction to the next first_token; sampling can't — the residual is a one-shot
+ * draw).  On full accept the bonus is deferred to the next iter's first_token (sampled
+ * by the caller from s->logits).  Returns committed count, -1 on error, -2 on a
+ * precondition gap (caller falls back to plain eval). */
+static int ds4_session_eval_speculative_sample_combined(
+        ds4_session *s, int first_token, int max_tokens, int eos_token,
+        float temperature, int top_k, float top_p, float min_p, uint64_t *rng,
+        int *accepted, int accepted_cap, char *err, size_t errlen) {
+    ds4_engine *e = s->engine;
+    int n_accept = 0;
+
+    if (!s->combined_prev_hc_valid || !s->graph.combined_prev_hc) return -2;
+
+    int draft_cap = (getenv("DS4_MTP_NO_CASCADE") != NULL) ? 1 : 2;
+    if (draft_cap > 2) draft_cap = 2;                 /* K=2 (prefix1/prefix2 frontier) */
+    if (draft_cap > max_tokens - 1) draft_cap = max_tokens - 1;
+    if (draft_cap > accepted_cap - 1) draft_cap = accepted_cap - 1;
+    int room = s->ctx_size - s->checkpoint.len;
+    if (draft_cap > room - 1) draft_cap = room - 1;
+    if (draft_cap < 1) return -2;
+
+    const uint32_t mtp_base_raw = s->graph.mtp_n_raw;
+    const uint32_t base_pos = (uint32_t)s->checkpoint.len;
+    const bool mtp_timing = getenv("DS4_MTP_TIMING") != NULL;
+    const double mtp_t0 = mtp_timing ? now_sec() : 0.0;
+
+    int drafts[3] = { -1, -1, -1 };
+    static _Thread_local spec_prob q_dist[2][DS4_SPEC_NUCLEUS_CAP];
+    int q_n[2] = { 0, 0 };
+
+    /* Manual draft chain that SAMPLES each row (vs the argmax n-primitive): MTP block
+     * -> q logits -> truncated dist -> sample -> feed the SAMPLED token to the next
+     * block.  HC ping-pongs mtp_state_hc / mtp_next_hc exactly as the n-primitive. */
+    int draft_n = 0;
+    for (int i = 0; i < draft_cap; i++) {
+        ds4_gpu_tensor *prev_hc = (i == 0) ? s->graph.combined_prev_hc
+                                : ((i & 1) ? s->graph.mtp_state_hc : s->graph.mtp_next_hc);
+        ds4_gpu_tensor *out_hc  = (i & 1) ? s->graph.mtp_next_hc : s->graph.mtp_state_hc;
+        const int in_token = (i == 0) ? first_token : drafts[i - 1];
+        int mtp_top = -1;
+        bool ok = metal_graph_eval_mtp_draft_from_hc(
+            &s->graph, &e->model, &e->weights, &e->mtp_model, &e->mtp_weights,
+            prev_hc, out_hc, in_token, base_pos + (uint32_t)i,
+            s->mtp_logits, &mtp_top);
+        if (!ok) { if (i == 0) return -2; break; }
+        q_n[i] = spec_build_trunc_dist(s->mtp_logits, DS4_N_VOCAB,
+                                       temperature, top_k, top_p, min_p, q_dist[i]);
+        if (q_n[i] <= 0) { if (i == 0) return -2; break; }
+        drafts[i] = spec_sample_from_dist(q_dist[i], q_n[i], rng);
+        draft_n++;
+        if (drafts[i] == eos_token) break;
+    }
+    s->combined_prev_hc_valid = false;
+    s->mtp_draft_valid = false;
+    if (draft_n < 1) return -2;
+
+    /* Push [first_token, drafts...] and run the batched verify for per-row target p. */
+    const int start = s->checkpoint.len;
+    token_vec_push(&s->checkpoint, first_token);
+    for (int i = 0; i < draft_n; i++) token_vec_push(&s->checkpoint, drafts[i]);
+    const uint32_t n_tokens = (uint32_t)(draft_n + 1);
+
+    int row_tops[3] = { -1, -1, -1 };
+    float *row_logits = s->spec_row_logits_buf;
+    bool ok = (row_logits != NULL) &&
+              metal_graph_verify_suffix_tops(&s->graph, &e->model, &e->weights,
+                                             &s->checkpoint, (uint32_t)start, n_tokens,
+                                             /*capture_prefix1*/ true, row_tops, row_logits);
+    if (!ok) {
+        s->checkpoint.len = start;
+        snprintf(err, errlen, "%s combined-forward failed", ds4_backend_name(e->backend));
+        s->checkpoint_valid = false;
+        return -1;
+    }
+
+    /* Rejection-sampling accept loop: accept drafts[i] against target row_logits[i]. */
+    int commit = 0;
+    int resampled = -1;
+    bool rejected = false;
+    while (commit < draft_n) {
+        bool acc = false;
+        int tok = spec_sample_step(row_logits + (uint64_t)commit * DS4_N_VOCAB, DS4_N_VOCAB,
+                                   q_dist[commit], q_n[commit], drafts[commit],
+                                   temperature, top_k, top_p, min_p, rng, &acc);
+        if (!acc) { resampled = tok; rejected = true; break; }
+        commit++;
+        if (drafts[commit - 1] == eos_token) break;   /* accepted EOS ends generation */
+    }
+
+    /* Rewind checkpoint to first_token + accepted drafts; roll the compressor frontier
+     * back past the rejected suffix (same prefix1/prefix2 snapshots argmax uses). */
+    s->checkpoint.len = start + 1 + commit;
+    if (commit < draft_n) {
+        bool rb_ok = (commit == 0) ? spec_frontier_commit_prefix1(s)
+                   : (commit == 1) ? spec_frontier_commit_prefix2(s)
+                   : true;
+        if (!rb_ok) {
+            snprintf(err, errlen, "%s prefix commit failed", ds4_backend_name(e->backend));
+            s->checkpoint_valid = false;
+            return -1;
+        }
+    }
+
+    /* Commit first_token + accepted drafts. */
+    accepted[n_accept++] = first_token;
+    bool hit_eos = (first_token == eos_token);
+    for (int i = 0; i < commit && n_accept < accepted_cap; i++) {
+        accepted[n_accept++] = drafts[i];
+        if (drafts[i] == eos_token) { hit_eos = true; break; }
+    }
+
+    uint32_t keep = mtp_base_raw + (uint32_t)commit;
+    if (keep > s->graph.raw_window) keep = s->graph.raw_window;
+    s->graph.mtp_n_raw = keep;
+
+    if (rejected && resampled >= 0 && !hit_eos && n_accept < accepted_cap) {
+        /* Correct the rejected position with the residual draw via one main forward
+         * (advances KV + sets s->logits for the next iter's first_token). */
+        if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
+                                            (uint32_t)resampled, (uint32_t)s->checkpoint.len,
+                                            s->logits)) {
+            snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
+            s->checkpoint_valid = false;
+            return -1;
+        }
+        token_vec_push(&s->checkpoint, resampled);
+        accepted[n_accept++] = resampled;
+        if (resampled == eos_token) hit_eos = true;
+        spec_argmax_bootstrap_combined_prev_hc(s);    /* keep next iter on combined path */
+    } else {
+        /* Full accept (commit==draft_n): the bonus token is deferred to next iter's
+         * first_token, drawn by the caller from s->logits = row_logits[commit] (= the
+         * target dist after the last accepted draft).  Also the eos / cap edge. */
+        memcpy(s->logits, row_logits + (uint64_t)commit * DS4_N_VOCAB,
+               (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        spec_argmax_snapshot_combined_prev_hc(s, (uint32_t)commit);
+    }
+    s->checkpoint_valid = true;
+
+    if (mtp_timing) {
+        fprintf(stderr,
+                "ds4: mtp timing sample drafted=%d committed=%d resampled=%d total=%.3f ms\n",
+                draft_n, commit, rejected ? 1 : 0, (now_sec() - mtp_t0) * 1000.0);
+    }
+    (void)row_tops;
+    return n_accept;
+}
 #endif
 
 /* Speculative decode state machine:
@@ -20259,6 +20538,61 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         }
     }
     return n_accept;
+#endif
+}
+
+/* Distribution-preserving speculative SAMPLING decode (MTP at temperature > 0).
+ * Counterpart to ds4_session_eval_speculative_argmax: drafts are sampled from the MTP
+ * draft distribution and verified by rejection sampling so the committed stream is
+ * distributed exactly as plain sampling from the (truncated) target.  first_token is
+ * the caller's freshly-sampled token; returns the committed tokens (first_token +
+ * accepted drafts + any residual correction), or -1 on error. */
+int ds4_session_eval_speculative_sample(ds4_session *s, int first_token,
+                                        int max_tokens, int eos_token,
+                                        float temperature, int top_k, float top_p, float min_p,
+                                        uint64_t *rng,
+                                        int *accepted, int accepted_cap,
+                                        char *err, size_t errlen) {
+    if (ds4_session_is_cpu(s)) {
+        (void)max_tokens; (void)eos_token;
+        (void)temperature; (void)top_k; (void)top_p; (void)min_p; (void)rng;
+        if (!accepted || accepted_cap <= 0) return 0;
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
+#ifdef DS4_NO_GPU
+    (void)s; (void)first_token; (void)max_tokens; (void)eos_token;
+    (void)temperature; (void)top_k; (void)top_p; (void)min_p; (void)rng;
+    (void)accepted; (void)accepted_cap;
+    snprintf(err, errlen, "GPU support is not compiled in");
+    return -1;
+#else
+    if (!s || max_tokens <= 0 || accepted_cap <= 0 || !rng) return 0;
+    ds4_engine *e = s->engine;
+
+    const bool spec_disabled = getenv("DS4_MTP_SPEC_DISABLE") != NULL;
+    const bool strict_mtp = e->quality || getenv("DS4_MTP_STRICT") != NULL;
+    const bool try_combined =
+        !strict_mtp && e->mtp_ready && e->mtp_draft_tokens == 2 && !spec_disabled &&
+        temperature > 0.0f && max_tokens >= 2 && accepted_cap >= 2 &&
+        first_token != eos_token && s->checkpoint.len + 3 <= s->ctx_size;
+    if (try_combined) {
+        const int rc = ds4_session_eval_speculative_sample_combined(
+            s, first_token, max_tokens, eos_token,
+            temperature, top_k, top_p, min_p, rng,
+            accepted, accepted_cap, err, errlen);
+        if (rc >= 0) return rc;
+        if (rc == -1) return -1;
+        /* rc == -2: precondition gap (cold start) — fall through to plain eval. */
+    }
+
+    /* Fallback: plain single-token step.  first_token was already sampled by the
+     * caller; commit it and bootstrap combined_prev_hc so the next iter goes combined. */
+    if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+    spec_argmax_bootstrap_combined_prev_hc(s);
+    accepted[0] = first_token;
+    return 1;
 #endif
 }
 

@@ -542,6 +542,23 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                 ds4_session_free(session);
                 return 1;
             }
+        } else if (cfg->gen.temperature > 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+                   getenv("DS4_MTP_SPEC_DISABLE") == NULL && getenv("DS4_MTP_SAMPLE") != NULL) {
+            ntok = ds4_session_eval_speculative_sample(session,
+                                                       token,
+                                                       max_tokens - generated,
+                                                       ds4_token_eos(engine),
+                                                       cfg->gen.temperature, 0,
+                                                       cfg->gen.top_p, cfg->gen.min_p, &rng,
+                                                       toks,
+                                                       (int)(sizeof(toks) / sizeof(toks[0])),
+                                                       err,
+                                                       sizeof(err));
+            if (ntok < 0) {
+                fprintf(stderr, "ds4: decode failed: %s\n", err);
+                ds4_session_free(session);
+                return 1;
+            }
         } else {
             if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
@@ -1181,6 +1198,22 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                                                        token,
                                                        max_tokens - generated,
                                                        ds4_token_eos(engine),
+                                                       toks,
+                                                       (int)(sizeof(toks) / sizeof(toks[0])),
+                                                       err,
+                                                       sizeof(err));
+            if (ntok < 0) {
+                fprintf(stderr, "ds4: decode failed: %s\n", err);
+                return 1;
+            }
+        } else if (cfg->gen.temperature > 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+                   getenv("DS4_MTP_SPEC_DISABLE") == NULL && getenv("DS4_MTP_SAMPLE") != NULL) {
+            ntok = ds4_session_eval_speculative_sample(chat->session,
+                                                       token,
+                                                       max_tokens - generated,
+                                                       ds4_token_eos(engine),
+                                                       cfg->gen.temperature, 0,
+                                                       cfg->gen.top_p, cfg->gen.min_p, &rng,
                                                        toks,
                                                        (int)(sizeof(toks) / sizeof(toks[0])),
                                                        err,

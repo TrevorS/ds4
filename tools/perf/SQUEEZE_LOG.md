@@ -372,9 +372,19 @@ greedy-only profiling:
    the exact sort at a fixed seed; **13.05 → 14.98 t/s at top_p=0.95** (recovers
    the full ~11 ms/token tax, matches the top_p=1.0 no-sort baseline). Also drops
    a ~2 MB/token malloc. Commit `4748b3a`.
-2. **MTP-for-sampling — ~+14–26%, medium.** Recover MTP for temp>0 via the
-   distribution-preserving rejection sampler (scoped + α-validated in
-   `docs/mtp-nongreedy-sampling.md`; α≈0.78 → keeps ~99% of the greedy MTP win).
+2. **MTP-for-sampling — LANDED (env-gated `DS4_MTP_SAMPLE`).** Recover MTP for
+   temp>0 via the distribution-preserving rejection sampler (`spec_sample_step` +
+   `ds4_session_eval_speculative_sample`, forked from the combined-forward argmax
+   path).  Drafts are sampled from the MTP draft dist `q`, accepted vs target `p`
+   with `min(1, p_trunc/q_trunc)`, residual `max(0,p_trunc-q_trunc)` on reject
+   (one extra main forward to commit the correction); bonus deferred to next-iter
+   first_token on full accept.  Preserves the truncated target so output ==
+   plain truncated sampling.  **Measured (temp 0.7, top_p 0.95): code 14.94 →
+   19.48 t/s (+30%, high accept), prose 14.95 → 16.16 (+8%, low accept)** — win
+   scales with accept, as predicted.  Verified coherent, deterministic (seeded),
+   and reduces to greedy in the low-temp limit.  Stacks on the qsort win for the
+   whole sampled-chat path.  Gated for rollout; flip the env / drop the gate once
+   a χ²/KL distribution test confirms exactness at scale.
 3. **Depth** — managed-KV tax ~14–19%; config lever (right-size `--ctx`) or an
    owner-level managed-KV optimization.
 

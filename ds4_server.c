@@ -10497,6 +10497,24 @@ decode_again:
                 finish = "error";
                 break;
             }
+        } else if (temperature > 0.0f &&
+                   ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+                   getenv("DS4_MTP_SPEC_DISABLE") == NULL &&
+                   getenv("DS4_MTP_SAMPLE") != NULL)
+        {
+            ntok = ds4_session_eval_speculative_sample(s->session,
+                                                       token,
+                                                       max_tokens - completion,
+                                                       ds4_token_eos(s->engine),
+                                                       temperature, top_k, top_p, min_p, &rng,
+                                                       toks,
+                                                       (int)(sizeof(toks) / sizeof(toks[0])),
+                                                       err,
+                                                       sizeof(err));
+            if (ntok < 0) {
+                finish = "error";
+                break;
+            }
         } else {
             if (ds4_session_eval(s->session, token, err, sizeof(err)) != 0) {
                 finish = "error";
