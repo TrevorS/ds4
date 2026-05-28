@@ -59,7 +59,7 @@ ds4: ds4_cli.o ds4_help.o linenoise.o $(CORE_OBJS)
 ds4-server: ds4_server.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_server.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
 
-ds4-bench: ds4_bench.o ds4_help.o $(CORE_OBJS)
+ds4-bench: ds4_bench.o ds4_help.o ds4_kvstore.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_bench.o ds4_help.o $(CORE_OBJS) $(METAL_LDLIBS)
 
 ds4-eval: ds4_eval.o ds4_help.o $(CORE_OBJS)
@@ -71,7 +71,7 @@ ds4-agent: ds4_agent.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJ
 cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o rax.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o ds4_help.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_help.o ds4_kvstore.o rax.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o ds4_help.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o ds4_help.o ds4_kvstore.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o ds4_help.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
 
@@ -109,7 +109,7 @@ ds4: ds4_cli.o ds4_help.o linenoise.o $(CORE_OBJS)
 ds4-server: ds4_server.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-ds4-bench: ds4_bench.o ds4_help.o $(CORE_OBJS)
+ds4-bench: ds4_bench.o ds4_help.o ds4_kvstore.o $(CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 ds4-eval: ds4_eval.o ds4_help.o $(CORE_OBJS)
@@ -121,7 +121,7 @@ ds4-agent: ds4_agent.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJ
 cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o rax.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o ds4_help.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_help.o ds4_kvstore.o rax.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o ds4_help.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o ds4_help.o ds4_kvstore.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o ds4_help.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
 
@@ -155,7 +155,7 @@ ds4_help.o: ds4_help.c ds4_help.h
 ds4_server.o: ds4_server.c ds4.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
 
-ds4_bench.o: ds4_bench.c ds4.h ds4_distributed.h ds4_help.h
+ds4_bench.o: ds4_bench.c ds4.h ds4_distributed.h ds4_help.h ds4_kvstore.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_bench.c
 
 ds4_eval.o: ds4_eval.c ds4.h ds4_distributed.h ds4_help.h
