@@ -384,7 +384,9 @@ greedy-only profiling:
    scales with accept, as predicted.  Verified coherent, deterministic (seeded),
    and reduces to greedy in the low-temp limit.  Stacks on the qsort win for the
    whole sampled-chat path.  Gated for rollout; flip the env / drop the gate once
-   a χ²/KL distribution test confirms exactness at scale.
+   the math is now verified exact by `./ds4_test --spec-sampling` (host-only:
+  TV(out,p)<0.004 and empirical accept == Σmin(p,q) across q==p / sharper /
+  flatter / disjoint-modes / random); drop the gate after a GPU-path soak.
 3. **Depth** — managed-KV tax ~14–19%; config lever (right-size `--ctx`) or an
    owner-level managed-KV optimization.
 

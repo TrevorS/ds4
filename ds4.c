@@ -17277,6 +17277,89 @@ static DS4_MAYBE_UNUSED int spec_sample_step(const float *p_logits, uint32_t n_v
     return spec_sample_from_dist(resid, r_n, rng);
 }
 
+/* Host-only exactness self-test for the speculative-sampling math (no GPU).  Over
+ * synthetic (p, q) logit pairs covering the corner cases (q==p, q sharper, q flatter,
+ * disjoint modes, random), verify that drafting from q_trunc + spec_sample_step
+ * reproduces the target p_trunc within sampling noise (total-variation distance), and
+ * that the empirical accept rate matches the theoretical Σ min(p_trunc, q_trunc).
+ * This is the distribution-fidelity check the GPU path can't do bit-identically (spec
+ * and plain consume RNG differently and run different forwards).  Returns failing-case
+ * count (0 = pass); prints a per-case table to stderr. */
+int ds4_spec_sampling_selftest(void) {
+    enum { NV = 64, TRIALS = 400000 };
+    const float TV_TOL = 0.015f, ACC_TOL = 0.01f;
+
+    /* deterministic synthetic logit fill */
+    uint64_t fseed = 0xC0FFEEULL;
+    float p[NV], q[NV];
+
+    struct { const char *name; int kind; } cases[] = {
+        {"q==p (always accept)",      0},
+        {"q sharper than p",          1},
+        {"q flatter (uniform)",       2},
+        {"disjoint modes p!=q",       3},
+        {"random p, random q",        4},
+    };
+    const float temps[] = { 1.0f, 0.7f };
+    const float topps[] = { 1.0f, 0.95f };
+
+    fprintf(stderr,
+        "ds4: spec-sampling self-test (NV=%d, %d trials/case)\n"
+        "  %-26s T    top_p   TV(out,p)  accept(emp/theo)  result\n",
+        NV, TRIALS, "case");
+
+    int fails = 0;
+    uint64_t rng = 0x5EED1234ABCDULL;
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        /* base random p */
+        for (int i = 0; i < NV; i++) p[i] = (sample_rng_f32(&fseed) * 2.0f - 1.0f) * 4.0f;
+        switch (cases[c].kind) {
+            case 0: for (int i = 0; i < NV; i++) q[i] = p[i]; break;                 /* q==p */
+            case 1: for (int i = 0; i < NV; i++) q[i] = p[i] * 2.5f; break;           /* sharper */
+            case 2: for (int i = 0; i < NV; i++) q[i] = 0.0f; break;                  /* uniform */
+            case 3: for (int i = 0; i < NV; i++) { p[i] = -8.0f; q[i] = -8.0f; }      /* disjoint */
+                    p[0] = 6.0f; p[1] = 4.0f; q[2] = 6.0f; q[3] = 4.0f; break;
+            case 4: for (int i = 0; i < NV; i++) q[i] = (sample_rng_f32(&fseed) * 2.0f - 1.0f) * 4.0f; break;
+        }
+
+        for (size_t ti = 0; ti < sizeof(temps) / sizeof(temps[0]); ti++) {
+            const float temp = temps[ti], top_p = topps[ti];
+            spec_prob qt[DS4_SPEC_NUCLEUS_CAP], pt[DS4_SPEC_NUCLEUS_CAP];
+            int qn = spec_build_trunc_dist(q, NV, temp, 0, top_p, 0.0f, qt);
+            int pn = spec_build_trunc_dist(p, NV, temp, 0, top_p, 0.0f, pt);
+            if (qn <= 0 || pn <= 0) { fprintf(stderr, "  build failed\n"); fails++; continue; }
+
+            double pd[NV] = {0}, qd[NV] = {0};
+            for (int i = 0; i < pn; i++) pd[pt[i].id] = pt[i].prob;
+            for (int i = 0; i < qn; i++) qd[qt[i].id] = qt[i].prob;
+            double theo_accept = 0.0;
+            for (int i = 0; i < NV; i++) theo_accept += pd[i] < qd[i] ? pd[i] : qd[i];
+
+            long hist[NV] = {0};
+            long acc_count = 0;
+            for (int t = 0; t < TRIALS; t++) {
+                int draft = spec_sample_from_dist(qt, qn, &rng);
+                bool acc = false;
+                int tok = spec_sample_step(p, NV, qt, qn, draft, temp, 0, top_p, 0.0f, &rng, &acc);
+                if (tok >= 0 && tok < NV) hist[tok]++;
+                if (acc) acc_count++;
+            }
+            double tv = 0.0;
+            for (int i = 0; i < NV; i++) tv += fabs((double)hist[i] / TRIALS - pd[i]);
+            tv *= 0.5;
+            const double emp_accept = (double)acc_count / TRIALS;
+            const bool ok = tv < TV_TOL && fabs(emp_accept - theo_accept) < ACC_TOL;
+            if (!ok) fails++;
+            fprintf(stderr, "  %-26s %.2f  %.2f    %.5f    %.4f/%.4f    %s\n",
+                    ti == 0 ? cases[c].name : "", temp, top_p, tv,
+                    emp_accept, theo_accept, ok ? "ok" : "FAIL");
+        }
+    }
+    fprintf(stderr, "ds4: spec-sampling self-test %s (%d failing cases)\n",
+            fails == 0 ? "PASSED" : "FAILED", fails);
+    return fails;
+}
+
 static void print_top_logits(
         FILE          * fp,
         const char    * label,
