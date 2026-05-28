@@ -1,0 +1,9 @@
+[20:10:23] [mtp-sample#1] ds4: MTP support model loaded: /home/trevor/models/ds4/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf (draft=2)
+[20:10:24] [mtp-sample#1] ds4: CUDA backend initialized on NVIDIA GB10 (sm_121)
+[20:10:27] [mtp-sample#1] ds4: CUDA registered 80.76 GiB model mapping for device access
+[20:10:27] [mtp-sample#1] ds4: CUDA registered 3.55 GiB model mapping for device access
+[20:10:27] [mtp-sample#1] ds4: CUDA startup model cache prepared 8.20 GiB of tensor spans in 0.440s
+[20:10:27] [mtp-sample#1] ds4: CUDA startup model cache prepared 0.17 GiB of tensor spans in 0.009s
+[20:10:27] [mtp-sample#1] ds4: cuda backend initialized for graph diagnostics
+[20:10:27] [mtp-sample#1] ds4-bench: context buffers 1054.41 MiB (ctx=32801, backend=cuda, prefill_chunk=4096, raw_kv_rows=4352, compressed_kv_rows=8202)
+[20:10:28] [mtp-sample#1] ds4-bench: decode path = MTP speculative combined-forward
