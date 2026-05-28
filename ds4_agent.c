@@ -63,6 +63,8 @@ typedef struct {
     agent_generation_options gen;
     const char *chdir_path;
     bool non_interactive;
+    bool save_on_exit;
+    const char *load_session_sha;
 } agent_config;
 
 typedef enum {
@@ -502,6 +504,9 @@ static void usage(FILE *fp) {
         "  -p, --prompt TEXT      Submit an initial prompt after startup.\n"
         "  --non-interactive      Run without the TUI. With -p: one turn and exit;\n"
         "                         without -p: read repeated prompts from stdin.\n"
+        "  --save-on-exit         (non-interactive only) /save the session before exit\n"
+        "                         and print '+DWARFSTAR_SAVED <sha>' to stdout.\n"
+        "  --load-session SHA     (non-interactive only) /switch to SHA before any prompt.\n"
         "  -sys, --system TEXT    Extra system prompt. Empty disables extra text.\n"
         "  --trace FILE           Write prompt, token, and DSML debug trace.\n"
         "  --temp F               Sampling temperature. Default: 1\n"
@@ -574,6 +579,10 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.prompt = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--non-interactive")) {
             c.non_interactive = true;
+        } else if (!strcmp(arg, "--save-on-exit")) {
+            c.save_on_exit = true;
+        } else if (!strcmp(arg, "--load-session")) {
+            c.load_session_sha = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {
@@ -9044,6 +9053,7 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     agent_prompt_queue queue = {0};
     double quiet_deadline = 0.0;
     int rc = 0;
+    bool load_session_done = (cfg->load_session_sha == NULL);
 
     if (!one_shot) {
         if (set_nonblock(STDIN_FILENO, true, &old_stdin_flags) != 0) {
@@ -9058,7 +9068,22 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
         bool initialized = worker_is_initialized(&worker, NULL);
         bool idle = worker_is_idle(&worker);
 
-        if (one_shot && !one_shot_submitted && initialized) {
+        if (!load_session_done && initialized && idle) {
+            char err[160] = {0};
+            if (!agent_worker_switch_session(&worker, cfg->load_session_sha,
+                                             AGENT_HISTORY_DEFAULT_TURNS,
+                                             err, sizeof(err))) {
+                fprintf(stderr, "ds4-agent: --load-session %s: %s\n",
+                        cfg->load_session_sha,
+                        err[0] ? err : "switch failed");
+                rc = 1;
+                break;
+            }
+            load_session_done = true;
+            idle = false;  /* switch may flip worker out of idle briefly */
+        }
+
+        if (one_shot && !one_shot_submitted && initialized && load_session_done) {
             if (worker_submit(&worker, cfg->gen.prompt))
                 one_shot_submitted = true;
             idle = false;
@@ -9177,6 +9202,22 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     if (stdin_nonblock) fcntl(STDIN_FILENO, F_SETFL, old_stdin_flags);
     agent_input_buf_free(&input);
     agent_prompt_queue_free(&queue);
+
+    if (rc == 0 && cfg->save_on_exit) {
+        char sha[41] = {0};
+        int saved_tokens = 0;
+        char err[160] = {0};
+        if (agent_worker_save_session_now(&worker, sha, &saved_tokens,
+                                          err, sizeof(err))) {
+            printf("+DWARFSTAR_SAVED %s\n", sha);
+            fflush(stdout);
+        } else {
+            fprintf(stderr, "ds4-agent: --save-on-exit: %s\n",
+                    err[0] ? err : "save failed");
+            rc = 1;
+        }
+    }
+
     agent_worker_free(&worker);
     return rc;
 }

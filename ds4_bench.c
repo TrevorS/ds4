@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_kvstore.h"
 
 /* Purpose-built throughput benchmark.
  *
@@ -24,6 +25,7 @@ typedef struct {
     const char *model_path;
     const char *prompt_path;
     const char *chat_prompt_path;
+    const char *kv_restore_path;
     const char *system;
     const char *csv_path;
     ds4_backend backend;
@@ -67,6 +69,9 @@ static void usage(FILE *fp) {
         "      Raw benchmark text. The fixed token sequence is sliced at each frontier.\n"
         "  --chat-prompt-file FILE\n"
         "      Render FILE as one no-thinking chat user message, then slice that sequence.\n"
+        "  --kv-restore FILE\n"
+        "      Restore a saved KV checkpoint (~/.ds4/kvcache/<sha>.kv) instead of\n"
+        "      prefilling. Forces a single frontier equal to the restored token count.\n"
         "  -sys, --system TEXT\n"
         "      System prompt used only with --chat-prompt-file.\n"
         "\n"
@@ -214,6 +219,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-prompt-file")) {
             c.chat_prompt_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--kv-restore")) {
+            c.kv_restore_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--ctx-start")) {
@@ -271,7 +278,12 @@ static bench_config parse_options(int argc, char **argv) {
         }
     }
 
-    if (!!c.prompt_path == !!c.chat_prompt_path) {
+    if (c.kv_restore_path) {
+        if (c.prompt_path || c.chat_prompt_path) {
+            fprintf(stderr, "ds4-bench: --kv-restore is mutually exclusive with --prompt-file/--chat-prompt-file\n");
+            exit(2);
+        }
+    } else if (!!c.prompt_path == !!c.chat_prompt_path) {
         fprintf(stderr, "ds4-bench: specify exactly one of --prompt-file or --chat-prompt-file\n");
         exit(2);
     }
@@ -439,23 +451,25 @@ int main(int argc, char **argv) {
     if (ds4_engine_open(&engine, &opt) != 0) return 1;
     log_context_memory(cfg.backend, cfg.ctx_alloc);
 
-    char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
     ds4_tokens prompt = {0};
-    if (cfg.chat_prompt_path) {
-        ds4_encode_chat_prompt(engine, cfg.system, text, DS4_THINK_NONE, &prompt);
-    } else {
-        ds4_tokenize_text(engine, text, &prompt);
-    }
-    free(text);
+    if (!cfg.kv_restore_path) {
+        char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
+        if (cfg.chat_prompt_path) {
+            ds4_encode_chat_prompt(engine, cfg.system, text, DS4_THINK_NONE, &prompt);
+        } else {
+            ds4_tokenize_text(engine, text, &prompt);
+        }
+        free(text);
 
-    if (prompt.len < cfg.ctx_max) {
-        fprintf(stderr,
-                "ds4-bench: prompt has %d tokens, need at least --ctx-max=%d\n",
-                prompt.len,
-                cfg.ctx_max);
-        ds4_tokens_free(&prompt);
-        ds4_engine_close(engine);
-        return 1;
+        if (prompt.len < cfg.ctx_max) {
+            fprintf(stderr,
+                    "ds4-bench: prompt has %d tokens, need at least --ctx-max=%d\n",
+                    prompt.len,
+                    cfg.ctx_max);
+            ds4_tokens_free(&prompt);
+            ds4_engine_close(engine);
+            return 1;
+        }
     }
 
     ds4_session *session = NULL;
@@ -489,22 +503,61 @@ int main(int argc, char **argv) {
     int previous = 0;
     int rc = 0;
 
-    for (int frontier = cfg.ctx_start; ; frontier = next_frontier(&cfg, frontier)) {
-        ds4_tokens prefix = {
-            .v = prompt.v,
-            .len = frontier,
-            .cap = frontier,
-        };
-
-        const double prefill_t0 = bench_now_sec();
-        if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
-            fprintf(stderr, "ds4-bench: prefill to %d failed: %s\n", frontier, err);
+    if (cfg.kv_restore_path) {
+        FILE *fp = fopen(cfg.kv_restore_path, "rb");
+        if (!fp) {
+            fprintf(stderr, "ds4-bench: open %s: %s\n",
+                    cfg.kv_restore_path, strerror(errno));
             rc = 1;
-            break;
+            goto cleanup;
         }
-        const double prefill_t1 = bench_now_sec();
-        const double prefill_sec = prefill_t1 - prefill_t0;
-        const int prefill_tokens = frontier - previous;
+        ds4_kvstore_entry hdr = {0};
+        uint32_t text_bytes = 0;
+        if (!ds4_kvstore_read_header(fp, &hdr, &text_bytes)) {
+            fprintf(stderr, "ds4-bench: invalid KV header in %s\n", cfg.kv_restore_path);
+            fclose(fp); rc = 1; goto cleanup;
+        }
+        if (text_bytes && fseek(fp, (long)text_bytes, SEEK_CUR) != 0) {
+            fprintf(stderr, "ds4-bench: seek past text: %s\n", strerror(errno));
+            fclose(fp); rc = 1; goto cleanup;
+        }
+        /* Title trailer (if EXT_SESSION_TITLE) sits AFTER the payload — ignore it. */
+        char load_err[160] = {0};
+        if (ds4_session_load_payload(session, fp, hdr.payload_bytes,
+                                     load_err, sizeof(load_err)) != 0) {
+            fprintf(stderr, "ds4-bench: load_payload: %s\n",
+                    load_err[0] ? load_err : "unknown");
+            fclose(fp); rc = 1; goto cleanup;
+        }
+        fclose(fp);
+        const int loaded_pos = (int)hdr.tokens;
+        fprintf(stderr, "ds4-bench: restored %d tokens from %s\n",
+                loaded_pos, cfg.kv_restore_path);
+        cfg.ctx_start = loaded_pos;
+        cfg.ctx_max = loaded_pos;
+        previous = loaded_pos;
+    }
+
+    for (int frontier = cfg.ctx_start; ; frontier = next_frontier(&cfg, frontier)) {
+        double prefill_sec = 0.0;
+        int prefill_tokens = 0;
+
+        if (!cfg.kv_restore_path) {
+            ds4_tokens prefix = {
+                .v = prompt.v,
+                .len = frontier,
+                .cap = frontier,
+            };
+            const double prefill_t0 = bench_now_sec();
+            if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4-bench: prefill to %d failed: %s\n", frontier, err);
+                rc = 1;
+                break;
+            }
+            const double prefill_t1 = bench_now_sec();
+            prefill_sec = prefill_t1 - prefill_t0;
+            prefill_tokens = frontier - previous;
+        }
 
         if (write_frontier_logits_json(&cfg, engine, session, frontier, previous) != 0) {
             rc = 1;
@@ -591,6 +644,7 @@ int main(int argc, char **argv) {
         if (frontier >= cfg.ctx_max) break;
     }
 
+cleanup:
     if (out != stdout) fclose(out);
     ds4_session_snapshot_free(&snap);
     ds4_session_free(session);
