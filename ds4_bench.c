@@ -496,6 +496,16 @@ int main(int argc, char **argv) {
 
     const int eos = ds4_token_eos(engine);
     const bool use_mtp = cfg.mtp_path != NULL && ds4_engine_mtp_draft_tokens(engine) > 1;
+    /* Optional decode-token dump for logit-equivalence cross-checks. */
+    FILE *tdump = NULL;
+    {
+        const char *tdpath = getenv("DS4_BENCH_TOKEN_DUMP");
+        if (tdpath && tdpath[0]) {
+            tdump = fopen(tdpath, "w");
+            if (!tdump)
+                fprintf(stderr, "ds4-bench: token dump open %s: %s\n", tdpath, strerror(errno));
+        }
+    }
     fprintf(stderr, "ds4-bench: decode path = %s\n",
             use_mtp ? "MTP speculative combined-forward" : "plain");
     ds4_session_snapshot snap = {0};
@@ -610,6 +620,7 @@ int main(int argc, char **argv) {
                     rc = 1;
                     break;
                 }
+                if (tdump) for (int i = 0; i < ntok; i++) fprintf(tdump, "%d\n", toks[i]);
                 produced += ntok;
             } else {
                 if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
@@ -617,6 +628,7 @@ int main(int argc, char **argv) {
                     rc = 1;
                     break;
                 }
+                if (tdump) fprintf(tdump, "%d\n", token);
                 produced += 1;
             }
         }
@@ -645,6 +657,7 @@ int main(int argc, char **argv) {
     }
 
 cleanup:
+    if (tdump) fclose(tdump);
     if (out != stdout) fclose(out);
     ds4_session_snapshot_free(&snap);
     ds4_session_free(session);
