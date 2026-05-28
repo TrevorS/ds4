@@ -9136,6 +9136,20 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     double quiet_deadline = 0.0;
     int rc = 0;
     bool load_session_done = (cfg->load_session_sha == NULL);
+    /* Token-rate metrics (printed once on exit as +DWARFSTAR_METRICS).
+     * decode_sec/decode_tokens accumulate only while the worker is in
+     * AGENT_WORKER_GENERATING, so tool-call prefill and idle time
+     * between turns are excluded from decode_tps. */
+    const double session_t0 = now_sec();
+    double cum_decode_sec = 0.0;
+    double cum_prefill_sec = 0.0;
+    int cum_decode_tokens = 0;
+    int cum_prefill_tokens = 0;
+    double gen_phase_t0 = 0.0;
+    double prefill_phase_t0 = 0.0;
+    double first_token_t = 0.0;     /* time of first generated token */
+    agent_worker_state prev_state = AGENT_WORKER_IDLE;
+    int phase_generated = 0;
 
     if (!one_shot) {
         if (set_nonblock(STDIN_FILENO, true, &old_stdin_flags) != 0) {
@@ -9233,6 +9247,33 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             write_all(STDOUT_FILENO, out, out_len);
             fflush(stdout);
         }
+
+        /* Metrics: accumulate decode time per generation phase. */
+        if (st.state == AGENT_WORKER_GENERATING) {
+            if (prev_state != AGENT_WORKER_GENERATING) {
+                gen_phase_t0 = now_sec();
+                phase_generated = 0;
+            }
+            if (st.generated > phase_generated) {
+                if (phase_generated == 0 && first_token_t == 0.0)
+                    first_token_t = now_sec();
+                phase_generated = st.generated;
+            }
+        } else if (prev_state == AGENT_WORKER_GENERATING) {
+            cum_decode_sec += now_sec() - gen_phase_t0;
+            cum_decode_tokens += phase_generated;
+            phase_generated = 0;
+        }
+        /* Prefill timing: prefill_total/done track the chat-prefill chunks.
+         * Treat any prefill activity as part of the prefill bucket. */
+        if (st.state == AGENT_WORKER_PREFILL) {
+            if (prev_state != AGENT_WORKER_PREFILL)
+                prefill_phase_t0 = now_sec();
+        } else if (prev_state == AGENT_WORKER_PREFILL) {
+            cum_prefill_sec += now_sec() - prefill_phase_t0;
+            if (st.prefill_total > 0) cum_prefill_tokens += st.prefill_total;
+        }
+        prev_state = st.state;
         free(out);
 
         if (worker_take_queued_user_drain_request(&worker)) {
@@ -9284,6 +9325,29 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     if (stdin_nonblock) fcntl(STDIN_FILENO, F_SETFL, old_stdin_flags);
     agent_input_buf_free(&input);
     agent_prompt_queue_free(&queue);
+
+    /* Final metrics — captured after the worker has settled to idle. */
+    if (prev_state == AGENT_WORKER_GENERATING) {
+        cum_decode_sec += now_sec() - gen_phase_t0;
+        cum_decode_tokens += phase_generated;
+    }
+    if (prev_state == AGENT_WORKER_PREFILL)
+        cum_prefill_sec += now_sec() - prefill_phase_t0;
+    {
+        const double wall = now_sec() - session_t0;
+        const double decode_tps = cum_decode_sec > 0.0
+            ? (double)cum_decode_tokens / cum_decode_sec : 0.0;
+        const double avg_tps = wall > 0.0
+            ? (double)cum_decode_tokens / wall : 0.0;
+        const double ttft = first_token_t > 0.0 ? first_token_t - session_t0 : 0.0;
+        fprintf(stderr,
+                "+DWARFSTAR_METRICS wall_s=%.3f decode_s=%.3f decode_tokens=%d "
+                "decode_tps=%.2f avg_tps=%.2f prefill_s=%.3f prefill_tokens=%d "
+                "ttft_s=%.3f\n",
+                wall, cum_decode_sec, cum_decode_tokens,
+                decode_tps, avg_tps, cum_prefill_sec, cum_prefill_tokens, ttft);
+        fflush(stderr);
+    }
 
     if (rc == 0 && cfg->save_on_exit) {
         char sha[41] = {0};
