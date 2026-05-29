@@ -2,7 +2,7 @@
 
 ## What's different in this fork
 
-- **GB10 / DGX Spark CUDA backend** — `sm_121a` support with the model kept resident in the unified GPU memory pool, instead of streaming weights per step. [`35466ad`](https://github.com/TrevorS/ds4/commit/35466addc5131363d02b1f2c196cccc5e6dead83)
+- **GB10 / DGX Spark CUDA backend** — the full model kept resident in the unified GPU memory pool (no per-step weight streaming) — the real GB10 win. Built via PTX→`sm_121` JIT (`make cuda-spark`, the default empty `CUDA_ARCH`), **not** native `sm_121a` cubins: native-arch SASS measured **−5.5% decode** on GB10 for these kernels (the PTX-JIT path schedules better here), so the JIT path is the validated default — don't set `CUDA_ARCH=sm_121`. [`35466ad`](https://github.com/TrevorS/ds4/commit/35466addc5131363d02b1f2c196cccc5e6dead83)
 - **MTP speculative decode (greedy + sampling)** — combined-forward, cascaded N=3 (two draft tokens verified in a single forward pass); `--mtp-draft` defaults to 2. **~1.5× sustained decode uplift over plain** on GB10 across 4k–32k ctx (greedy; see Benchmarks). Now covers **temperature sampling** too, via distribution-preserving rejection sampling (output is identical to plain sampling, just faster: 1.25–1.43× measured); on by default for `temp>0`, `DS4_MTP_SPEC_DISABLE=1` turns it off. **MTP is now wired in `ds4-agent`** — was previously the only DS4 binary that loaded the MTP gguf without ever calling `ds4_session_eval_speculative_*`; the agent's worker decode now spec-decodes too, lifting agent decode tps from ~11 to ~15-18 (+39% to +64%) on chat-formatted prompts. [`fe9f316`](https://github.com/TrevorS/ds4/commit/fe9f316129a77fca66c516b211b4f0e12f04b057), [`0529fad`](https://github.com/TrevorS/ds4/commit/0529fad79e3170e0a9b5918044a570efedcb5472), [`339c59e`](https://github.com/TrevorS/ds4/commit/339c59e255bbaa4f0a7b71acc7354140213053b1), [`38a7570`](https://github.com/TrevorS/ds4/commit/38a757038507266409bf06da46f1beea71433515)
 - **CUDA kernel & graph perf** — share-warp Q8 (load weight quants once across tokens), `__launch_bounds__` tuning (+5.5% decode), bit-identical CUDA-graph decode (+5%), a Q8→f16 dense-weight prewarm (~2× prefill TTFT), and a bounded top-K nucleus sampler that drops the per-token 129k qsort (+14.8% on the sampled path). [`cacfce1`](https://github.com/TrevorS/ds4/commit/cacfce1757e4277ce0d0fbfddea2cbb8669ff78e), [`b9135aa`](https://github.com/TrevorS/ds4/commit/b9135aae5602d29fe93a1a10490bec181ce083e2), [`300430c`](https://github.com/TrevorS/ds4/commit/300430c911d33e6efa5897e6362d18698bd6d9d3), [`2f0955c`](https://github.com/TrevorS/ds4/commit/2f0955c2d5cdd511df148c099ef415ad1c29da66), [`4748b3a`](https://github.com/TrevorS/ds4/commit/4748b3a37a754a6e417e0ecfa6ebe3fd3c9bda68)
 - **Runtime directional steering** — per-request scale plus an admin endpoint, named profiles, and model-name steering where `model:profile:tier` selects a steering vector and strength. [`d812335`](https://github.com/TrevorS/ds4/commit/d8123355aa3a3b3399e768ab687ee3431c97372b), [`2c1fd09`](https://github.com/TrevorS/ds4/commit/2c1fd095da2e688dbcbc68d37715db121dd65b50)
@@ -116,6 +116,15 @@ Defaults the wrapper bakes in: model `DeepSeek-V4-Flash-IQ2XXS` chat-v2, draft `
 |  32,768 |  13.2 | 20.0 (1.51×) | 17.4 (1.32×) |
 
 MTP-greedy holds ~1.5× across the whole ctx range; MTP-sample stays in the 1.25–1.43× band (slightly lower at the extremes where spec-sampling acceptance and the qsort-sampler path pull against each other). Prefill is identical across cells (340–400 t/s at 4k–32k) — MTP doesn't affect prefill.
+
+**Long-context decode** (MTP-greedy, `--mtp-draft 2 --power 85`, KV-restore single-context points, 2026-05-29):
+
+| context | decode t/s |
+| ------: | ---------: |
+|  43,643 |       19.7 |
+| 147,877 |       17.6 |
+
+Decode degrades gracefully far past the 32k sweep: ~22.6 t/s peak at 4k → 17.6 t/s at 148k, so ~36× context costs only ~22% decode. The attention + compressed-KV path is bandwidth-bound but holds up at long context (F16 comp-KV above 131k ctx-alloc keeps the cache footprint halved — a memory win, decode-neutral).
 
 Those are *prose* numbers (the bench greedily continues an Italian novel). MTP shines harder on low-entropy output: on real **code or structured generation** the draft accept rate climbs and sustained decode clears **23+ t/s** greedy. Reproducible via the server — AVL-tree codegen:
 
