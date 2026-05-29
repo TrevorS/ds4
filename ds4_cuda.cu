@@ -10434,6 +10434,9 @@ static int routed_moe_launch(
         const uint32_t expert_tile_m = getenv("DS4_CUDA_MOE_TILE4") ? 4u : 8u;
         const uint32_t write_gate_up = getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL;
         const uint32_t use_p2_sorted = use_sorted_pairs && getenv("DS4_CUDA_MOE_NO_P2") == NULL;
+        // Atomic-add down accumulation is scheduling-order-dependent: f32 rounding
+        // can flip greedy argmax during large prefill (chunk>=128). Set
+        // DS4_CUDA_MOE_NO_ATOMIC_DOWN=1 for bit-reproducible greedy (issue #244).
         const uint32_t use_atomic_down = use_expert_tiles &&
             (getenv("DS4_CUDA_MOE_ATOMIC_DOWN") != NULL ||
              (n_tokens >= 128u && getenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN") == NULL));

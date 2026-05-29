@@ -83,6 +83,10 @@ Environment variables (perf / observability):
 | `DS4_MTP_MIN_MARGIN=F`             | 0       | reject drafts whose verifier margin is below F. Sweep showed mostly noise across prompt classes; only `analytical-qa` saw a clear +8% at `F=0.5`. Not a universal lever |
 | `DS4_MTP_NO_CASCADE=1`             | off     | force single-draft window (no draft-conditioning). Costs throughput; debug only |
 | `DS4_MTP_STRICT=1`                 | off     | exact verification path (no margin-skip). Same kill-switch `--quality` activates |
+| `DS4_CUDA_MOE_NO_ATOMIC_DOWN=1`    | off     | force the deterministic (non-atomic) MoE down-projection accumulation, even at large prefill chunks. Set this for bit-reproducible greedy decode (see caveat below) |
+| `DS4_CUDA_MOE_ATOMIC_DOWN=1`       | off     | force the atomic-accumulate MoE down-projection on, regardless of chunk size. Faster at large prefill but scheduling-order-dependent |
+
+> **MoE atomic-down nondeterminism (issue #244):** the MoE down-projection auto-enables atomic accumulation for prefill chunks `>= 128` tokens (`ds4_cuda.cu:10437`). Atomic-add accumulation order is scheduling-dependent, so f32 rounding differs run-to-run; this can flip the greedy argmax during large prefill, picking a valid-but-different next token. For bit-reproducible greedy output set `DS4_CUDA_MOE_NO_ATOMIC_DOWN=1` (forces the deterministic path); `DS4_CUDA_MOE_ATOMIC_DOWN=1` forces it on for any chunk size.
 
 `bench-with-monitor.sh` wrapper knobs: `--label NAME`, `--matrix`, `--iter N`, `--no-mtp`, `--no-temp`, `--rebuild`, `--prompt-file FILE`, `-m MODEL`, `--mtp PATH`, and `-- <pass-through-to-ds4-bench>`.
 
