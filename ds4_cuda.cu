@@ -1637,6 +1637,30 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                    "tensor copy");
 }
 
+__global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n);
+
+/* Convert `count` F32 elements from src (byte offset src_offset) into F16 at dst
+ * (byte offset dst_offset).  Mirrors the Metal backend's f32->f16 cache commit:
+ * the attention-compressed KV stage is computed in F32 and rounded to F16 on
+ * store (DS4_GPU_ATTN_COMP_CACHE_F16).  Async D2D on the default stream so it is
+ * stream-ordered with the surrounding compressor kernels (capturable). */
+extern "C" int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                                const ds4_gpu_tensor *src, uint64_t src_offset,
+                                                uint64_t count) {
+    if (!dst || !src) return 0;
+    const uint64_t dst_bytes = count * sizeof(__half);
+    const uint64_t src_bytes = count * sizeof(float);
+    if (dst_offset > dst->bytes || src_offset > src->bytes ||
+        dst_bytes > dst->bytes - dst_offset || src_bytes > src->bytes - src_offset) {
+        return 0;
+    }
+    if (count == 0) return 1;
+    __half *out = (__half *)((char *)dst->ptr + dst_offset);
+    const float *in = (const float *)((char *)src->ptr + src_offset);
+    f32_to_f16_kernel<<<(count + 255) / 256, 256>>>(out, in, count);
+    return cuda_ok(cudaGetLastError(), "tensor copy f32->f16");
+}
+
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 extern "C" int ds4_gpu_end_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "end commands"); }
@@ -2172,6 +2196,29 @@ __device__ static float warp_max_f32(float v) {
 
 __device__ static float dot4_f32(float4 a, float4 b) {
     return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+}
+
+/* Compressed-KV row read helpers.  The persistent attention-compressed KV cache
+ * is stored either F32 (legacy) or F16 (DS4_GPU_ATTN_COMP_CACHE_F16; matches
+ * Metal).  The compressor still pools/norms/RoPEs rows in F32 staging and the
+ * store path rounds to F16 on commit, so attention only needs an F16->F32 widen
+ * on read.  Raw KV stays F32; only comp rows are ever F16.  These helpers keep
+ * the staged-to-shared K/V in F32 so the FlashAttention compute path is shared
+ * bit-for-bit with the F32 configuration. */
+__device__ __forceinline__ static float4 comp_kv_load_f4(
+        const float *comp_kv, uint32_t comp_kv_f16, uint64_t row, uint32_t c4) {
+    if (comp_kv_f16) {
+        const __half *h = (const __half *)comp_kv + row * 512ull + (uint64_t)c4 * 4ull;
+        return make_float4(__half2float(h[0]), __half2float(h[1]),
+                           __half2float(h[2]), __half2float(h[3]));
+    }
+    return ((const float4 *)(comp_kv + row * 512ull))[c4];
+}
+
+__device__ __forceinline__ static float comp_kv_load_elem(
+        const float *comp_kv, uint32_t comp_kv_f16, uint64_t idx) {
+    if (comp_kv_f16) return __half2float(((const __half *)comp_kv)[idx]);
+    return comp_kv[idx];
 }
 
 __device__ __forceinline__ static int32_t load_i8x4_i32_aligned(const int8_t *p) {
@@ -3136,6 +3183,7 @@ __global__ static void attention_prefill_mixed_kernel(
         const float *q,
         const float *raw_kv,
         const float *comp_kv,
+        uint32_t comp_kv_f16,
         const float *comp_mask,
         uint32_t use_comp_mask,
         uint32_t n_tokens,
@@ -3171,9 +3219,10 @@ __global__ static void attention_prefill_mixed_kernel(
         float add = use_comp_mask ? comp_mask[(uint64_t)t * n_comp + c] : 0.0f;
         float s = -INFINITY;
         if (add > -1.0e20f) {
-            const float *kvrow = comp_kv + (uint64_t)c * head_dim;
+            const uint64_t crow = (uint64_t)c * head_dim;
             float dot = 0.0f;
-            for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+            for (uint32_t d = 0; d < head_dim; d++)
+                dot += qh[d] * comp_kv_load_elem(comp_kv, comp_kv_f16, crow + d);
             s = dot * scale + add;
         }
         scores[raw_count + c] = s;
@@ -3204,7 +3253,7 @@ __global__ static void attention_prefill_mixed_kernel(
     for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv[(uint64_t)(raw_start + r) * head_dim + d] * scores[r];
-        for (uint32_t c = 0; c < visible_comp; c++) acc += comp_kv[(uint64_t)c * head_dim + d] * scores[raw_count + c];
+        for (uint32_t c = 0; c < visible_comp; c++) acc += comp_kv_load_elem(comp_kv, comp_kv_f16, (uint64_t)c * head_dim + d) * scores[raw_count + c];
         oh[d] = acc / denom;
     }
 }
@@ -3316,6 +3365,7 @@ __global__ static void attention_prefill_pack_mixed_kv_kernel(
         float *dst,
         const float *raw_kv,
         const float *comp_kv,
+        uint32_t comp_kv_f16,
         uint32_t n_tokens,
         uint32_t n_comp,
         uint32_t head_dim) {
@@ -3324,8 +3374,9 @@ __global__ static void attention_prefill_pack_mixed_kv_kernel(
     if (gid >= n) return;
     uint32_t d = gid % head_dim;
     uint32_t r = gid / head_dim;
-    dst[gid] = r < n_tokens ? raw_kv[(uint64_t)r * head_dim + d]
-                             : comp_kv[(uint64_t)(r - n_tokens) * head_dim + d];
+    dst[gid] = r < n_tokens
+        ? raw_kv[(uint64_t)r * head_dim + d]
+        : comp_kv_load_elem(comp_kv, comp_kv_f16, (uint64_t)(r - n_tokens) * head_dim + d);
 }
 
 __global__ static void attention_prefill_unpack_heads_kernel(
@@ -3383,6 +3434,7 @@ __global__ static void attention_decode_mixed_kernel(
         const float *q,
         const float *raw_kv,
         const float *comp_kv,
+        uint32_t comp_kv_f16,
         const float *comp_mask,
         uint32_t use_comp_mask,
         uint32_t n_tokens,
@@ -3453,9 +3505,10 @@ __global__ static void attention_decode_mixed_kernel(
             float add = use_comp_mask ? comp_mask[(uint64_t)t * n_comp + c] : 0.0f;
             float s = -INFINITY;
             if (add > -1.0e20f) {
-                const float *kvrow = comp_kv + (uint64_t)c * head_dim;
+                const uint64_t crow = (uint64_t)c * head_dim;
                 float dot = 0.0f;
-                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kvrow[d];
+                for (uint32_t d = 0; d < head_dim; d++)
+                    dot += qh[d] * comp_kv_load_elem(comp_kv, comp_kv_f16, crow + d);
                 s = dot * scale + add;
             }
             scores[raw_count + c] = s;
@@ -3469,17 +3522,27 @@ __global__ static void attention_decode_mixed_kernel(
             if (row < n_score) {
                 float add = 0.0f;
                 const float *kvrow = NULL;
+                bool row_is_comp = false;
+                uint64_t comp_base = 0;
                 if (row < raw_count) {
                     kvrow = raw_kv + (uint64_t)raw_rows[row] * head_dim;
                 } else {
                     uint32_t c = row - raw_count;
                     add = use_comp_mask ? comp_mask[(uint64_t)t * n_comp + c] : 0.0f;
-                    if (add > -1.0e20f) kvrow = comp_kv + (uint64_t)c * head_dim;
+                    if (add > -1.0e20f) {
+                        row_is_comp = true;
+                        comp_base = (uint64_t)c * head_dim;
+                        kvrow = comp_kv + comp_base;
+                    }
                 }
                 float s = -INFINITY;
                 if (kvrow) {
                     float dot = 0.0f;
-                    for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
+                    if (row_is_comp)
+                        for (uint32_t d = qlane; d < head_dim; d += 8u)
+                            dot += qh[d] * comp_kv_load_elem(comp_kv, comp_kv_f16, comp_base + d);
+                    else
+                        for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
                     const uint32_t mask = 0xffu << (threadIdx.x & 24u);
                     for (uint32_t off = 4u; off > 0u; off >>= 1u) {
                         dot += __shfl_down_sync(mask, dot, off, 8);
@@ -3529,9 +3592,9 @@ __global__ static void attention_decode_mixed_kernel(
         }
         for (uint32_t c = 0; c < visible_comp; c++) {
             float s = scores[raw_count + c];
-            const float *kv = comp_kv + (uint64_t)c * head_dim;
-            acc0 += kv[d0] * s;
-            acc1 += kv[d1] * s;
+            const uint64_t crow = (uint64_t)c * head_dim;
+            acc0 += comp_kv_load_elem(comp_kv, comp_kv_f16, crow + d0) * s;
+            acc1 += comp_kv_load_elem(comp_kv, comp_kv_f16, crow + d1) * s;
         }
         oh[d0] = acc0 / denom;
         oh[d1] = acc1 / denom;
@@ -3539,7 +3602,7 @@ __global__ static void attention_decode_mixed_kernel(
         for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
             float acc = 0.0f;
             for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv[(uint64_t)raw_rows[r] * head_dim + d] * scores[r];
-            for (uint32_t c = 0; c < visible_comp; c++) acc += comp_kv[(uint64_t)c * head_dim + d] * scores[raw_count + c];
+            for (uint32_t c = 0; c < visible_comp; c++) acc += comp_kv_load_elem(comp_kv, comp_kv_f16, (uint64_t)c * head_dim + d) * scores[raw_count + c];
             oh[d] = acc / denom;
         }
     }
@@ -3551,6 +3614,7 @@ __global__ static void attention_indexed_mixed_kernel(
         const float *q,
         const float *raw_kv,
         const float *comp_kv,
+        uint32_t comp_kv_f16,
         const int32_t *topk,
         uint32_t n_tokens,
         uint32_t pos0,
@@ -3637,11 +3701,17 @@ __global__ static void attention_indexed_mixed_kernel(
         for (uint32_t row0 = 0; row0 < n_score; row0 += 32u) {
             uint32_t row = row0 + qgroup;
             if (row < n_score) {
-                const float *kvrow = row < raw_count
-                    ? raw_kv + (uint64_t)raw_rows[row] * head_dim
-                    : comp_kv + (uint64_t)comp_rows[row - raw_count] * head_dim;
+                const bool row_is_comp = row >= raw_count;
+                const uint64_t base = row_is_comp
+                    ? (uint64_t)comp_rows[row - raw_count] * head_dim
+                    : (uint64_t)raw_rows[row] * head_dim;
+                const float *kvrow = raw_kv + base;
                 float dot = 0.0f;
-                for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
+                if (row_is_comp)
+                    for (uint32_t d = qlane; d < head_dim; d += 8u)
+                        dot += qh[d] * comp_kv_load_elem(comp_kv, comp_kv_f16, base + d);
+                else
+                    for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
                 const uint32_t mask = 0xffu << (threadIdx.x & 24u);
                 for (uint32_t off = 4u; off > 0u; off >>= 1u) {
                     dot += __shfl_down_sync(mask, dot, off, 8);
@@ -3689,9 +3759,9 @@ __global__ static void attention_indexed_mixed_kernel(
         }
         for (uint32_t c = 0; c < comp_count; c++) {
             float s = scores[raw_count + c];
-            const float *kv = comp_kv + (uint64_t)comp_rows[c] * head_dim;
-            acc0 += kv[d0] * s;
-            acc1 += kv[d1] * s;
+            const uint64_t crow = (uint64_t)comp_rows[c] * head_dim;
+            acc0 += comp_kv_load_elem(comp_kv, comp_kv_f16, crow + d0) * s;
+            acc1 += comp_kv_load_elem(comp_kv, comp_kv_f16, crow + d1) * s;
         }
         oh[d0] = acc0 / denom;
         oh[d1] = acc1 / denom;
@@ -3699,7 +3769,7 @@ __global__ static void attention_indexed_mixed_kernel(
         for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
             float acc = 0.0f;
             for (uint32_t r = 0; r < raw_count; r++) acc += raw_kv[(uint64_t)raw_rows[r] * head_dim + d] * scores[r];
-            for (uint32_t s = 0; s < comp_count; s++) acc += comp_kv[(uint64_t)comp_rows[s] * head_dim + d] * scores[raw_count + s];
+            for (uint32_t s = 0; s < comp_count; s++) acc += comp_kv_load_elem(comp_kv, comp_kv_f16, (uint64_t)comp_rows[s] * head_dim + d) * scores[raw_count + s];
             oh[d] = acc / denom;
         }
     }
@@ -3711,6 +3781,7 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
         const float *q,
         const float *raw_kv,
         const float *comp_kv,
+        uint32_t comp_kv_f16,
         const int32_t *topk,
         uint32_t n_tokens,
         uint32_t pos0,
@@ -3800,10 +3871,9 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)comp_rows[sr - raw_count] * head_dim);
-            kv_shared[off] = src[c4];
+            kv_shared[off] = sr < raw_count
+                ? ((const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim))[c4]
+                : comp_kv_load_f4(comp_kv, comp_kv_f16, (uint64_t)comp_rows[sr - raw_count], c4);
         }
         __syncthreads();
         if (valid_head) {
@@ -3848,10 +3918,9 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)comp_rows[sr - raw_count] * head_dim);
-            kv_shared[off] = src[c4];
+            kv_shared[off] = sr < raw_count
+                ? ((const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim))[c4]
+                : comp_kv_load_f4(comp_kv, comp_kv_f16, (uint64_t)comp_rows[sr - raw_count], c4);
         }
         __syncthreads();
         if (valid_head) {
@@ -3887,6 +3956,7 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
         const float *q,
         const float *raw_kv,
         const float *comp_kv,
+        uint32_t comp_kv_f16,
         const int32_t *topk,
         uint32_t n_tokens,
         uint32_t pos0,
@@ -3976,10 +4046,9 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
             const uint32_t comp_idx = sr < raw_count
                 ? 0u
                 : (uint32_t)topk[(uint64_t)t * top_k + (sr - raw_count)];
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)comp_idx * head_dim);
-            kv_shared[off] = src[c4];
+            kv_shared[off] = sr < raw_count
+                ? ((const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim))[c4]
+                : comp_kv_load_f4(comp_kv, comp_kv_f16, (uint64_t)comp_idx, c4);
         }
         __syncthreads();
         if (valid_head) {
@@ -4052,6 +4121,7 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
         const float *q,
         const float *raw_kv,
         const float *comp_kv,
+        uint32_t comp_kv_f16,
         uint32_t n_tokens,
         uint32_t n_comp,
         uint32_t window,
@@ -4100,10 +4170,9 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)(raw_start + sr) * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim);
-            kv_shared[off] = src[c4];
+            kv_shared[off] = sr < raw_count
+                ? ((const float4 *)(raw_kv + (uint64_t)(raw_start + sr) * head_dim))[c4]
+                : comp_kv_load_f4(comp_kv, comp_kv_f16, (uint64_t)(sr - raw_count), c4);
         }
         __syncthreads();
         if (valid_head) {
@@ -4176,6 +4245,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
         const float *q,
         const float *raw_kv,
         const float *comp_kv,
+        uint32_t comp_kv_f16,
         uint32_t n_tokens,
         uint32_t pos0,
         uint32_t n_raw,
@@ -4265,10 +4335,9 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
             const uint32_t sr = row0 + rr;
-            const float4 *src = sr < raw_count
-                ? (const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim)
-                : (const float4 *)(comp_kv + (uint64_t)(sr - raw_count) * head_dim);
-            kv_shared[off] = src[c4];
+            kv_shared[off] = sr < raw_count
+                ? ((const float4 *)(raw_kv + (uint64_t)raw_rows[sr] * head_dim))[c4]
+                : comp_kv_load_f4(comp_kv, comp_kv_f16, (uint64_t)(sr - raw_count), c4);
         }
         __syncthreads();
         if (valid_head) {
@@ -7439,18 +7508,19 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                use_mask,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16 ||
-        !heads || !q || !raw_kv || !model_map || n_raw == 0 || raw_cap < n_raw ||
+    if (!heads || !q || !raw_kv || !model_map || n_raw == 0 || raw_cap < n_raw ||
         raw_start >= raw_cap || (n_comp != 0 && !comp_kv) || (use_mask && !comp_mask) ||
         sinks_offset > model_size ||
         (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
         heads->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
-        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
+        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim *
+                                    (comp_kv_f16 ? sizeof(__half) : sizeof(float))) ||
         (use_mask && comp_mask->bytes < (uint64_t)n_comp * sizeof(float))) {
         return 0;
     }
+    const uint32_t cf16 = n_comp ? comp_kv_f16 : 0u;
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
@@ -7463,6 +7533,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                                               (const float *)q->ptr,
                                                                               (const float *)raw_kv->ptr,
                                                                               n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                              cf16,
                                                                               1,
                                                                               0,
                                                                               n_raw,
@@ -7484,6 +7555,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                  (const float *)q->ptr,
                                                  (const float *)raw_kv->ptr,
                                                  n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                 cf16,
                                                  use_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_mask,
                                                  1, 0, n_raw, raw_cap, raw_start, n_comp,
@@ -7509,6 +7581,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
                                                                    (const float *)q->ptr,
                                                                    (const float *)raw_kv->ptr,
                                                                    (const float *)raw_kv->ptr,
+                                                                   0u,
                                                                    n_tokens,
                                                                    0,
                                                                    window,
@@ -7610,8 +7683,7 @@ static int attention_decode_batch_launch(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16 ||
-        !heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
+    if (!heads || !q || !raw_kv || !model_map || n_tokens == 0 ||
         n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
         (n_comp != 0 && !comp_kv) || (use_comp_mask && !comp_mask) ||
         sinks_offset > model_size ||
@@ -7619,11 +7691,13 @@ static int attention_decode_batch_launch(
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
-        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
+        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim *
+                                    (comp_kv_f16 ? sizeof(__half) : sizeof(float))) ||
         (use_comp_mask && comp_mask->bytes < (uint64_t)n_tokens * n_comp * sizeof(float))) {
         return 0;
     }
     if (n_comp != 0 && ratio == 0) return 0;
+    const uint32_t cf16 = n_comp ? comp_kv_f16 : 0u;
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
@@ -7636,6 +7710,7 @@ static int attention_decode_batch_launch(
                                                                               (const float *)q->ptr,
                                                                               (const float *)raw_kv->ptr,
                                                                               n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                              cf16,
                                                                               n_tokens,
                                                                               pos0,
                                                                               n_raw,
@@ -7660,6 +7735,7 @@ static int attention_decode_batch_launch(
                                                                    (const float *)q->ptr,
                                                                    (const float *)raw_kv->ptr,
                                                                    n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                   cf16,
                                                                    n_tokens,
                                                                    pos0,
                                                                    n_raw,
@@ -7678,6 +7754,7 @@ static int attention_decode_batch_launch(
                                                  (const float *)q->ptr,
                                                  (const float *)raw_kv->ptr,
                                                  n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                 cf16,
                                                  use_comp_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_comp_mask, n_tokens, pos0, n_raw, raw_cap,
                                                  raw_start, n_comp, window, ratio, n_head, head_dim);
@@ -7726,7 +7803,6 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16) return 0;
     return attention_decode_batch_launch(heads, model_map, model_size, sinks_offset,
                                       q, raw_kv, comp_kv, comp_kv_f16, comp_mask, use_comp_mask,
                                       n_tokens, pos0, n_raw, raw_cap, raw_start,
@@ -7754,8 +7830,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16 ||
-        !heads || !q || !raw_kv || !comp_kv || !topk || !model_map ||
+    if (!heads || !q || !raw_kv || !comp_kv || !topk || !model_map ||
         n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
         n_comp == 0 || top_k == 0 ||
         sinks_offset > model_size ||
@@ -7763,7 +7838,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
-        comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float) ||
+        comp_kv->bytes < (uint64_t)n_comp * head_dim *
+                         (comp_kv_f16 ? sizeof(__half) : sizeof(float)) ||
         topk->bytes < (uint64_t)n_tokens * top_k * sizeof(int32_t)) {
         return 0;
     }
@@ -7790,6 +7866,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                                                (const float *)q->ptr,
                                                                                (const float *)raw_kv->ptr,
                                                                                (const float *)comp_kv->ptr,
+                                                                               comp_kv_f16,
                                                                                topk_ptr,
                                                                                n_tokens,
                                                                                pos0,
@@ -7810,6 +7887,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                                  (const float *)q->ptr,
                                                                  (const float *)raw_kv->ptr,
                                                                  (const float *)comp_kv->ptr,
+                                                                 comp_kv_f16,
                                                                  topk_ptr,
                                                                  n_tokens,
                                                                  pos0,
@@ -7830,6 +7908,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                   (const float *)q->ptr,
                                                   (const float *)raw_kv->ptr,
                                                   (const float *)comp_kv->ptr,
+                                                  comp_kv_f16,
                                                   topk_ptr,
                                                   n_tokens,
                                                   pos0,
@@ -7853,6 +7932,7 @@ static int attention_prefill_mixed_launch(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
+        uint32_t                comp_kv_f16,
         const ds4_gpu_tensor *comp_mask,
         uint32_t                use_comp_mask,
         uint32_t                n_tokens,
@@ -7868,10 +7948,12 @@ static int attention_prefill_mixed_launch(
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float) ||
-        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
+        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim *
+                                    (comp_kv_f16 ? sizeof(__half) : sizeof(float))) ||
         (use_comp_mask && comp_mask->bytes < (uint64_t)n_tokens * n_comp * sizeof(float))) {
         return 0;
     }
+    const uint32_t cf16 = n_comp ? comp_kv_f16 : 0u;
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
@@ -7884,6 +7966,7 @@ static int attention_prefill_mixed_launch(
                                                                    (const float *)q->ptr,
                                                                    (const float *)raw_kv->ptr,
                                                                    n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                   cf16,
                                                                    n_tokens,
                                                                    n_comp,
                                                                    window,
@@ -7912,6 +7995,7 @@ static int attention_prefill_mixed_launch(
                 kv,
                 (const float *)raw_kv->ptr,
                 n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                cf16,
                 n_tokens,
                 n_comp,
                 head_dim);
@@ -7983,6 +8067,7 @@ static int attention_prefill_mixed_launch(
                                                   (const float *)q->ptr,
                                                   (const float *)raw_kv->ptr,
                                                   n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                  cf16,
                                                   use_comp_mask ? (const float *)comp_mask->ptr : NULL,
                                                   use_comp_mask, n_tokens, n_comp, window, ratio,
                                                   n_head, head_dim);
@@ -8004,9 +8089,8 @@ extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16) return 0;
     return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
-                                       q, raw_kv, comp_kv, NULL, 0, n_tokens,
+                                       q, raw_kv, comp_kv, comp_kv_f16, NULL, 0, n_tokens,
                                        n_comp, window, ratio, n_head, head_dim);
 }
 
@@ -8026,9 +8110,8 @@ extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16) return 0;
     return attention_prefill_mixed_launch(heads, model_map, model_size, sinks_offset,
-                                       q, raw_kv, comp_kv, comp_mask, 1, n_tokens,
+                                       q, raw_kv, comp_kv, comp_kv_f16, comp_mask, 1, n_tokens,
                                        n_comp, window, ratio, n_head, head_dim);
 }
 extern "C" int ds4_gpu_attention_output_q8_batch_tensor(

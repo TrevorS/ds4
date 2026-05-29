@@ -9244,8 +9244,36 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
  */
 #if defined(__APPLE__)
 #define DS4_GPU_ATTN_COMP_CACHE_F16 1
+/* Metal is always F16; the context gate is a no-op (returns F16 unconditionally)
+ * so the shared sizing functions can call it without platform branches. */
+#define DS4_COMP_KV_F16_MIN_CTX 0u
+static inline int ds4_comp_kv_f16_for_ctx(uint32_t ctx) { (void)ctx; return 1; }
 #else
-#define DS4_GPU_ATTN_COMP_CACHE_F16 0
+/* CUDA: the attention-compressed KV cache is stored F16 (was F32).  The
+ * compressor still pools/normalizes/RoPEs/FP8-rounds rows in an F32 stage and
+ * the commit rounds to F16; attention widens F16->F32 on read so the
+ * FlashAttention compute path is shared with the legacy F32 config.  Matches
+ * the Metal storage layout (parity evidence it's numerically safe). */
+#define DS4_GPU_ATTN_COMP_CACHE_F16 ds4_comp_kv_f16()
+#endif
+
+#if !defined(__APPLE__)
+/* Context-length gate for the CUDA comp-KV in-memory dtype.  F16 halves the
+ * comp-KV read (a long-context win) but costs ~1.7% decode at short/mid ctx
+ * where the comp cache is tiny.  Decide F16 vs F32 per-session by the context
+ * allocation size.  Safe because the on-disk KV format is ALWAYS F32 (save:
+ * payload_write_tensor_span_f16_as_f32, restore: payload_read_tensor_span_f32_as_f16),
+ * so the in-memory dtype is free to vary per session without breaking KV files. */
+#define DS4_COMP_KV_F16_MIN_CTX 131072u
+
+static int ds4_comp_kv_f16_for_ctx(uint32_t ctx) {
+    const char *ov = getenv("DS4_COMP_KV_F16");
+    if (ov && ov[0]) return atoi(ov) != 0;
+    return ctx >= DS4_COMP_KV_F16_MIN_CTX;
+}
+
+static int g_comp_kv_f16 = 0;
+static inline int ds4_comp_kv_f16(void) { return g_comp_kv_f16; }
 #endif
 
 /* =========================================================================
@@ -9759,7 +9787,7 @@ static uint64_t metal_graph_kv_cache_bytes_for_context(uint32_t ctx_size, uint32
         if (ratio == 0) continue;
         const uint64_t comp_cap = (uint64_t)(ctx_size / ratio + 2u);
         bytes += comp_cap * DS4_N_HEAD_DIM *
-                 (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+                 (ds4_comp_kv_f16_for_ctx(ctx_size) ? sizeof(uint16_t) : sizeof(float));
         if (ratio == 4) {
             bytes += comp_cap * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
         }
@@ -9784,7 +9812,7 @@ static uint64_t metal_graph_context_bytes_for_kv_policy(
     if (kv_cache_bytes_out) *kv_cache_bytes_out = kv_cache_bytes;
     uint64_t bytes = kv_cache_bytes +
                      2ull * comp_cap * prefill_cap * sizeof(float);
-    if (DS4_GPU_ATTN_COMP_CACHE_F16) {
+    if (ds4_comp_kv_f16_for_ctx(ctx_size)) {
         uint64_t attn_stage_cap = (uint64_t)(prefill_cap / min_ratio + 2u);
         if (attn_stage_cap < 2u) attn_stage_cap = 2u;
         bytes += attn_stage_cap * DS4_N_HEAD_DIM * sizeof(float);
@@ -9961,6 +9989,16 @@ static bool metal_graph_alloc_raw_cap(
     if (raw_cap < raw_window) raw_cap = raw_window;
     if (raw_cap > ctx_size) raw_cap = ctx_size;
     if (raw_cap == 0) raw_cap = 1;
+#if !defined(__APPLE__)
+    /* Set the per-session comp-KV in-memory dtype BEFORE any sizing/alloc below
+     * (the macro DS4_GPU_ATTN_COMP_CACHE_F16 reads this flag, and the sizing
+     * fns gate on ctx_size directly).  This is the only caller of those sizing
+     * fns, so the ordering keeps the byte budget consistent with the dtype. */
+    g_comp_kv_f16 = ds4_comp_kv_f16_for_ctx(ctx_size);
+    fprintf(stderr,
+            "ds4: comp-KV cache dtype = %s (ctx_alloc=%u, threshold=%u)\n",
+            g_comp_kv_f16 ? "F16" : "F32", ctx_size, DS4_COMP_KV_F16_MIN_CTX);
+#endif
     g->raw_cap = raw_cap;
     g->raw_window = raw_window;
     g->prefill_cap = prefill_cap;
