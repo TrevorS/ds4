@@ -7099,16 +7099,14 @@ static bool agent_worker_compact_if_needed(agent_worker *w, const char *reason,
     return agent_worker_compact(w, reason, err, err_len);
 }
 
-static int worker_accept_generated_token(agent_worker *w,
-                                         int token,
-                                         int *generated,
-                                         double t0,
-                                         agent_stream_renderer *stream,
-                                         char *err,
-                                         size_t err_len) {
-    if (ds4_session_eval(w->session, token, err, err_len) != 0)
-        return 1;
-
+/* Stream + bookkeeping for a token whose session_eval has already happened.
+ * Used by the MTP speculative path where ds4_session_eval_speculative_* has
+ * advanced the session for us. */
+static int worker_record_decoded_token(agent_worker *w,
+                                       int token,
+                                       int *generated,
+                                       double t0,
+                                       agent_stream_renderer *stream) {
     ds4_tokens_push(&w->transcript, token);
 
     size_t text_len = 0;
@@ -7125,6 +7123,18 @@ static int worker_accept_generated_token(agent_worker *w,
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
     return 0;
+}
+
+static int worker_accept_generated_token(agent_worker *w,
+                                         int token,
+                                         int *generated,
+                                         double t0,
+                                         agent_stream_renderer *stream,
+                                         char *err,
+                                         size_t err_len) {
+    if (ds4_session_eval(w->session, token, err, err_len) != 0)
+        return 1;
+    return worker_record_decoded_token(w, token, generated, t0, stream);
 }
 
 static int worker_force_generated_text(agent_worker *w,
@@ -7279,6 +7289,13 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         agent_wake_locked(w);
         pthread_mutex_unlock(&w->mu);
 
+        /* MTP availability is fixed for the run; cache once. The
+         * DS4_MTP_SPEC_DISABLE env var matches what ds4-cli + ds4-bench
+         * + ds4-server check so a single knob disables spec everywhere. */
+        const bool mtp_ready =
+            ds4_engine_mtp_draft_tokens(w->engine) > 1 &&
+            getenv("DS4_MTP_SPEC_DISABLE") == NULL;
+
         while (generated < max_tokens && !worker_should_interrupt(w)) {
             worker_apply_pending_power(w);
             int token = ds4_session_sample(w->session, cfg->gen.temperature, 0,
@@ -7293,6 +7310,9 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 agent_trace(w, "edit old auto-upto replaced token=%d text=%.*s",
                             token, (int)(text_len > 80 ? 80 : text_len), text);
                 free(text);
+                /* upto-forcer bypasses MTP — it replaces the sampled token
+                 * with a fixed text fragment that needs to be evaluated
+                 * normally. */
                 if (worker_force_generated_text(w, "[upto]\n", max_tokens,
                                                 &generated, t0, &stream,
                                                 err, sizeof(err)) != 0) {
@@ -7302,12 +7322,58 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 }
             } else {
                 free(text);
-                if (worker_accept_generated_token(w, token, &generated, t0,
-                                                  &stream, err, sizeof(err)) != 0) {
+                /* MTP spec path: evaluate token + drafts in one combined
+                 * forward and commit the accepted prefix. Plain path is
+                 * the fallback. */
+                int toks[17];
+                const int toks_cap = (int)(sizeof(toks) / sizeof(toks[0]));
+                int ntok;
+                if (mtp_ready && cfg->gen.temperature > 0.0f) {
+                    ntok = ds4_session_eval_speculative_sample(
+                        w->session, token, max_tokens - generated,
+                        ds4_token_eos(w->engine),
+                        cfg->gen.temperature, 0,
+                        cfg->gen.top_p, cfg->gen.min_p, &rng,
+                        toks, toks_cap, err, sizeof(err));
+                } else if (mtp_ready) {
+                    ntok = ds4_session_eval_speculative_argmax(
+                        w->session, token, max_tokens - generated,
+                        ds4_token_eos(w->engine),
+                        toks, toks_cap, err, sizeof(err));
+                } else {
+                    if (ds4_session_eval(w->session, token, err,
+                                         sizeof(err)) != 0) {
+                        agent_dsml_parser_free(&dsml);
+                        agent_set_error(w, err);
+                        return 1;
+                    }
+                    toks[0] = token;
+                    ntok = 1;
+                }
+                if (ntok < 0) {
                     agent_dsml_parser_free(&dsml);
                     agent_set_error(w, err);
                     return 1;
                 }
+
+                bool stop_batch = false;
+                for (int j = 0; j < ntok; j++) {
+                    if (toks[j] == ds4_token_eos(w->engine)) {
+                        stop_batch = true;
+                        break;
+                    }
+                    if (worker_record_decoded_token(w, toks[j], &generated,
+                                                    t0, &stream) != 0) {
+                        agent_dsml_parser_free(&dsml);
+                        agent_set_error(w, err);
+                        return 1;
+                    }
+                    if (generated >= max_tokens) {
+                        stop_batch = true;
+                        break;
+                    }
+                }
+                if (stop_batch) break;
             }
 
             if (dsml.state == AGENT_DSML_DONE) {
