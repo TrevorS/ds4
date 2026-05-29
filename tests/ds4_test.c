@@ -1486,6 +1486,23 @@ static void test_run_mpp_candidate(const char *label,
 }
 
 static void test_metal_mpp_equivalence(void) {
+#ifndef __APPLE__
+    /* This test compares the Metal MPP (Metal Performance Primitives) tensor
+     * path against the non-MPP fallback by toggling DS4_METAL_DISABLE_METAL4
+     * between the reference and candidate engines.  Both engines reduce to
+     * the same code path on CUDA — there's no MPP vs non-MPP distinction —
+     * so the comparison degenerates into "does opening the same model twice
+     * give bit-identical argmax across separate cuBLAS handles".  That's
+     * non-deterministic in practice (cuBLAS handle/workspace state drifts
+     * across instantiations, flipping near-tied top-1 logits), which makes
+     * the test flake despite no actual functional regression.  Skip on
+     * non-Apple builds rather than asserting on a Metal-specific
+     * equivalence check that doesn't translate. */
+    fprintf(stderr,
+            "metal-tensor-equivalence: skipped (CUDA build — Metal MPP vs "
+            "non-MPP comparison has no equivalent on CUDA)\n");
+    return;
+#else
     test_close_engines();
 
     test_mpp_eq_case cases[TEST_MPP_EQ_MAX_CASES];
@@ -1517,6 +1534,7 @@ static void test_metal_mpp_equivalence(void) {
     test_run_mpp_candidate("auto", cases, ncase);
 
     for (int i = 0; i < ncase; i++) test_mpp_eq_case_free(&cases[i]);
+#endif
 }
 
 static const char *test_tool_call_request_json(void) {
