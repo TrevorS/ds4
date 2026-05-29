@@ -27,6 +27,15 @@ void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
+
+/* C20: per-tensor device fingerprint drift tap (env-gated diagnostic).
+ * Computes {sum (f64 accum), amax, nan_count, byte_xor} over the first n_f32
+ * float elements of `t` with one device reduction kernel, reads back only the
+ * small fingerprint, and appends a line to <DS4_CUDA_TAP_PREFIX>_<tag>_L<layer>_p<pos>.fp.
+ * Zero-overhead no-op (cached env, predicted-not-taken branch, no launch/sync/alloc)
+ * when DS4_CUDA_TAP_PREFIX is unset. Returns 1 on success / no-op, 0 on error. */
+int ds4_gpu_fingerprint_tap_f32(const ds4_gpu_tensor *t, uint64_t n_f32,
+                                const char *tag, uint32_t layer, uint32_t pos);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);

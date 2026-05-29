@@ -10794,6 +10794,7 @@ static bool metal_graph_encode_decode_layer(
     DS4_METAL_PROFILE_DECODE_STAGE("q_path");
     if (ok) {
         metal_graph_debug_dump_tensor("Qcur", g->q, q_dim, il, pos);
+        ds4_gpu_fingerprint_tap_f32(g->q, q_dim, "Qcur", il, pos);  /* C20 tap: Q output */
     }
     if (!qkv_rms_fused) {
         if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->kv_raw, model->map, model->size,
@@ -10826,6 +10827,7 @@ static bool metal_graph_encode_decode_layer(
     DS4_METAL_PROFILE_DECODE_STAGE("kv_path");
     if (ok) {
         metal_graph_debug_dump_tensor("KVcur", g->kv, DS4_N_HEAD_DIM, il, pos);
+        ds4_gpu_fingerprint_tap_f32(g->kv, DS4_N_HEAD_DIM, "KVcur", il, pos);  /* C20 tap: KV-quant output */
     }
 
     uint32_t n_comp = 0;
@@ -10908,6 +10910,7 @@ static bool metal_graph_encode_decode_layer(
                 ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
                 if (ok) {
                     metal_graph_debug_dump_tensor("KVcompress", comp_row_view, DS4_N_HEAD_DIM, il, pos);
+                    ds4_gpu_fingerprint_tap_f32(comp_row_view, DS4_N_HEAD_DIM, "KVcompress", il, pos);  /* C20 tap: compressor output */
                 }
                 ds4_gpu_tensor_free(comp_row_view);
             }
@@ -11343,6 +11346,12 @@ static bool metal_graph_encode_decode_layer(
                                       (uint64_t)DS4_N_EXPERT_USED * down_in_dim, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_up_clamped", g->routed_up,
                                       (uint64_t)DS4_N_EXPERT_USED * down_in_dim, il, pos);
+        /* C20 tap: MoE gate/up output. This is a per-expert scratch buffer whose
+         * unwritten tail slots legitimately hold non-finite garbage (the reference
+         * dumper sees the same), so nan_count/byte_xor here are scratch-noise — use
+         * sum/amax for trend and prefer the clean ffn_moe_out tap for nan==0 checks. */
+        ds4_gpu_fingerprint_tap_f32(g->routed_gate, (uint64_t)DS4_N_EXPERT_USED * down_in_dim,
+                                    "ffn_moe_gate", il, pos);
     }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_weighted_swiglu", g->routed_mid,
@@ -11354,6 +11363,10 @@ static bool metal_graph_encode_decode_layer(
     }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_out", g->routed_out, DS4_N_EMBD, il, pos);
+        /* C20 tap: MoE down/sum output. Tap the post-sum routed_out (DS4_N_EMBD,
+         * fully written) rather than the per-expert routed_down scratch, whose
+         * unwritten tail slots legitimately hold non-finite garbage. */
+        ds4_gpu_fingerprint_tap_f32(g->routed_out, DS4_N_EMBD, "ffn_moe_out", il, pos);
     }
     const bool fuse_shared_gate_up =
         !g->quality &&
@@ -12896,6 +12909,8 @@ static bool metal_graph_encode_layer_attention_batch(
     if (ok) {
         metal_graph_debug_dump_tensor("Qcur", g->batch_q,
                                       (uint64_t)n_tokens * q_dim, il, pos0);
+        ds4_gpu_fingerprint_tap_f32(g->batch_q, (uint64_t)n_tokens * q_dim,
+                                    "Qcur", il, pos0);  /* C20 tap: Q output (verify, n_tokens-scaled) */
     }
     DS4_METAL_PROFILE_Q_STAGE("head_norm_rope");
     DS4_METAL_PROFILE_ATTN_STAGE("q_path");
@@ -12952,6 +12967,8 @@ static bool metal_graph_encode_layer_attention_batch(
     if (ok) {
         metal_graph_debug_dump_tensor("KVcur", g->batch_kv,
                                       (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
+        ds4_gpu_fingerprint_tap_f32(g->batch_kv, (uint64_t)n_tokens * DS4_N_HEAD_DIM,
+                                    "KVcur", il, pos0);  /* C20 tap: KV-quant output (verify, n_tokens-scaled) */
     }
     DS4_METAL_PROFILE_ATTN_STAGE("kv_path");
     /*
@@ -13314,6 +13331,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                           DS4_N_HEAD_DIM,
                                                           il,
                                                           pos);
+                            ds4_gpu_fingerprint_tap_f32(comp_row_view, DS4_N_HEAD_DIM,
+                                                        "KVcompress", il, pos);  /* C20 tap: compressor output (verify) */
                         }
                         ds4_gpu_tensor_free(comp_row_view);
                         if (ok) ok = metal_graph_commit_attn_comp_stage(g, il, comp_row, 1);
@@ -14244,6 +14263,9 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EXPERT_USED * down_in_dim, il, pos0);
         metal_graph_debug_dump_tensor("ffn_moe_up_clamped", g->batch_routed_up,
                                       (uint64_t)n_tokens * DS4_N_EXPERT_USED * down_in_dim, il, pos0);
+        ds4_gpu_fingerprint_tap_f32(g->batch_routed_gate,
+                                    (uint64_t)n_tokens * DS4_N_EXPERT_USED * down_in_dim,
+                                    "ffn_moe_gate", il, pos0);  /* C20 tap: MoE gate/up output (verify, n_tokens-scaled) */
     }
     if (ok) {
         const uint64_t routed_mid_elems = (uint64_t)n_tokens * DS4_N_EXPERT_USED * down_in_dim;
@@ -14262,6 +14284,10 @@ static bool metal_graph_encode_layer_ffn_batch(
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_out", g->batch_routed_out,
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
+        /* C20 tap: MoE down/sum output (verify, n_tokens-scaled). Post-sum
+         * batch_routed_out is fully written (no scratch-tail garbage). */
+        ds4_gpu_fingerprint_tap_f32(g->batch_routed_out, (uint64_t)n_tokens * DS4_N_EMBD,
+                                    "ffn_moe_out", il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("routed_moe");
     if (ok) ok = metal_graph_matmul_q8_0_named_tensor("shared_gate",

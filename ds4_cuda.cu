@@ -1506,6 +1506,118 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
     return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");
 }
 
+/* ---- C20: byte-XOR / fingerprint drift taps (env-gated diagnostic) -------- */
+/* One device reduction kernel computes a per-tensor fingerprint so a single run
+ * can localize numerical drift to a specific kernel x layer (today drift hunts
+ * are a manual binary search). The four fields:
+ *   sum       - f64-accumulated sum of the f32 values (fp-tolerant signal)
+ *   amax      - max(|value|)                          (fp-tolerant signal)
+ *   nan_count - count of NaN/Inf elements             (fp-tolerant signal)
+ *   byte_xor  - u32 XOR of the raw 32-bit element bits (bit-EXACT only)
+ * NOTE: byte_xor is bit-exact-only. It false-fires on benign reduction-order
+ * differences (e.g. atomic-down accumulation order), so it is ONLY meaningful
+ * for bit-equality replay checks. The load-bearing fp-tolerant drift signals
+ * are sum/amax/nan_count; treat byte_xor as a strict equality tripwire. */
+struct ds4_cuda_fingerprint {
+    double   sum;        /* f64 accumulator over f32 values */
+    float    amax;       /* max abs value */
+    uint32_t nan_count;  /* count of !isfinite elements */
+    uint32_t byte_xor;   /* xor of raw 32-bit element bit patterns */
+    uint32_t _pad;
+};
+
+__global__ static void fingerprint_reduce_kernel(const float *x, uint64_t n,
+                                                  ds4_cuda_fingerprint *out) {
+    __shared__ double s_sum[256];
+    __shared__ float  s_amax[256];
+    __shared__ uint32_t s_nan[256];
+    __shared__ uint32_t s_xor[256];
+    const uint32_t t = threadIdx.x;
+    double   l_sum = 0.0;
+    float    l_amax = 0.0f;
+    uint32_t l_nan = 0u;
+    uint32_t l_xor = 0u;
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + t;
+         i < n; i += (uint64_t)gridDim.x * blockDim.x) {
+        const float v = x[i];
+        uint32_t bits;
+        memcpy(&bits, &v, sizeof(bits));
+        l_xor ^= bits;
+        if (isfinite(v)) {
+            l_sum += (double)v;
+            const float a = fabsf(v);
+            if (a > l_amax) l_amax = a;
+        } else {
+            l_nan++;
+        }
+    }
+    s_sum[t] = l_sum; s_amax[t] = l_amax; s_nan[t] = l_nan; s_xor[t] = l_xor;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2u; stride > 0u; stride >>= 1) {
+        if (t < stride) {
+            s_sum[t] += s_sum[t + stride];
+            if (s_amax[t + stride] > s_amax[t]) s_amax[t] = s_amax[t + stride];
+            s_nan[t] += s_nan[t + stride];
+            s_xor[t] ^= s_xor[t + stride];
+        }
+        __syncthreads();
+    }
+    if (t == 0u) {
+        atomicAdd(&out->sum, s_sum[0]);
+        atomicMax((int *)&out->amax, __float_as_int(s_amax[0]));  /* amax >= 0 so int order == float order */
+        atomicAdd(&out->nan_count, s_nan[0]);
+        atomicXor(&out->byte_xor, s_xor[0]);
+    }
+}
+
+/* Cached env gate: read DS4_CUDA_TAP_PREFIX once. When unset, the tap is a
+ * zero-overhead no-op (cached static, predicted-not-taken branch, NO kernel
+ * launch / NO sync / NO alloc) — this no-op contract is the load-bearing
+ * requirement for leaving the taps compiled into the hot path permanently. */
+static const char *ds4_cuda_tap_prefix(void) {
+    static const char *g_prefix = NULL;
+    static int g_init = 0;
+    if (!g_init) {                       /* one-time env read */
+        g_prefix = getenv("DS4_CUDA_TAP_PREFIX");
+        g_init = 1;
+    }
+    return g_prefix;
+}
+
+extern "C" int ds4_gpu_fingerprint_tap_f32(const ds4_gpu_tensor *t, uint64_t n_f32,
+                                           const char *tag, uint32_t layer, uint32_t pos) {
+    const char *prefix = ds4_cuda_tap_prefix();
+    if (__builtin_expect(prefix == NULL, 1)) return 1;  /* no-op fast path */
+    if (!t || !t->ptr || n_f32 == 0 || !tag ||
+        n_f32 > t->bytes / sizeof(float)) {
+        return 0;
+    }
+    /* Device accumulator: zero-init, reduce, read back the small struct. */
+    ds4_cuda_fingerprint *d_fp = NULL;
+    if (cudaMalloc(&d_fp, sizeof(*d_fp)) != cudaSuccess) return 0;
+    if (cudaMemset(d_fp, 0, sizeof(*d_fp)) != cudaSuccess) { (void)cudaFree(d_fp); return 0; }
+    uint32_t blocks = (uint32_t)((n_f32 + 255u) / 256u);
+    if (blocks > 1024u) blocks = 1024u;
+    fingerprint_reduce_kernel<<<blocks, 256>>>((const float *)t->ptr, n_f32, d_fp);
+    if (!cuda_ok(cudaGetLastError(), "fingerprint tap launch")) { (void)cudaFree(d_fp); return 0; }
+    ds4_cuda_fingerprint h_fp;
+    int ok = cuda_ok(cudaMemcpy(&h_fp, d_fp, sizeof(h_fp), cudaMemcpyDeviceToHost), "fingerprint tap read");
+    (void)cudaFree(d_fp);
+    if (!ok) return 0;
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s_%s_L%u_p%u.fp", prefix, tag, layer, pos);
+    FILE *f = fopen(path, "a");
+    if (!f) return 0;
+    /* One line per fingerprint: sum amax nan xor count. sum/amax/nan are the
+     * fp-tolerant drift signals; xor is the bit-exact equality tripwire. */
+    fprintf(f, "tag=%s L=%u pos=%u n=%llu sum=%.9g amax=%.9g nan=%u xor=0x%08x\n",
+            tag, layer, pos, (unsigned long long)n_f32,
+            h_fp.sum, (double)h_fp.amax, h_fp.nan_count, h_fp.byte_xor);
+    fclose(f);
+    return 1;
+}
+
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                      const ds4_gpu_tensor *src, uint64_t src_offset,
                                      uint64_t bytes) {
