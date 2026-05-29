@@ -17132,6 +17132,19 @@ struct ds4_session {
     float *spec_row_logits_buf;
     int *spec_row_tops_buf;
     uint32_t spec_row_logits_cap_rows;
+    /* Adaptive cascade-depth controller (opt-in, DS4_MTP_CASCADE_ADAPTIVE).
+     * EWMA of the conditional p1 = P(drafts[1] accepted | drafts[0] accepted),
+     * sampled only on iters that actually ran K=2.  When the EWMA falls below
+     * the low threshold the controller drops the per-iter draft_cap to K=1
+     * (hysteresis between low/high thresholds), and forces a periodic K=2
+     * re-probe so it can climb back out.  Bit-safe: both K=1 and K=2 emit the
+     * same verifier-defined greedy stream. */
+    bool   mtp_cascade_adaptive;   /* feature enabled (env latched once) */
+    bool   mtp_cascade_inited;     /* controller state initialized */
+    int    mtp_cascade_cap;        /* current per-iter draft_cap (1 or 2) */
+    int    mtp_cascade_probe_n;    /* cold-start forced-K=2 probes remaining */
+    int    mtp_cascade_since_probe;/* iters since last K=2 sample */
+    float  mtp_cascade_ewma_p1;    /* EWMA of conditional p1 */
 };
 
 /* =========================================================================
@@ -19684,6 +19697,47 @@ static int ds4_session_eval_speculative_argmax_combined(
      * compressor frontier to the prefix2 snapshot captured at the row-1
      * boundary.  DS4_MTP_NO_CASCADE=1 forces the two-token window. */
     int draft_cap = (getenv("DS4_MTP_NO_CASCADE") != NULL) ? 1 : 2;
+
+    /* Adaptive cascade depth (opt-in DS4_MTP_CASCADE_ADAPTIVE).  An EWMA of the
+     * conditional p1 = P(drafts[1] accept | drafts[0] accept) gates draft_cap
+     * between 1 and 2 with hysteresis: drop to K=1 below 0.30, climb to K=2
+     * above 0.35.  K=2 is forced on cold start (first K_PROBE iters) and
+     * re-probed every PROBE_EVERY iters so a stuck-low controller can recover
+     * if accept rates rise.  No effect under DS4_MTP_NO_CASCADE (draft_cap is
+     * already pinned to 1).  Bit-safe: both K choices emit the same greedy
+     * verifier stream. */
+    int probe_k2 = 0;
+    if (draft_cap > 1) {
+        if (!s->mtp_cascade_inited) {
+            s->mtp_cascade_adaptive = (getenv("DS4_MTP_CASCADE_ADAPTIVE") != NULL);
+            s->mtp_cascade_cap = 2;
+            s->mtp_cascade_ewma_p1 = 1.0f;       /* optimistic cold start */
+            s->mtp_cascade_probe_n = 2;          /* K=2 for first 2 iters */
+            s->mtp_cascade_since_probe = 0;
+            s->mtp_cascade_inited = true;
+        }
+        if (s->mtp_cascade_adaptive) {
+            const int   CASCADE_PROBE_EVERY = 16;
+            const float CASCADE_LO = 0.30f;      /* drop K=2 -> K=1 below */
+            const float CASCADE_HI = 0.35f;      /* raise K=1 -> K=2 above */
+            /* Hysteresis update of the latched cap from the running EWMA. */
+            if (s->mtp_cascade_cap == 2) {
+                if (s->mtp_cascade_ewma_p1 < CASCADE_LO) s->mtp_cascade_cap = 1;
+            } else {
+                if (s->mtp_cascade_ewma_p1 > CASCADE_HI) s->mtp_cascade_cap = 2;
+            }
+            /* Force a K=2 probe on cold start and every PROBE_EVERY iters so a
+             * controller stuck at K=1 can re-measure p1 and recover. */
+            if (s->mtp_cascade_probe_n > 0 ||
+                s->mtp_cascade_since_probe >= CASCADE_PROBE_EVERY) {
+                probe_k2 = 1;
+                draft_cap = 2;
+            } else {
+                draft_cap = s->mtp_cascade_cap;
+            }
+        }
+    }
+
     if (draft_cap > max_tokens - 1) draft_cap = max_tokens - 1;
     if (draft_cap > accepted_cap - 1) draft_cap = accepted_cap - 1;
     int room = s->ctx_size - s->checkpoint.len;
@@ -19818,10 +19872,43 @@ static int ds4_session_eval_speculative_argmax_combined(
     if (keep > s->graph.raw_window) keep = s->graph.raw_window;
     s->graph.mtp_n_raw = keep;
 
+    /* Adaptive controller bookkeeping.  Sample the conditional p1 only on iters
+     * that actually ran K=2 (draft_n==2) AND saw drafts[0] accepted (commit>=1)
+     * — otherwise the K=2 row carries no information about P(drafts[1]|drafts[0]).
+     * EWMA alpha=0.25.  since_probe counts iters between forced K=2 re-probes. */
+    if (s->mtp_cascade_adaptive) {
+        const bool ran_k2 = (draft_n >= 2);
+        if (ran_k2 && commit >= 1) {
+            /* Usable conditional sample: drafts[0] accepted, so the K=2 row's
+             * accept/reject IS the p1 observation. */
+            const float obs = (commit >= 2) ? 1.0f : 0.0f;
+            const float alpha = 0.25f;
+            s->mtp_cascade_ewma_p1 =
+                (1.0f - alpha) * s->mtp_cascade_ewma_p1 + alpha * obs;
+        }
+        if (ran_k2) {
+            /* A K=2 iter (probe or steady) satisfies the re-probe cadence. */
+            if (s->mtp_cascade_probe_n > 0) s->mtp_cascade_probe_n--;
+            s->mtp_cascade_since_probe = 0;
+        } else {
+            s->mtp_cascade_since_probe++;
+        }
+        (void)probe_k2;
+    }
+
     if (mtp_timing) {
-        fprintf(stderr,
-                "ds4: mtp timing combined drafted=%d committed=%d total=%.3f ms\n",
-                draft_n, commit, (now_sec() - mtp_t0) * 1000.0);
+        if (s->mtp_cascade_adaptive) {
+            fprintf(stderr,
+                    "ds4: mtp timing combined drafted=%d committed=%d "
+                    "cap=%d ewma_p1=%.3f total=%.3f ms\n",
+                    draft_n, commit, s->mtp_cascade_cap,
+                    (double)s->mtp_cascade_ewma_p1,
+                    (now_sec() - mtp_t0) * 1000.0);
+        } else {
+            fprintf(stderr,
+                    "ds4: mtp timing combined drafted=%d committed=%d total=%.3f ms\n",
+                    draft_n, commit, (now_sec() - mtp_t0) * 1000.0);
+        }
     }
 
     return n_accept;
