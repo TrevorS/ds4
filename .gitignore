@@ -20,3 +20,4 @@ __pycache__/
 .DS_Store
 /librechat/
 tools/perf/*/runs/
+/tests/cuda_long_context_smoke
