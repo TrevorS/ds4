@@ -566,6 +566,17 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "ds4-bench: token dump open %s: %s\n", tdpath, strerror(errno));
         }
     }
+    /* Optional per-step logit-vector dump for tensor-RMS cross-check (MTP vs
+     * canonical). Binary: repeated [int32 pos][int32 n][n×float32]. Capped. */
+    FILE *ldump = NULL; float *lbuf = NULL; const int lbuf_cap = 131072; int ldump_left = 48;
+    {
+        const char *lpath = getenv("DS4_BENCH_LOGIT_DUMP");
+        if (lpath && lpath[0]) {
+            ldump = fopen(lpath, "wb");
+            if (!ldump) fprintf(stderr, "ds4-bench: logit dump open %s: %s\n", lpath, strerror(errno));
+            else { lbuf = (float *)malloc((size_t)lbuf_cap * sizeof(float)); if (!lbuf) { fclose(ldump); ldump = NULL; } }
+        }
+    }
     fprintf(stderr, "ds4-bench: decode path = %s\n",
             use_mtp ? "MTP speculative combined-forward" : "plain");
     ds4_session_snapshot snap = {0};
@@ -655,6 +666,15 @@ int main(int argc, char **argv) {
             /* Greedy default keeps rows comparable; --temp>0 measures the real
              * sampled decode path (spec-sampling when --mtp).  Sampled spec calls
              * pass eos=-1 so generation never early-stops (full gen_tokens/row). */
+            if (ldump && lbuf && ldump_left > 0) {
+                int n = ds4_session_copy_logits(session, lbuf, lbuf_cap);
+                if (n > 0) {
+                    int32_t hdr[2] = { (int32_t)produced, (int32_t)n };
+                    fwrite(hdr, sizeof(hdr), 1, ldump);
+                    fwrite(lbuf, sizeof(float), (size_t)n, ldump);
+                    ldump_left--;
+                }
+            }
             const int token = sampled
                 ? ds4_session_sample(session, cfg.temperature, 0, cfg.top_p, cfg.min_p, &rng)
                 : ds4_session_argmax_excluding(session, eos);
@@ -730,6 +750,8 @@ int main(int argc, char **argv) {
 
 cleanup:
     if (tdump) fclose(tdump);
+    if (ldump) fclose(ldump);
+    free(lbuf);
     if (out != stdout) fclose(out);
     ds4_session_snapshot_free(&snap);
     ds4_session_free(session);

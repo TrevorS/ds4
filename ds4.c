@@ -11285,6 +11285,8 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("hc_attn_post", g->after_attn_hc, hc_dim, il, pos);
     }
+    /* C20 tap: canonical N=1 post-attn HC. Aligns by layer with batch path. */
+    if (ok) ds4_gpu_fingerprint_tap_f32(g->after_attn_hc, hc_dim, "hc_attn_post", il, pos);
     if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->after_attn_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_ffn_fn,
                                                  hc_dim, mix_hc, g->flat_hc, 1);
@@ -11493,6 +11495,8 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_post", g->after_ffn_hc, hc_dim, il, pos);
     }
+    /* C20 tap: canonical N=1 post-ffn HC. Aligns by layer with batch path. */
+    if (ok) ds4_gpu_fingerprint_tap_f32(g->after_ffn_hc, hc_dim, "hc_ffn_post", il, pos);
     return ok;
 }
 
@@ -14116,6 +14120,10 @@ static bool metal_graph_encode_layer_attention_batch(
         metal_graph_debug_dump_tensor("hc_attn_post", g->batch_after_attn_hc,
                                       (uint64_t)n_tokens * hc_dim, il, pos0);
     }
+    /* C20 tap: batch verify post-attn HC, FIRST position only (first hc_dim
+     * floats) so it is directly comparable to the canonical N=1 tap at the same
+     * layer and start position. */
+    if (ok) ds4_gpu_fingerprint_tap_f32(g->batch_after_attn_hc, hc_dim, "hc_attn_post", il, pos0);
     DS4_METAL_PROFILE_ATTN_STAGE("hc_post");
     ds4_gpu_tensor_free(after_attn_hc_view);
     ds4_gpu_tensor_free(attn_cur_view);
@@ -14406,6 +14414,9 @@ static bool metal_graph_encode_layer_ffn_batch(
         metal_graph_debug_dump_tensor("hc_ffn_post", g->batch_next_hc,
                                       (uint64_t)n_tokens * hc_dim, il, pos0);
     }
+    /* C20 tap: batch verify post-ffn HC, FIRST position only (first hc_dim
+     * floats) so it is directly comparable to the canonical N=1 tap. */
+    if (ok) ds4_gpu_fingerprint_tap_f32(g->batch_next_hc, hc_dim, "hc_ffn_post", il, pos0);
     DS4_METAL_PROFILE_FFN_STAGE("hc_post");
     ds4_gpu_tensor_free(next_hc_view);
     ds4_gpu_tensor_free(ffn_cur_view);
@@ -15497,6 +15508,9 @@ static bool metal_graph_verify_suffix_tops(
                                                       weights,
                                                       n_tokens,
                                                       weights->output->dim[1]);
+    /* C20 tap: batch verify output logits, FIRST row only. Tagged spec_logits,
+     * layer=DS4_N_LAYER so it sorts after per-layer taps; pos=start. */
+    if (ok) ds4_gpu_fingerprint_tap_f32(g->spec_logits, DS4_N_VOCAB, "spec_logits", DS4_N_LAYER, start);
     if (ok) {
         if (top_rows == 1) {
             /* Common K=2 verify case: top_k=1 over n_vocab → use the dedicated
@@ -15647,6 +15661,9 @@ static bool metal_graph_verify_decode2_exact(
         g->cur_hc = cur0;
         ok = ds4_gpu_begin_commands() != 0;
         if (ok) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+        /* C20 tap: canonical/strict output logits for token0 (first position).
+         * SAME tag/layer/pos as the batch spec_logits tap so they align. */
+        if (ok) ds4_gpu_fingerprint_tap_f32(g->logits, DS4_N_VOCAB, "spec_logits", DS4_N_LAYER, start);
         if (ok) ok = ds4_gpu_argmax_tensor(g->comp_selected,
                                            g->logits,
                                            DS4_N_VOCAB) != 0;
