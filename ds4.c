@@ -14274,7 +14274,86 @@ static bool metal_graph_encode_layer_ffn_batch(
     }
     DS4_METAL_PROFILE_FFN_STAGE("router");
 
-    if (ok) {
+    /* C20 MoE-order fix: when armed for the tiny (n=2) MTP verify, route the
+     * routed-MoE through the byte-identical N=1 kernel/order (use_decode_lut_gate +
+     * use_direct_down_sum6) by looping ds4_gpu_routed_moe_one_tensor per token.
+     * Gated on the same small-n verify window as DS4_CUDA_ORDERED_F16_MAX_TOKENS so
+     * production prefill (n_tokens large) and the canonical N=1 path are untouched. */
+    bool verify_ordered_moe = false;
+    if (ok && n_tokens > 1) {
+        /* Dedicated MoE gate takes precedence; otherwise piggyback on the same
+         * small-n window that arms the ordered F16 GEMMs (DS4_CUDA_ORDERED_F16_MAX_TOKENS)
+         * so the deterministic arbiter run exercises the ordered MoE without a
+         * second env var. Either knob, when its cap >= n_tokens, routes the verify
+         * MoE through the byte-identical N=1 kernel/order. */
+        const char *omt = getenv("DS4_CUDA_ORDERED_MOE_MAX_TOKENS");
+        if (omt && omt[0]) {
+            const int omt_max = atoi(omt);
+            verify_ordered_moe = (omt_max > 0 && (int)n_tokens <= omt_max);
+        } else {
+            const char *f16 = getenv("DS4_CUDA_ORDERED_F16_MAX_TOKENS");
+            if (f16 && f16[0]) {
+                const int f16_max = atoi(f16);
+                verify_ordered_moe = (f16_max > 0 && (int)n_tokens <= f16_max);
+            }
+        }
+    }
+    if (ok && verify_ordered_moe) {
+        for (uint32_t t = 0; t < n_tokens && ok; t++) {
+            ds4_gpu_tensor *out_view =
+                ds4_gpu_tensor_view(g->batch_routed_out,
+                                    (uint64_t)t * DS4_N_EMBD * sizeof(float),
+                                    (uint64_t)DS4_N_EMBD * sizeof(float));
+            ds4_gpu_tensor *sel_view =
+                ds4_gpu_tensor_view(g->batch_router_selected,
+                                    (uint64_t)t * DS4_N_EXPERT_USED * sizeof(int32_t),
+                                    (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+            ds4_gpu_tensor *wts_view =
+                ds4_gpu_tensor_view(g->batch_router_weights,
+                                    (uint64_t)t * DS4_N_EXPERT_USED * sizeof(float),
+                                    (uint64_t)DS4_N_EXPERT_USED * sizeof(float));
+            ds4_gpu_tensor *norm_view =
+                ds4_gpu_tensor_view(g->batch_ffn_norm,
+                                    (uint64_t)t * DS4_N_EMBD * sizeof(float),
+                                    (uint64_t)DS4_N_EMBD * sizeof(float));
+            if (!out_view || !sel_view || !wts_view || !norm_view) {
+                ok = false;
+            } else {
+                ok = ds4_gpu_routed_moe_one_tensor(out_view,
+                                                   g->routed_gate,
+                                                   g->routed_up,
+                                                   g->routed_mid,
+                                                   g->routed_down,
+                                                   model->map,
+                                                   model->size,
+                                                   layer->ffn_gate_exps->abs_offset,
+                                                   layer->ffn_up_exps->abs_offset,
+                                                   layer->ffn_down_exps->abs_offset,
+                                                   layer->ffn_gate_exps->type,
+                                                   layer->ffn_down_exps->type,
+                                                   gate_expert_bytes,
+                                                   gate_row_bytes,
+                                                   down_expert_bytes,
+                                                   down_row_bytes,
+                                                   (uint32_t)expert_in_dim,
+                                                   (uint32_t)down_in_dim,
+                                                   (uint32_t)routed_out_dim,
+                                                   sel_view,
+                                                   wts_view,
+                                                   DS4_N_EXPERT,
+                                                   DS4_N_EXPERT_USED,
+                                                   DS4_SWIGLU_CLAMP_EXP,
+                                                   norm_view) != 0;
+            }
+            ds4_gpu_tensor_free(out_view);
+            ds4_gpu_tensor_free(sel_view);
+            ds4_gpu_tensor_free(wts_view);
+            ds4_gpu_tensor_free(norm_view);
+        }
+        /* N=1 path writes f32 mid scratch; mirror its requant-state flag so the
+         * downstream dump picks the f32 branch. */
+        g->batch_routed_mid_is_f16 = false;
+    } else if (ok) {
         ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
                                                g->batch_routed_gate,
                                                g->batch_routed_up,
