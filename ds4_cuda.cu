@@ -2097,6 +2097,35 @@ __global__ static void matmul_f16_ordered_chunks_kernel(
     }
 }
 
+/* Batch-invariant WMMA F16 GEMM for the deterministic verify path: a fast
+ * tensor-core replacement for the scalar matmul_f16_ordered_chunks_kernel on
+ * mult-of-16 shapes.  Each warp owns a 16-row output tile and loops K in fixed
+ * +=16 steps with the token (N) dimension padded to 16, so every output
+ * element's reduction order is independent of n_tok -> n=1 row == n=2..8 row
+ * bit-for-bit (batch-invariant) AND run-to-run deterministic, on tensor cores
+ * (measured 5-10x the scalar kernel on the dominant verify shapes).  cuBLAS
+ * cannot do this: it tiles M (n_tok) differently for n=1 vs n=2, so its ~5e-5
+ * row mismatch amplifies through the indexer/router top-k to ~0.25 gate RMS.
+ *   out_pad: out_dim x 16, col-major (caller copies the first n_tok cols out).
+ *   xpad:    16 x in_dim, row-major; rows [n_tok,16) must be zeroed. */
+__global__ static void matmul_f16_wmma_bi_kernel(
+        float *out_pad, const __half *w, const __half *xpad,
+        uint64_t in_dim, uint64_t out_dim) {
+    namespace wmma = nvcuda::wmma;
+    const uint64_t r0 = (uint64_t)blockIdx.x * 16u;
+    if (r0 >= out_dim) return;
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> fc;
+    wmma::fill_fragment(fc, 0.0f);
+    for (uint64_t k0 = 0; k0 < in_dim; k0 += 16u) {
+        wmma::load_matrix_sync(fa, w + r0 * in_dim + k0, in_dim);
+        wmma::load_matrix_sync(fb, xpad + k0, in_dim);
+        wmma::mma_sync(fc, fa, fb, fc);
+    }
+    wmma::store_matrix_sync(out_pad + r0, fc, out_dim, wmma::mem_col_major);
+}
+
 __global__ static void matmul_f16_pair_ordered_chunks_kernel(
         float *out0,
         float *out1,
@@ -6938,6 +6967,37 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         return cuda_ok(cudaGetLastError(), serial_router ? "matmul_f16_router_serial launch" : "matmul_f16_serial launch");
     }
     if (ordered_router) {
+        /* Batch-invariant deterministic verify GEMM. Mult-of-16 shapes -> the fast
+         * WMMA tensor-core kernel (n=1 row == n=2 row bit-for-bit, run-to-run
+         * deterministic, ~5-10x the scalar kernel on the dominant verify shapes).
+         * Other shapes (e.g. out=24 hc_mix, out=4 output) keep the scalar ordered
+         * kernel — also batch-invariant, and cheap at tiny N.  cuBLAS is unusable
+         * here: it tiles M (n_tok) differently for n=1 vs n=2, and that ~5e-5 row
+         * mismatch amplifies through the indexer/router top-k to ~0.25 gate RMS. */
+        if ((in_dim % 16u) == 0u && (out_dim % 16u) == 0u && in_dim <= UINT32_MAX) {
+            const uint64_t xpad_bytes = 16u * in_dim * sizeof(__half);
+            const uint64_t cpad_bytes = out_dim * 16u * sizeof(float);
+            char *tmp = (char *)cuda_tmp_alloc(xpad_bytes + cpad_bytes, "wmma f16 verify scratch");
+            if (!tmp) return 0;
+            __half *xpad = (__half *)tmp;             /* 16 x in_dim, rows [n_tok,16) zeroed */
+            float *cpad = (float *)(tmp + xpad_bytes); /* out_dim x 16, col-major */
+            /* All ops on cudaStreamPerThread (the build uses --default-stream
+             * per-thread) so the convert/mma/copy chain is ordered with the
+             * surrounding kernels — stream 0 (legacy) would race and corrupt.
+             * No memset of the padded rows: each WMMA output column is an
+             * independent K-dot, so the unused columns n_tok..15 (reading stale
+             * xpad rows) never affect cols 0..n_tok-1, and only the first n_tok
+             * cols are copied out.  Skipping the 16*in_dim zero-fill per call is
+             * the bulk of the per-call overhead. */
+            const uint64_t xc = n_tok * in_dim;
+            f32_to_f16_kernel<<<(xc + 255) / 256, 256>>>(xpad, (const float *)x->ptr, xc);
+            matmul_f16_wmma_bi_kernel<<<(unsigned)((out_dim + 15u) / 16u), 32>>>(cpad, w, xpad, in_dim, out_dim);
+            /* col-major: the first n_tok columns of cpad are the first n_tok*out_dim
+             * contiguous floats, so they copy straight into out. */
+            cudaMemcpyAsync(out->ptr, cpad, n_tok * out_dim * sizeof(float),
+                            cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+            return cuda_ok(cudaGetLastError(), "matmul_f16_wmma_bi launch");
+        }
         matmul_f16_ordered_chunks_kernel<<<grid, 32>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
         return cuda_ok(cudaGetLastError(), "matmul_f16_ordered_chunks launch");
     }
@@ -6963,7 +7023,12 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
         getenv("DS4_CUDA_NO_F16_PAIR_MATMUL") != NULL ||
         getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
         getenv("DS4_CUDA_SERIAL_ROUTER") != NULL ||
-        getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") != NULL) {
+        getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") != NULL ||
+        /* Determinism mode (knob armed): delegate to two single GEMMs so the n=1
+         * canonical comp_kv/comp_sc take the SAME ordered/WMMA path as the n>1
+         * combined verify — otherwise the scalar pair kernel here vs WMMA there
+         * is an asymmetry that amplifies through the indexer/router top-k. */
+        getenv("DS4_CUDA_ORDERED_F16_MAX_TOKENS") != NULL) {
         return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
                                            in_dim, out_dim, x, n_tok) &&
                ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
