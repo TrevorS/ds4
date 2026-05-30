@@ -3685,6 +3685,52 @@ __global__ static void attention_indexed_mixed_kernel(
         if (comp_count > 512u) comp_count = 512u;
     }
     __syncthreads();
+    /* Deterministic compressed-row order.
+     *
+     * The atomicAdd compaction above fills comp_rows[] in thread-scheduling
+     * order, which differs between the N=1 decode launch (grid.x = 1) and the
+     * batched verify launch (grid.x = n_tokens) due to differing block
+     * occupancy.  The score-pass and the score*V reduction then accumulate the
+     * compressed contributions in that nondeterministic order, producing a
+     * pure float accumulation-order drift (identical amax, ~3.6e-4 sum delta at
+     * L2 hc_attn_post, compounding to ~0.2 logit RMS across 43 layers and
+     * flipping MTP spec-acceptance).
+     *
+     * Sort comp_rows[] ascending by compressed-row index with an in-shared
+     * bitonic sort so BOTH launches reduce in the identical, position-
+     * independent order.  This is parallel (no serialization of the reduction)
+     * and runs once per block over <=512 rows, so it preserves the fast path's
+     * throughput while making combined-forward bit-equal to canonical decode. */
+    {
+        const uint32_t cc = comp_count;
+        if (cc > 1u) {
+            uint32_t pot = 1u;
+            while (pot < cc) pot <<= 1u;          /* next pow2 >= cc, <= 512 */
+            /* Pad [cc, pot) with UINT32_MAX sentinels so they sort to the end
+             * and never participate in the reduction (loops bound by cc). */
+            for (uint32_t i = cc + threadIdx.x; i < pot; i += blockDim.x) {
+                comp_rows[i] = 0xffffffffu;
+            }
+            __syncthreads();
+            for (uint32_t k = 2u; k <= pot; k <<= 1u) {
+                for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
+                    for (uint32_t idx = threadIdx.x; idx < pot; idx += blockDim.x) {
+                        const uint32_t other = idx ^ j;
+                        if (other > idx && other < pot) {
+                            const uint32_t a = comp_rows[idx];
+                            const uint32_t b = comp_rows[other];
+                            const bool up = (idx & k) == 0u;
+                            if ((up && a > b) || (!up && a < b)) {
+                                comp_rows[idx] = b;
+                                comp_rows[other] = a;
+                            }
+                        }
+                    }
+                    __syncthreads();
+                }
+            }
+        }
+    }
     uint32_t n_score = raw_count + comp_count;
     float local_max = sinks[h];
     if (comp_count == 0) {
@@ -7857,8 +7903,30 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         if (!cuda_ok(cudaGetLastError(), "indexed attention topk sort launch")) return 0;
         topk_ptr = sorted;
     }
+    /* Batched (n_tokens>1) verify path selection.
+     *
+     * The heads8 online/rb4 kernels are ~1.5x faster but use a DIFFERENT
+     * score-pass dot reduction (float4 + 32-lane warp_sum) and softmax
+     * summation order than the N=1 reference (attention_indexed_mixed_kernel:
+     * 8-lane shfl dot, block-stride softmax, score*V with deferred /denom).
+     * That order mismatch is the proven source of the combined-forward logit
+     * divergence (first departs at L2 hc_attn_post, compounds to ~0.2 logit
+     * RMS across 43 layers) and flips MTP spec-acceptance vs canonical.
+     *
+     * Default the batched verify to the N=1 kernel (which already loops
+     * t = blockIdx.x, so grid(n_tokens, n_head) works unchanged) so the
+     * combined-forward uses the IDENTICAL summation algorithm as canonical
+     * decode and stays greedy-token-equal to it (within canonical's own
+     * atomicAdd comp-fill nondeterminism).  Measured on GB10: ~20 tps,
+     * unchanged from the heads8 path, and token-equal to strict within the
+     * reference noise floor.
+     *
+     * Set DS4_CUDA_INDEXED_HEADS8=1 to opt back into the fast heads8 kernels
+     * (online by default, or rb4 via DS4_CUDA_INDEXED_TWOPASS) for the
+     * approximate-but-equal-speed path. */
     if (n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
-        getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
+        getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL &&
+        getenv("DS4_CUDA_INDEXED_HEADS8") != NULL) {
         if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
             dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
             attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>((float *)heads->ptr,
