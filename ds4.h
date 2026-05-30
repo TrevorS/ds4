@@ -175,6 +175,17 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
 /* Host-only exactness self-test for the speculative-sampling math (no model/GPU
  * needed).  Returns failing-case count (0 = pass). */
 int ds4_spec_sampling_selftest(void);
+/* MTP combined-forward correctness gate (CUDA-only).  Runs one two-token verify
+ * step through both the fast batched verify and the exact N=1 decode verify over
+ * an identical (start, token0, token1), then RMS-compares the per-row logits.
+ * The session must be synced to a real prefix.  Returns failed-check count
+ * (0 = pass); optional out params report worst-row RMS, the pass threshold,
+ * whether both rows kept top1, and the nonfinite count. */
+int ds4_mtp_correctness_selftest(ds4_session *s,
+                                 double *out_rms,
+                                 double *out_threshold,
+                                 int *out_top1_match,
+                                 int *out_nonfinite);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt);

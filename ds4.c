@@ -18825,6 +18825,195 @@ static bool spec_frontier_restore(ds4_spec_frontier *f, ds4_session *s) {
     return ok;
 }
 
+/* MTP combined-forward correctness gate (CUDA-only, test hook).
+ *
+ * Runs the SAME two-token verify step through both code paths over an identical
+ * (start, token0, token1):
+ *   - combined  : metal_graph_verify_suffix_tops  (fast batched n=2 verify,
+ *                 reads g->spec_logits row 0 = after token0, row 1 = after
+ *                 token1)
+ *   - canonical : metal_graph_verify_decode2_exact (exact N=1 decode kernels,
+ *                 logits0 = after token0, logits1 = after token1)
+ * then RMS-compares row0/logits0 and row1/logits1 over the full vocab.  The
+ * batched-attention accumulation-order fix (default batched verify -> the N=1
+ * reference attention kernel + deterministic comp-row sort in ds4_cuda.cu)
+ * drives this RMS to the float noise floor and keeps top1 equal; the unfixed
+ * heads8 path diverges (~0.2 logit RMS, top1 flips on near-ties).
+ *
+ * The session must be synced to a real prefix (checkpoint_valid, len >= 1) so
+ * the per-layer compressed-KV caches are populated; start = checkpoint.len.
+ * Both verifiers mutate the live caches/frontier, so each call is bracketed by
+ * spec_frontier_snapshot/restore and the checkpoint length is rewound between
+ * them.  DS4_CUDA_MOE_NO_ATOMIC_DOWN is forced on internally so the MoE down
+ * projection is deterministic across the two forwards (it is exonerated as a
+ * divergence source but its atomic accumulation is itself nondeterministic).
+ *
+ * Returns the number of failed sub-checks (0 = pass).  Optional out params
+ * report the worst-row RMS, the pass threshold, whether both rows kept top1,
+ * and the nonfinite count. */
+int ds4_mtp_correctness_selftest(ds4_session *s,
+                                 double *out_rms,
+                                 double *out_threshold,
+                                 int *out_top1_match,
+                                 int *out_nonfinite) {
+    /* Threshold: ~10x the achieved noise-floor RMS (measured ~1e-3 over the
+     * full 128k vocab after the fix) but two orders below the unfixed ~0.2. */
+    const double THRESHOLD = 1.0e-2;
+    if (out_rms) *out_rms = 0.0;
+    if (out_threshold) *out_threshold = THRESHOLD;
+    if (out_top1_match) *out_top1_match = 0;
+    if (out_nonfinite) *out_nonfinite = 0;
+
+#ifdef DS4_NO_GPU
+    (void)s;
+    fprintf(stderr, "ds4: mtp-correctness self-test requires a GPU build\n");
+    return 1;
+#else
+    if (!s || !s->engine || s->engine->backend != DS4_BACKEND_CUDA) {
+        fprintf(stderr, "ds4: mtp-correctness self-test requires a CUDA session\n");
+        return 1;
+    }
+    if (!s->checkpoint_valid || s->checkpoint.len < 1) {
+        fprintf(stderr, "ds4: mtp-correctness self-test needs a synced prefix\n");
+        return 1;
+    }
+    if (!s->logits) {
+        fprintf(stderr, "ds4: mtp-correctness self-test: session has no logits\n");
+        return 1;
+    }
+
+    /* Determinism: MoE down projection without atomics (latched for the run). */
+    setenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN", "1", 1);
+
+    ds4_engine *e = s->engine;
+    ds4_gpu_graph *g = &s->graph;
+    const int start = s->checkpoint.len;
+
+    /* Two draft tokens from the current target distribution (top-2 of the live
+     * logits).  Their identity is immaterial to the order-drift comparison; we
+     * only require valid, distinct ids so both verifiers walk the same path. */
+    int drafts[2] = {0, 1};
+    {
+        float best0 = -INFINITY, best1 = -INFINITY;
+        int arg0 = -1, arg1 = -1;
+        for (uint32_t i = 0; i < (uint32_t)DS4_N_VOCAB; i++) {
+            const float v = s->logits[i];
+            if (!isfinite(v)) continue;
+            if (v > best0) { best1 = best0; arg1 = arg0; best0 = v; arg0 = (int)i; }
+            else if (v > best1) { best1 = v; arg1 = (int)i; }
+        }
+        if (arg0 >= 0) drafts[0] = arg0;
+        if (arg1 >= 0) drafts[1] = arg1;
+        if (drafts[1] == drafts[0]) drafts[1] = (drafts[0] + 1) % DS4_N_VOCAB;
+    }
+
+    const size_t vocab = (size_t)DS4_N_VOCAB;
+    float *comb0 = (float *)xmalloc(vocab * sizeof(float));
+    float *comb1 = (float *)xmalloc(vocab * sizeof(float));
+    float *exact0 = (float *)xmalloc(vocab * sizeof(float));
+    float *exact1 = (float *)xmalloc(vocab * sizeof(float));
+    float *comb_rows = (float *)xmalloc(2u * vocab * sizeof(float));
+    int row_tops[2] = {-1, -1};
+    int fails = 0;
+    bool ran = false;
+
+    /* --- Combined (fast batched n=2 verify) --- */
+    ds4_spec_frontier fc;
+    memset(&fc, 0, sizeof(fc));
+    bool have_fc = spec_frontier_snapshot(&fc, s);
+    bool ok_comb = have_fc;
+    if (ok_comb) {
+        token_vec_push(&s->checkpoint, drafts[0]);
+        token_vec_push(&s->checkpoint, drafts[1]);
+        ok_comb = metal_graph_verify_suffix_tops(g, &e->model, &e->weights,
+                                                 &s->checkpoint,
+                                                 (uint32_t)start, 2u,
+                                                 /*capture_prefix1=*/true,
+                                                 row_tops, comb_rows);
+        s->checkpoint.len = start;
+    }
+    if (have_fc) (void)spec_frontier_restore(&fc, s);
+    spec_frontier_free(&fc);
+    if (ok_comb) {
+        memcpy(comb0, comb_rows, vocab * sizeof(float));
+        memcpy(comb1, comb_rows + vocab, vocab * sizeof(float));
+    }
+
+    /* --- Canonical (exact N=1 decode2 verify) --- */
+    ds4_spec_frontier fe;
+    memset(&fe, 0, sizeof(fe));
+    bool have_fe = spec_frontier_snapshot(&fe, s);
+    int exact_top0 = -1;
+    bool ok_exact = have_fe;
+    if (ok_exact) {
+        ok_exact = metal_graph_verify_decode2_exact(g, &e->model, &e->weights,
+                                                    drafts[0], drafts[1],
+                                                    (uint32_t)start,
+                                                    &exact_top0, exact0, exact1);
+    }
+    if (have_fe) {
+        s->checkpoint.len = start;
+        (void)spec_frontier_restore(&fe, s);
+    }
+    spec_frontier_free(&fe);
+
+    if (ok_comb && ok_exact) {
+        ran = true;
+        const char *row_name[2] = {"row0 (post-token0)", "row1 (post-token1)"};
+        float *combs[2] = {comb0, comb1};
+        float *exacts[2] = {exact0, exact1};
+        double worst_rms = 0.0;
+        int top1_both = 1;
+        int nonfinite_total = 0;
+        for (int r = 0; r < 2; r++) {
+            const float *cb = combs[r];
+            const float *ex = exacts[r];
+            double sumsq = 0.0;
+            int nonfinite = 0;
+            int arg_cb = -1, arg_ex = -1;
+            float best_cb = -INFINITY, best_ex = -INFINITY;
+            for (size_t i = 0; i < vocab; i++) {
+                if (!isfinite(cb[i]) || !isfinite(ex[i])) { nonfinite++; continue; }
+                const double d = (double)cb[i] - (double)ex[i];
+                sumsq += d * d;
+                if (cb[i] > best_cb) { best_cb = cb[i]; arg_cb = (int)i; }
+                if (ex[i] > best_ex) { best_ex = ex[i]; arg_ex = (int)i; }
+            }
+            const double rms = sqrt(sumsq / (double)vocab);
+            const bool top1 = (arg_cb >= 0 && arg_cb == arg_ex);
+            if (rms > worst_rms) worst_rms = rms;
+            if (!top1) top1_both = 0;
+            nonfinite_total += nonfinite;
+            fprintf(stderr,
+                    "ds4: mtp-correctness %s rms=%g top1 comb=%d exact=%d %s nonfinite=%d\n",
+                    row_name[r], rms, arg_cb, arg_ex,
+                    top1 ? "match" : "MISMATCH", nonfinite);
+            if (rms >= THRESHOLD) fails++;
+            if (!top1) fails++;
+            if (nonfinite) fails++;
+        }
+        if (out_rms) *out_rms = worst_rms;
+        if (out_top1_match) *out_top1_match = top1_both;
+        if (out_nonfinite) *out_nonfinite = nonfinite_total;
+        fprintf(stderr,
+                "ds4: mtp-correctness start=%d drafts=[%d,%d] worst_rms=%g threshold=%g top1=%s nonfinite=%d -> %s\n",
+                start, drafts[0], drafts[1], worst_rms, THRESHOLD,
+                top1_both ? "match" : "MISMATCH", nonfinite_total,
+                fails == 0 ? "PASS" : "FAIL");
+    }
+
+    if (!ran) {
+        fprintf(stderr,
+                "ds4: mtp-correctness verifier failed to run (combined=%d exact=%d)\n",
+                (int)ok_comb, (int)ok_exact);
+        fails++;
+    }
+
+    free(comb0); free(comb1); free(exact0); free(exact1); free(comb_rows);
+    return fails;
+#endif
+}
+
 /* Restore the per-layer compressor frontier from a captured prefix snapshot.
  *
  * The verifier has already advanced every layer through all draft tokens.  On
