@@ -19014,6 +19014,148 @@ int ds4_mtp_correctness_selftest(ds4_session *s,
 #endif
 }
 
+/* MTP combined-forward SELF-CONSISTENCY probe (CUDA-only).  Runs the SAME fast
+ * batched n=2 verify TWICE on identical inputs (each bracketed by its own
+ * frontier snapshot/restore so both start from the same post-prefix cache
+ * state) and diffs the two logit rows.  Unlike ds4_mtp_correctness_selftest
+ * (which compares combined-vs-canonical and so conflates run-to-run
+ * nondeterminism with the algorithmic batch-vs-N=1 gap), this isolates PURE
+ * nondeterminism: any nonzero maxabs is run-to-run drift.  Post-fix this should
+ * read maxabs==0 (bit-exact).  Returns failed-check count (0 = bit-stable);
+ * optional out params report max-abs diff, RMS, and whether both row argmaxes
+ * stayed stable. */
+int ds4_mtp_selfconsistency_selftest(ds4_session *s,
+                                     double *out_maxabs,
+                                     double *out_rms,
+                                     int *out_top_stable) {
+    if (out_maxabs) *out_maxabs = 0.0;
+    if (out_rms) *out_rms = 0.0;
+    if (out_top_stable) *out_top_stable = 0;
+#ifdef DS4_NO_GPU
+    (void)s;
+    fprintf(stderr, "ds4: mtp-selfconsistency self-test requires a GPU build\n");
+    return 1;
+#else
+    if (!s || !s->engine || s->engine->backend != DS4_BACKEND_CUDA) {
+        fprintf(stderr, "ds4: mtp-selfconsistency self-test requires a CUDA session\n");
+        return 1;
+    }
+    if (!s->checkpoint_valid || s->checkpoint.len < 1) {
+        fprintf(stderr, "ds4: mtp-selfconsistency self-test needs a synced prefix\n");
+        return 1;
+    }
+    if (!s->logits) {
+        fprintf(stderr, "ds4: mtp-selfconsistency self-test: session has no logits\n");
+        return 1;
+    }
+
+    /* Same determinism latch as the correctness gate, plus force the verify F16
+     * GEMMs onto the ordered (deterministic) kernel — this harness certifies that
+     * the deterministic-mode verify is bit-exact run-to-run, which production
+     * (cuBLAS default, DS4_CUDA_ORDERED_F16_MAX_TOKENS=1) trades away for ~12% tps.
+     * Latched here so the test measures the deterministic capability regardless of
+     * the production default. */
+    setenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN", "1", 1);
+    setenv("DS4_CUDA_ORDERED_F16_MAX_TOKENS", "8", 1);
+
+    ds4_engine *e = s->engine;
+    ds4_gpu_graph *g = &s->graph;
+    const int start = s->checkpoint.len;
+
+    /* Two drafts from the live top-2 (identity immaterial; both runs use the
+     * same pair, so any divergence is pure nondeterminism). */
+    int drafts[2] = {0, 1};
+    {
+        float best0 = -INFINITY, best1 = -INFINITY;
+        int arg0 = -1, arg1 = -1;
+        for (uint32_t i = 0; i < (uint32_t)DS4_N_VOCAB; i++) {
+            const float v = s->logits[i];
+            if (!isfinite(v)) continue;
+            if (v > best0) { best1 = best0; arg1 = arg0; best0 = v; arg0 = (int)i; }
+            else if (v > best1) { best1 = v; arg1 = (int)i; }
+        }
+        if (arg0 >= 0) drafts[0] = arg0;
+        if (arg1 >= 0) drafts[1] = arg1;
+        if (drafts[1] == drafts[0]) drafts[1] = (drafts[0] + 1) % DS4_N_VOCAB;
+    }
+
+    const size_t vocab = (size_t)DS4_N_VOCAB;
+    float *rows_a = (float *)xmalloc(2u * vocab * sizeof(float));
+    float *rows_b = (float *)xmalloc(2u * vocab * sizeof(float));
+    int tops_a[2] = {-1, -1};
+    int tops_b[2] = {-1, -1};
+    int fails = 0;
+
+    bool ok_a = false, ok_b = false;
+    {   /* run A */
+        ds4_spec_frontier fa; memset(&fa, 0, sizeof(fa));
+        bool have = spec_frontier_snapshot(&fa, s);
+        ok_a = have;
+        if (ok_a) {
+            token_vec_push(&s->checkpoint, drafts[0]);
+            token_vec_push(&s->checkpoint, drafts[1]);
+            ok_a = metal_graph_verify_suffix_tops(g, &e->model, &e->weights,
+                                                  &s->checkpoint,
+                                                  (uint32_t)start, 2u,
+                                                  /*capture_prefix1=*/true,
+                                                  tops_a, rows_a);
+            s->checkpoint.len = start;
+        }
+        if (have) (void)spec_frontier_restore(&fa, s);
+        spec_frontier_free(&fa);
+    }
+    {   /* run B — identical inputs, fresh snapshot */
+        ds4_spec_frontier fb; memset(&fb, 0, sizeof(fb));
+        bool have = spec_frontier_snapshot(&fb, s);
+        ok_b = have;
+        if (ok_b) {
+            token_vec_push(&s->checkpoint, drafts[0]);
+            token_vec_push(&s->checkpoint, drafts[1]);
+            ok_b = metal_graph_verify_suffix_tops(g, &e->model, &e->weights,
+                                                  &s->checkpoint,
+                                                  (uint32_t)start, 2u,
+                                                  /*capture_prefix1=*/true,
+                                                  tops_b, rows_b);
+            s->checkpoint.len = start;
+        }
+        if (have) (void)spec_frontier_restore(&fb, s);
+        spec_frontier_free(&fb);
+    }
+
+    if (ok_a && ok_b) {
+        double maxabs = 0.0, sumsq = 0.0;
+        for (size_t i = 0; i < 2u * vocab; i++) {
+            const double d = fabs((double)rows_a[i] - (double)rows_b[i]);
+            if (d > maxabs) maxabs = d;
+            sumsq += d * d;
+        }
+        const double rms = sqrt(sumsq / (double)(2u * vocab));
+        const int top_stable =
+            (tops_a[0] == tops_b[0]) && (tops_a[1] == tops_b[1]);
+        if (out_maxabs) *out_maxabs = maxabs;
+        if (out_rms) *out_rms = rms;
+        if (out_top_stable) *out_top_stable = top_stable;
+        fprintf(stderr,
+                "ds4: mtp-selfconsistency start=%d drafts=[%d,%d] maxabs=%g rms=%g "
+                "tops=[%d,%d]vs[%d,%d] %s -> %s\n",
+                start, drafts[0], drafts[1], maxabs, rms,
+                tops_a[0], tops_a[1], tops_b[0], tops_b[1],
+                top_stable ? "stable" : "FLIP",
+                (maxabs == 0.0) ? "BIT-EXACT" : "nondeterministic");
+        if (maxabs != 0.0) fails++;
+        if (!top_stable) fails++;
+    } else {
+        fprintf(stderr,
+                "ds4: mtp-selfconsistency verifier failed to run (a=%d b=%d)\n",
+                (int)ok_a, (int)ok_b);
+        fails++;
+    }
+
+    free(rows_a); free(rows_b);
+    return fails;
+#endif
+}
+
 /* Restore the per-layer compressor frontier from a captured prefix snapshot.
  *
  * The verifier has already advanced every layer through all draft tokens.  On

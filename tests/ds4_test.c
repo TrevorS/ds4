@@ -1724,6 +1724,80 @@ static void test_mtp_correctness(void) {
 #endif
 }
 
+static void test_mtp_selfconsistency(void) {
+#ifdef __APPLE__
+    fprintf(stderr, "ds4-test: mtp-selfconsistency skipped (CUDA-only, Metal build)\n");
+    return;
+#else
+    const char *prompt_path = getenv("DS4_TEST_LONG_PROMPT");
+    if (!prompt_path || !prompt_path[0]) {
+        prompt_path = "tests/long_context_story_prompt.txt";
+    }
+    char *prompt_text = test_read_file(prompt_path);
+    TEST_ASSERT(prompt_text != NULL);
+    if (!prompt_text) return;
+
+    const char *mtp_path = getenv("DS4_TEST_MTP_MODEL");
+    if (!mtp_path || !mtp_path[0]) {
+        mtp_path = "/home/trevor/models/ds4/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf";
+    }
+    ds4_engine_options opt = {
+        .model_path = test_model_path(),
+        .mtp_path = mtp_path,
+        .backend = DS4_BACKEND_CUDA,
+        .mtp_draft_tokens = 2,
+        .quality = false,
+    };
+    ds4_engine *engine = NULL;
+    TEST_ASSERT(ds4_engine_open(&engine, &opt) == 0);
+    if (!engine) {
+        free(prompt_text);
+        return;
+    }
+    TEST_ASSERT(ds4_engine_has_mtp(engine));
+
+    ds4_tokens prompt = {0};
+    ds4_tokenize_rendered_chat(engine, prompt_text, &prompt);
+    TEST_ASSERT(prompt.len > 4096);
+
+    ds4_session *session = NULL;
+    TEST_ASSERT(ds4_session_create(&session, engine, 100000) == 0);
+    if (!session) {
+        ds4_tokens_free(&prompt);
+        ds4_engine_close(engine);
+        free(prompt_text);
+        return;
+    }
+
+    char err[160];
+    ds4_session_set_progress(session, test_long_prefill_progress, NULL);
+    const int sync_rc = ds4_session_sync(session, &prompt, err, sizeof(err));
+    ds4_session_set_progress(session, NULL, NULL);
+    TEST_ASSERT(sync_rc == 0);
+
+    if (sync_rc == 0) {
+        double maxabs = 0.0, rms = 0.0;
+        int top_stable = 0;
+        const int fails = ds4_mtp_selfconsistency_selftest(
+            session, &maxabs, &rms, &top_stable);
+        fprintf(stderr,
+                "ds4-test: mtp-selfconsistency fails=%d maxabs=%g rms=%g top_stable=%s\n",
+                fails, maxabs, rms, top_stable ? "yes" : "no");
+        /* The combined batched verify must be run-to-run deterministic: two
+         * identical-input runs must yield bit-identical logits.  This is the
+         * prerequisite for --mtp-correctness to be a reliable scalar (its noise
+         * floor must drop below the 0.01 threshold it checks against). */
+        TEST_ASSERT(maxabs == 0.0);
+        TEST_ASSERT(top_stable);
+    }
+
+    ds4_session_free(session);
+    ds4_tokens_free(&prompt);
+    ds4_engine_close(engine);
+    free(prompt_text);
+#endif
+}
+
 #endif
 
 static void test_server_unit_group(void) {
@@ -1753,6 +1827,7 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
     {"--mtp-correctness", "mtp-correctness", "CUDA MTP combined vs exact verify logit-RMS gate (skips on Metal)", test_mtp_correctness},
+    {"--mtp-selfconsistency", "mtp-selfconsistency", "CUDA MTP combined verify run-to-run determinism (twice-run bit-diff)", test_mtp_selfconsistency},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
     {"--spec-sampling", "spec-sampling", "speculative-sampling math exactness (host-only, no model)", test_spec_sampling_group},

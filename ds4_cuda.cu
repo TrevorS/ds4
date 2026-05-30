@@ -6878,12 +6878,32 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         !serial_f16 &&
         router_shape &&
         getenv("DS4_CUDA_SERIAL_ROUTER") != NULL;
+    /* Determinism knob (MTP verify): optionally route the tiny n_tok=2-4 verify F16
+     * GEMMs through the ordered FP32 kernel instead of cuBLAS.  cublasGemmEx
+     * (CUBLAS_GEMM_DEFAULT)+TF32 picks its algo heuristically per launch and truncates
+     * to TF32, so its output jitters run-to-run; routing the verify through the same
+     * ordered-chunks kernel the N=1 canonical path uses makes the combined verify
+     * BIT-EXACT run-to-run (measured: --mtp-selfconsistency maxabs=0).  This does NOT
+     * close the ~0.37 combined-vs-canonical algorithmic mean gap (that lives elsewhere),
+     * and routing the larger verify GEMMs to the 32-thread ordered kernel costs ~12%
+     * decode tok/s on GB10 — so it is DEFAULT OFF (threshold 1 = cuBLAS at n_tok>1, the
+     * fast production path).  Set DS4_CUDA_ORDERED_F16_MAX_TOKENS>=2 to enable the
+     * deterministic verify (the --mtp-selfconsistency harness sets it to 8). */
+    uint64_t ordered_max_tokens = 1u;
+    {
+        const char *ord_env = getenv("DS4_CUDA_ORDERED_F16_MAX_TOKENS");
+        if (ord_env && ord_env[0]) {
+            char *endp = NULL;
+            long v = strtol(ord_env, &endp, 10);
+            if (endp != ord_env && v >= 1 && v < 4096) ordered_max_tokens = (uint64_t)v;
+        }
+    }
     const int ordered_router =
         !serial_f16 &&
         !serial_router &&
-        n_tok == 1u &&
+        n_tok >= 1u && n_tok <= ordered_max_tokens &&
         getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") == NULL;
-    if (!serial_f16 && g_cublas_ready && n_tok > 1) {
+    if (!serial_f16 && g_cublas_ready && n_tok > ordered_max_tokens) {
         const uint64_t xh_count = n_tok * in_dim;
         __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");
         if (!xh) return 0;

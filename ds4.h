@@ -186,6 +186,15 @@ int ds4_mtp_correctness_selftest(ds4_session *s,
                                  double *out_threshold,
                                  int *out_top1_match,
                                  int *out_nonfinite);
+/* MTP combined-forward self-consistency probe (CUDA-only).  Runs the same fast
+ * batched n=2 verify twice on identical inputs and max-abs/RMS-diffs the logit
+ * rows, isolating run-to-run nondeterminism from the algorithmic batch-vs-N=1
+ * gap.  Returns failed-check count (0 = bit-stable); optional out params report
+ * max-abs diff, RMS, and whether both row argmaxes stayed stable. */
+int ds4_mtp_selfconsistency_selftest(ds4_session *s,
+                                     double *out_maxabs,
+                                     double *out_rms,
+                                     int *out_top_stable);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt);
