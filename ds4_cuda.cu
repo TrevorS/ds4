@@ -8223,7 +8223,24 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
     if (!out_a || !out_b) return 0;
 
     const __half *out_a_f16 = NULL;
-    uint32_t out_a_cublas_min_tokens = 2u;
+    /* attn_output_A reduction-path selection.
+     *
+     * The cublas F16 GEMM and the Q8 dp4a kernel compute the low-rank
+     * projection in DIFFERENT precision/accumulation order.  The N=1 decode
+     * path (ds4_gpu_attention_output_low_q8_tensor) is ALWAYS Q8 dp4a, so when
+     * the batched verify (metal_graph_verify_suffix_tops, n_tokens = 2..4)
+     * routes attn_output_A through the F16 cublas branch it departs from the
+     * canonical decode2 reference at this exact stage — the single largest
+     * localized contributor to the combined-vs-canonical logit RMS measured by
+     * --mtp-correctness (L0 attn_low goes from bit-identical to ~0.7% with this
+     * branch; turning it off makes L0 attn_low/attn_out bit-exact).
+     *
+     * The cublas F16 path is a throughput win only for the WIDE batched prefill
+     * (n_tokens >= 128), never for the tiny MTP verify.  Default the cublas
+     * crossover to 128 so the verify regime (small n_tokens) uses the same Q8
+     * dp4a kernel as canonical decode, while real prefill keeps the fast F16
+     * GEMM unchanged.  Override with DS4_CUDA_ATTENTION_OUTPUT_A_CUBLAS_MIN. */
+    uint32_t out_a_cublas_min_tokens = 128u;
     const char *out_a_min_env = getenv("DS4_CUDA_ATTENTION_OUTPUT_A_CUBLAS_MIN");
     if (out_a_min_env && out_a_min_env[0]) {
         char *endp = NULL;
