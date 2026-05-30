@@ -12782,6 +12782,22 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     uint32_t *comp_counts = compressed ? xcalloc(n_tokens, sizeof(comp_counts[0])) : NULL;
     uint32_t *index_counts = ratio == 4 ? xcalloc(n_tokens, sizeof(index_counts[0])) : NULL;
+    /* C20-class attn-order fix: the non-indexed batched DECODE_MIXED kernel splits
+     * each score dot across 8 lanes + tree-reduces (assoc differs from the N=1
+     * sequential dot), seeding the L3 compressed-attention divergence. When armed
+     * for the tiny MTP verify window, leave batch_attention_done=false on that
+     * branch so the per-row fallback loop runs the byte-identical N=1
+     * ds4_gpu_attention_decode_heads_tensor per token. Default 0 = OFF; production
+     * prefill (large n) and the canonical N=1 path are untouched. */
+    uint32_t ordered_attn_max_tokens = 0;
+    {
+        const char *oamt = getenv("DS4_CUDA_ORDERED_ATTN_MAX_TOKENS");
+        if (oamt && oamt[0]) {
+            char *e = NULL;
+            long v = strtol(oamt, &e, 10);
+            if (e != oamt && v >= 1 && v < 4096) ordered_attn_max_tokens = (uint32_t)v;
+        }
+    }
     const bool qkv_rms_fused = !metal_graph_use_reference_qkv_norm();
     ds4_gpu_tensor *hc_mix_view = ds4_gpu_tensor_view(
             g->batch_hc_mix, 0, (uint64_t)n_tokens * mix_hc * sizeof(float));
@@ -13798,6 +13814,12 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                         n_comp,
                                                                         &index_stage_t0);
                     }
+                    if (ok) batch_attention_done = true;
+                } else if (n_tokens > 1 && ordered_attn_max_tokens >= n_tokens) {
+                    /* Ordered-attn verify: skip the 8-lane-split batched kernel and
+                     * leave batch_attention_done=false so the per-row fallback at
+                     * line ~13203 runs ds4_gpu_attention_decode_heads_tensor per
+                     * token = the identical N=1 (sequential-dot) kernel/order. */
                 } else {
                     ok = ds4_gpu_attention_decode_mixed_batch_heads_tensor(g->batch_heads,
                                                                              model->map,
@@ -13819,9 +13841,9 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                              ratio,
                                                                              DS4_N_HEAD,
                                                                              DS4_N_HEAD_DIM) != 0;
+                    if (ok) batch_attention_done = true;
                 }
             }
-            if (ok) batch_attention_done = true;
         }
 
         const bool topk_prefill_needed = ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K;
