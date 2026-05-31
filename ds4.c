@@ -13111,7 +13111,20 @@ static bool metal_graph_encode_layer_attention_batch(
             fprintf(stderr, "ds4: Metal layer-major prefill needs attention compressor weights\n");
             ok = false;
         }
-        if (ok) {
+        /* A1: fuse the attention-compressor pair (comp_kv + comp_sc, both from
+         * batch_attn_norm, in=DS4_N_EMBD) into one grouped WMMA launch in the
+         * deterministic verify mode — bit-identical to the separate calls. */
+        const int verify_group_a1 = (n_tokens <= 8u &&
+                                     getenv("DS4_CUDA_ORDERED_F16_MAX_TOKENS") != NULL);
+        if (ok && verify_group_a1) {
+            ds4_gpu_tensor *gouts[2] = { g->batch_comp_kv, g->batch_comp_sc };
+            const uint64_t goffs[2] = { layer->attn_compressor_kv->abs_offset,
+                                        layer->attn_compressor_gate->abs_offset };
+            const uint64_t godim[2] = { comp_width, comp_width };
+            ok = ds4_gpu_matmul_f16_group_tensor(gouts, model->map, model->size,
+                                                 goffs, godim, 2, DS4_N_EMBD,
+                                                 g->batch_attn_norm, n_tokens) != 0;
+        } else if (ok) {
             ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_kv,
                                              model->map,
                                              model->size,
