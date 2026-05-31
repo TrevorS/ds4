@@ -1814,6 +1814,19 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     }
     cudaError_t err = cudaHostRegister((void *)model_map, (size_t)model_size,
                                        flags);
+    /* cudaHostRegisterReadOnly is not supported on every device (notably GB10
+     * returns cudaErrorNotSupported); retry without the read-only hint so the
+     * mapping still succeeds.  Without this, the host map stays unregistered and
+     * the later H2D weight-cache copy fails with cudaErrorInvalidValue — which
+     * breaks the second registered model (the MTP support model).  Mirrors the
+     * same fallback in cuda_model_range_register_mapped(). */
+    if (err != cudaSuccess &&
+        (flags & cudaHostRegisterReadOnly) != 0 &&
+        (err == cudaErrorNotSupported || err == cudaErrorInvalidValue)) {
+        (void)cudaGetLastError();
+        err = cudaHostRegister((void *)model_map, (size_t)model_size,
+                               cudaHostRegisterMapped);
+    }
     if (err == cudaSuccess) {
         void *dev = NULL;
         err = cudaHostGetDevicePointer(&dev, (void *)model_map, 0);
