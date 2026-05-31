@@ -21,3 +21,4 @@ __pycache__/
 /librechat/
 tools/perf/*/runs/
 /tests/cuda_long_context_smoke
+tools/perf/runs.db

@@ -119,9 +119,24 @@ def connect(path: str) -> sqlite3.Connection:
 
 
 def kernel_span(con: sqlite3.Connection) -> tuple[int, int]:
+    have = con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name='CUPTI_ACTIVITY_KIND_KERNEL'"
+    ).fetchone()
+    if not have:
+        raise SystemExit(
+            "perflib: this sqlite has no CUPTI_ACTIVITY_KIND_KERNEL table — the nsys "
+            "capture was truncated or had no CUDA kernels (commonly: a second GPU job "
+            "ran concurrently, or `nsys profile` was killed). Re-capture serialized "
+            "(capture.sh now takes an flock) and confirm the .nsys-rep is non-empty.")
     r = con.execute(
         "SELECT MIN(start) lo, MAX(end) hi FROM CUPTI_ACTIVITY_KIND_KERNEL"
     ).fetchone()
+    if r is None or r["lo"] is None:
+        raise SystemExit(
+            "perflib: CUPTI_ACTIVITY_KIND_KERNEL is empty (0 kernels traced). The "
+            "profiled run captured no GPU work — check the nsyslog for a CUDA-injection "
+            "error and re-capture.")
     return int(r["lo"]), int(r["hi"])
 
 
