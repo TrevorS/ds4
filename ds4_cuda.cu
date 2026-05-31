@@ -6948,18 +6948,13 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         !serial_f16 &&
         router_shape &&
         getenv("DS4_CUDA_SERIAL_ROUTER") != NULL;
-    /* Determinism knob (MTP verify): optionally route the tiny n_tok=2-4 verify F16
-     * GEMMs through the ordered FP32 kernel instead of cuBLAS.  cublasGemmEx
-     * (CUBLAS_GEMM_DEFAULT)+TF32 picks its algo heuristically per launch and truncates
-     * to TF32, so its output jitters run-to-run; routing the verify through the same
-     * ordered-chunks kernel the N=1 canonical path uses makes the combined verify
-     * BIT-EXACT run-to-run (measured: --mtp-selfconsistency maxabs=0).  This does NOT
-     * close the ~0.37 combined-vs-canonical algorithmic mean gap (that lives elsewhere),
-     * and routing the larger verify GEMMs to the 32-thread ordered kernel costs ~12%
-     * decode tok/s on GB10 — so it is DEFAULT OFF (threshold 1 = cuBLAS at n_tok>1, the
-     * fast production path).  Set DS4_CUDA_ORDERED_F16_MAX_TOKENS>=2 to enable the
-     * deterministic verify (the --mtp-selfconsistency harness sets it to 8). */
-    uint64_t ordered_max_tokens = 1u;
+    /* Deterministic MTP verify is the DEFAULT (bit-exact to canonical, worst_rms=0) —
+     * the verify F16 GEMMs route through the batch-invariant WMMA path for the small
+     * n_tok verify regime.  DS4_CUDA_FAST_VERIFY=1 opts into the faster non-deterministic
+     * cuBLAS verify (~6% decode on GB10); greedy output is token-identical either way
+     * (validated), so the fast path is what we run on Spark.  DS4_CUDA_ORDERED_F16_MAX_TOKENS
+     * overrides the small-batch threshold for tuning. */
+    uint64_t ordered_max_tokens = (getenv("DS4_CUDA_FAST_VERIFY") != NULL) ? 1u : 8u;
     {
         const char *ord_env = getenv("DS4_CUDA_ORDERED_F16_MAX_TOKENS");
         if (ord_env && ord_env[0]) {
@@ -7065,11 +7060,11 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
         getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL ||
         getenv("DS4_CUDA_SERIAL_ROUTER") != NULL ||
         getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") != NULL ||
-        /* Determinism mode (knob armed): delegate to two single GEMMs so the n=1
-         * canonical comp_kv/comp_sc take the SAME ordered/WMMA path as the n>1
-         * combined verify — otherwise the scalar pair kernel here vs WMMA there
-         * is an asymmetry that amplifies through the indexer/router top-k. */
-        getenv("DS4_CUDA_ORDERED_F16_MAX_TOKENS") != NULL) {
+        /* Deterministic verify is the DEFAULT: delegate to two single GEMMs so the n=1
+         * canonical comp_kv/comp_sc take the SAME WMMA path as the n>1 combined verify
+         * (the scalar pair kernel here vs WMMA there would otherwise amplify through the
+         * indexer/router top-k).  DS4_CUDA_FAST_VERIFY=1 keeps the fused scalar pair. */
+        getenv("DS4_CUDA_FAST_VERIFY") == NULL) {
         return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
                                            in_dim, out_dim, x, n_tok) &&
                ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,

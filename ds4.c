@@ -12784,12 +12784,12 @@ static bool metal_graph_encode_layer_attention_batch(
     uint32_t *index_counts = ratio == 4 ? xcalloc(n_tokens, sizeof(index_counts[0])) : NULL;
     /* C20-class attn-order fix: the non-indexed batched DECODE_MIXED kernel splits
      * each score dot across 8 lanes + tree-reduces (assoc differs from the N=1
-     * sequential dot), seeding the L3 compressed-attention divergence. When armed
-     * for the tiny MTP verify window, leave batch_attention_done=false on that
-     * branch so the per-row fallback loop runs the byte-identical N=1
-     * ds4_gpu_attention_decode_heads_tensor per token. Default 0 = OFF; production
-     * prefill (large n) and the canonical N=1 path are untouched. */
-    uint32_t ordered_attn_max_tokens = 0;
+     * sequential dot), seeding the L3 compressed-attention divergence. By DEFAULT
+     * (deterministic verify) leave batch_attention_done=false on that branch for the
+     * tiny verify window so the per-row N=1 ds4_gpu_attention_decode_heads_tensor runs
+     * (byte-identical). DS4_CUDA_FAST_VERIFY=1 -> 0 = use the fast batched kernel.
+     * Prefill (large n) and the canonical N=1 path are untouched either way. */
+    uint32_t ordered_attn_max_tokens = (getenv("DS4_CUDA_FAST_VERIFY") != NULL) ? 0u : 8u;
     {
         const char *oamt = getenv("DS4_CUDA_ORDERED_ATTN_MAX_TOKENS");
         if (oamt && oamt[0]) {
@@ -13115,7 +13115,7 @@ static bool metal_graph_encode_layer_attention_batch(
          * batch_attn_norm, in=DS4_N_EMBD) into one grouped WMMA launch in the
          * deterministic verify mode — bit-identical to the separate calls. */
         const int verify_group_a1 = (n_tokens <= 8u &&
-                                     getenv("DS4_CUDA_ORDERED_F16_MAX_TOKENS") != NULL);
+                                     getenv("DS4_CUDA_FAST_VERIFY") == NULL);
         if (ok && verify_group_a1) {
             ds4_gpu_tensor *gouts[2] = { g->batch_comp_kv, g->batch_comp_sc };
             const uint64_t goffs[2] = { layer->attn_compressor_kv->abs_offset,
@@ -13435,7 +13435,7 @@ static bool metal_graph_encode_layer_attention_batch(
              * indexer_weights is computed here (moved up; it's independent of the
              * indexer_q block below) and skipped at its original site. */
             const int verify_group = (n_tokens <= 8u &&
-                                      getenv("DS4_CUDA_ORDERED_F16_MAX_TOKENS") != NULL);
+                                      getenv("DS4_CUDA_FAST_VERIFY") == NULL);
             if (ok && verify_group) {
                 ds4_gpu_tensor *gouts[3] = { g->batch_comp_kv, g->batch_comp_sc,
                                              g->batch_indexer_weights };
@@ -14333,25 +14333,11 @@ static bool metal_graph_encode_layer_ffn_batch(
      * use_direct_down_sum6) by looping ds4_gpu_routed_moe_one_tensor per token.
      * Gated on the same small-n verify window as DS4_CUDA_ORDERED_F16_MAX_TOKENS so
      * production prefill (n_tokens large) and the canonical N=1 path are untouched. */
-    bool verify_ordered_moe = false;
-    if (ok && n_tokens > 1) {
-        /* Dedicated MoE gate takes precedence; otherwise piggyback on the same
-         * small-n window that arms the ordered F16 GEMMs (DS4_CUDA_ORDERED_F16_MAX_TOKENS)
-         * so the deterministic arbiter run exercises the ordered MoE without a
-         * second env var. Either knob, when its cap >= n_tokens, routes the verify
-         * MoE through the byte-identical N=1 kernel/order. */
-        const char *omt = getenv("DS4_CUDA_ORDERED_MOE_MAX_TOKENS");
-        if (omt && omt[0]) {
-            const int omt_max = atoi(omt);
-            verify_ordered_moe = (omt_max > 0 && (int)n_tokens <= omt_max);
-        } else {
-            const char *f16 = getenv("DS4_CUDA_ORDERED_F16_MAX_TOKENS");
-            if (f16 && f16[0]) {
-                const int f16_max = atoi(f16);
-                verify_ordered_moe = (f16_max > 0 && (int)n_tokens <= f16_max);
-            }
-        }
-    }
+    /* Deterministic verify is the DEFAULT: route the small-n verify routed-MoE through
+     * the byte-identical N=1 kernel/order. DS4_CUDA_FAST_VERIFY=1 keeps the fast batched
+     * MoE.  (n_tokens<=8 limits this to the verify regime; prefill is large.) */
+    const bool verify_ordered_moe = (ok && n_tokens > 1 && n_tokens <= 8 &&
+                                     getenv("DS4_CUDA_FAST_VERIFY") == NULL);
     if (ok && verify_ordered_moe) {
         for (uint32_t t = 0; t < n_tokens && ok; t++) {
             ds4_gpu_tensor *out_view =
@@ -19015,8 +19001,11 @@ int ds4_mtp_correctness_selftest(ds4_session *s,
         return 1;
     }
 
-    /* Determinism: MoE down projection without atomics (latched for the run). */
+    /* Determinism: MoE down projection without atomics + force the default
+     * deterministic verify path (clear any DS4_CUDA_FAST_VERIFY opt-out) so the gate
+     * measures the bit-exact verify regardless of the caller's env. */
     setenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN", "1", 1);
+    unsetenv("DS4_CUDA_FAST_VERIFY");
 
     ds4_engine *e = s->engine;
     ds4_gpu_graph *g = &s->graph;
@@ -19182,14 +19171,12 @@ int ds4_mtp_selfconsistency_selftest(ds4_session *s,
         return 1;
     }
 
-    /* Same determinism latch as the correctness gate, plus force the verify F16
-     * GEMMs onto the ordered (deterministic) kernel — this harness certifies that
-     * the deterministic-mode verify is bit-exact run-to-run, which production
-     * (cuBLAS default, DS4_CUDA_ORDERED_F16_MAX_TOKENS=1) trades away for ~12% tps.
-     * Latched here so the test measures the deterministic capability regardless of
-     * the production default. */
+    /* Same determinism latch as the correctness gate, and force the DEFAULT
+     * deterministic verify path (clear any DS4_CUDA_FAST_VERIFY opt-out) — this
+     * harness certifies the deterministic verify is bit-exact run-to-run regardless
+     * of how the caller's env is set. */
     setenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN", "1", 1);
-    setenv("DS4_CUDA_ORDERED_F16_MAX_TOKENS", "8", 1);
+    unsetenv("DS4_CUDA_FAST_VERIFY");
 
     ds4_engine *e = s->engine;
     ds4_gpu_graph *g = &s->graph;

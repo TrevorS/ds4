@@ -1701,20 +1701,14 @@ static void test_mtp_correctness(void) {
                 fails, rms, threshold, top1_match ? "match" : "MISMATCH", nonfinite);
         TEST_ASSERT(nonfinite == 0);
         TEST_ASSERT(top1_match);
-        /* REPORT-MODE: the combined-forward verify still diverges from the canonical
-         * decode2 verify at the LOGIT level (~0.2-0.33 RMS), localized to the batched
-         * flash/online-softmax attention vs canonical two-pass-exact softmax at the
-         * indexed-attention path (see misc/MTP-ATTENTION-FIX-LOG.md). Greedy top1
-         * still agrees, so output is coherent; per-logit equivalence is gated here as
-         * a REPORTED known-issue (not a hard failure) until a precision-matched fast
-         * flash kernel lands. Flip these back to asserts once worst_rms < threshold. */
-        if (rms >= threshold || fails != 0) {
-            fprintf(stderr,
-                    "ds4-test: mtp-correctness KNOWN-ISSUE (report-only, NOT gated): "
-                    "combined-vs-canonical worst_rms=%g >= threshold=%g; top1 matches, "
-                    "nonfinite=0. Per-logit equivalence pending flash-attn precision fix.\n",
-                    rms, threshold);
-        }
+        /* The combined-forward verify is now BIT-EXACT to the canonical N=1 verify in
+         * the default (deterministic) mode — worst_rms=0, achieved by routing the verify
+         * F16 GEMMs / MoE / compressed-attention to the N=1 kernels/order (the selftest
+         * clears DS4_CUDA_FAST_VERIFY to force this).  Hard-gated: per-logit equivalence
+         * is required, not just greedy top1.  (DS4_CUDA_FAST_VERIFY=1 trades it for ~6-8%
+         * decode and is not exercised here.) */
+        TEST_ASSERT(rms < threshold);
+        TEST_ASSERT(fails == 0);
     }
 
     ds4_session_free(session);
