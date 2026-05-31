@@ -38,26 +38,63 @@ import perflib as P
 
 
 def parse_accept(path: str) -> dict:
-    """Sum MTP `drafted=/committed=` telemetry into accept-rate + tokens/iter."""
+    """Join MTP `DS4_MTP_TIMING=1` telemetry into accept-rate + per-step timing.
+
+    Lines look like:
+      ds4: mtp timing micro    drafted=2 committed=2 draft=5.7 ms snapshot=0.0 ms verify=105.0 ms total=110.7 ms
+      ds4: mtp timing combined drafted=2 committed=1 total=143.7 ms
+    The `combined` steps are steady-state speculative decode (the throughput-
+    relevant cost); `micro` is the warmup probe.  We surface accept-rate AND the
+    per-step ms breakdown (combined total drives tok/s; verify is the dominant
+    sub-cost) so the verify-forward residual is visible alongside throughput."""
     drafted = committed = iters = 0
-    rx = re.compile(r"drafted=(\d+)\s+committed=(\d+)")
+    rx_dc = re.compile(r"drafted=(\d+)\s+committed=(\d+)")
+    rx_kind = re.compile(r"mtp timing (\w+)")
+    def field(k, l):
+        m = re.search(rf"{k}=([\d.]+)\s*ms", l)
+        return float(m.group(1)) if m else None
+    comb_total, comb_acc = [], [0, 0]          # combined step totals; [committed, drafted]
+    verify_ms, draft_ms, micro_total = [], [], []
     try:
         with open(path) as f:
             for line in f:
-                m = rx.search(line)
-                if m:
-                    drafted += int(m.group(1))
-                    committed += int(m.group(2))
-                    iters += 1
+                m = rx_dc.search(line)
+                if not m:
+                    continue
+                drafted += int(m.group(1)); committed += int(m.group(2)); iters += 1
+                km = rx_kind.search(line)
+                kind = km.group(1) if km else ""
+                tot = field("total", line)
+                if kind == "combined":
+                    if tot is not None: comb_total.append(tot)
+                    comb_acc[0] += int(m.group(2)); comb_acc[1] += int(m.group(1))
+                elif kind == "micro":
+                    if tot is not None: micro_total.append(tot)
+                    v = field("verify", line);  d = field("draft", line)
+                    if v is not None: verify_ms.append(v)
+                    if d is not None: draft_ms.append(d)
     except OSError:
         return {}
     if iters == 0:
         return {}
-    return {
+    mean = lambda xs: (sum(xs) / len(xs)) if xs else None
+    out = {
         "accept_pct": 100.0 * committed / drafted if drafted else float("nan"),
         "tokens_per_iter": 1.0 + committed / iters,
         "iters": iters,
+        "drafted": drafted,
+        "committed": committed,
     }
+    if comb_total:
+        out["combined_total_ms"] = mean(comb_total)
+        out["combined_steps"] = len(comb_total)
+        if comb_acc[1]:
+            out["combined_accept_pct"] = 100.0 * comb_acc[0] / comb_acc[1]
+            out["combined_tokens_per_iter"] = 1.0 + comb_acc[0] / len(comb_total)
+    if verify_ms: out["verify_ms"] = mean(verify_ms)
+    if draft_ms:  out["draft_ms"] = mean(draft_ms)
+    if micro_total: out["micro_total_ms"] = mean(micro_total)
+    return out
 
 
 def fmt(x: float, nd: int = 1, suffix: str = "") -> str:
@@ -244,8 +281,14 @@ def emit_markdown(r: dict) -> None:
     print(f"- prefill   {fmt(t.get('prefill_tps'))} t/s")
     print(f"- decode    {fmt(t.get('decode_tps'),2)} t/s")
     if "accept_pct" in t:
-        print(f"- accept    {fmt(t.get('accept_pct'))}%   "
-              f"tokens/iter {fmt(t.get('tokens_per_iter'),2)}")
+        ca = t.get("combined_accept_pct")
+        print(f"- accept    {fmt(t.get('accept_pct'))}%"
+              + (f" (combined {fmt(ca)}%)" if ca is not None else "")
+              + f"   tokens/iter {fmt(t.get('combined_tokens_per_iter', t.get('tokens_per_iter')),2)}")
+    if t.get("combined_total_ms") is not None:
+        print(f"- mtp step  combined {fmt(t.get('combined_total_ms'),2)} ms"
+              + (f"   verify {fmt(t.get('verify_ms'),2)} ms" if t.get('verify_ms') is not None else "")
+              + (f"   draft {fmt(t.get('draft_ms'),2)} ms" if t.get('draft_ms') is not None else ""))
     if t.get("kvcache_mb") is not None:
         print(f"- kvcache   {fmt(t.get('kvcache_mb'))} MB")
 

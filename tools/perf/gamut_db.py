@@ -188,10 +188,21 @@ def cmd_compare(args):
         sys.exit("could not resolve both runs")
     ka = {k.get("kernel"): k for k in a.get("kernels", [])}
     kb = {k.get("kernel"): k for k in b.get("kernels", [])}
-    ta = (a.get("throughput") or {}).get("decode_tps")
-    tb = (b.get("throughput") or {}).get("decode_tps")
+    tpa = a.get("throughput") or {}
+    tpb = b.get("throughput") or {}
+    ta, tb = tpa.get("decode_tps"), tpb.get("decode_tps")
     print(f"# compare  {a.get('label')}  ->  {b.get('label')}")
     print(f"decode t/s  {ta} -> {tb}")
+    # MTP telemetry (joined from DS4_MTP_TIMING): accept + per-step verify cost
+    def g(d, k): return d.get(k)
+    for key, lbl, p in (("accept_pct", "accept %", 1), ("combined_accept_pct", "accept % (combined)", 1),
+                        ("combined_tokens_per_iter", "tokens/iter", 2), ("combined_total_ms", "mtp step ms", 2),
+                        ("verify_ms", "verify ms", 2), ("draft_ms", "draft ms", 2)):
+        va, vb = g(tpa, key), g(tpb, key)
+        if va is not None or vb is not None:
+            fa = f"{va:.{p}f}" if isinstance(va, (int, float)) else "-"
+            fb = f"{vb:.{p}f}" if isinstance(vb, (int, float)) else "-"
+            print(f"{lbl:22} {fa:>9} -> {fb:>9}")
     print(f"{'kernel':46} {'ms a':>9} {'ms b':>9} {'Δms':>9} {'regs a→b':>10}")
     allk = sorted(set(ka) | set(kb), key=lambda n: -((kb.get(n, {}).get("ms") or 0)))
     for n in allk:
