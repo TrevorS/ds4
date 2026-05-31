@@ -22,3 +22,6 @@ __pycache__/
 tools/perf/*/runs/
 /tests/cuda_long_context_smoke
 tools/perf/runs.db
+tools/perf/runs/*/
+tests/test_q4k_dot
+tests/cuda_long_context_smoke

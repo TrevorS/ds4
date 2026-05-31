@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import subprocess
 import time
 from dataclasses import dataclass
@@ -71,12 +72,34 @@ def _num(x):
         return x
 
 
+def _fit_prompt(prompt_file: str, ctx_max: int, out_dir: Path) -> str:
+    """ds4-bench refuses to start when the prompt tokenizes to fewer tokens than
+    --ctx-max ('prompt has N tokens, need at least --ctx-max=M'). The story prompt
+    is ~30.5k tokens, short of the 32k frontier, so stitch copies into the run dir
+    until it's long enough (rough ~5 bytes/token + slack). Ported from the legacy
+    bench-with-monitor harness."""
+    need_bytes = ctx_max * 5 + 8192
+    try:
+        src_bytes = os.path.getsize(prompt_file)
+    except OSError:
+        return prompt_file
+    if src_bytes >= need_bytes or src_bytes == 0:
+        return prompt_file
+    copies = (need_bytes + src_bytes - 1) // src_bytes
+    stitched = out_dir / "prompt.txt"
+    data = Path(prompt_file).read_bytes()
+    stitched.write_bytes(data * copies)
+    print(f"## prompt stitched: {copies}x copies → {stitched} "
+          f"({stitched.stat().st_size} bytes, target≈{ctx_max} tok)", flush=True)
+    return str(stitched)
+
+
 def run(cfg: BenchCfg) -> dict:
-    import os
     out = PERF / "runs" / cfg.label
     out.mkdir(parents=True, exist_ok=True)
     ds4_bench = str(ROOT / "ds4-bench")
     Path("/tmp/ds4.lock").unlink(missing_ok=True)
+    cfg.prompt_file = _fit_prompt(cfg.prompt_file, cfg.ctx_max, out)
 
     cells = MATRIX_CELLS if cfg.matrix else [("single", cfg.use_mtp, cfg.use_temp)]
     env = dict(os.environ)
