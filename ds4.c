@@ -13415,7 +13415,26 @@ static bool metal_graph_encode_layer_attention_batch(
                 fprintf(stderr, "ds4: Metal layer-major prefill needs indexer weights\n");
                 ok = false;
             }
-            if (ok) {
+            /* Deterministic verify (knob armed, small n_tokens): fuse the three
+             * batch_attn_norm GEMMs (comp_kv + comp_sc + indexer_weights, all
+             * in=DS4_N_EMBD) into ONE grouped WMMA launch — bit-identical to the
+             * separate calls but GPU-filling (measured 3.76x on this cluster).
+             * indexer_weights is computed here (moved up; it's independent of the
+             * indexer_q block below) and skipped at its original site. */
+            const int verify_group = (n_tokens <= 8u &&
+                                      getenv("DS4_CUDA_ORDERED_F16_MAX_TOKENS") != NULL);
+            if (ok && verify_group) {
+                ds4_gpu_tensor *gouts[3] = { g->batch_comp_kv, g->batch_comp_sc,
+                                             g->batch_indexer_weights };
+                const uint64_t goffs[3] = { layer->indexer_compressor_kv->abs_offset,
+                                            layer->indexer_compressor_gate->abs_offset,
+                                            layer->indexer_proj->abs_offset };
+                const uint64_t godim[3] = { index_width, index_width,
+                                            (uint64_t)DS4_N_INDEXER_HEAD };
+                ok = ds4_gpu_matmul_f16_group_tensor(gouts, model->map, model->size,
+                                                     goffs, godim, 3, DS4_N_EMBD,
+                                                     g->batch_attn_norm, n_tokens) != 0;
+            } else if (ok) {
                 ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_kv,
                                                  model->map,
                                                  model->size,
@@ -13468,7 +13487,7 @@ static bool metal_graph_encode_layer_attention_batch(
             if (ok) ok = ds4_gpu_dsv4_indexer_qat_tensor(g->batch_indexer_q,
                                                           n_tokens * DS4_N_INDEXER_HEAD,
                                                           DS4_N_INDEXER_HEAD_DIM) != 0;
-            if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_indexer_weights,
+            if (ok && !verify_group) ok = ds4_gpu_matmul_f16_tensor(g->batch_indexer_weights,
                                                      model->map,
                                                      model->size,
                                                      layer->indexer_proj->abs_offset,

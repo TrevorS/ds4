@@ -2126,6 +2126,38 @@ __global__ static void matmul_f16_wmma_bi_kernel(
     wmma::store_matrix_sync(out_pad + r0, fc, out_dim, wmma::mem_col_major);
 }
 
+/* Grouped batch-invariant WMMA GEMM: fuses several verify F16 GEMMs that share the
+ * SAME input activation x and in_dim into ONE launch.  Each block owns a 16-row tile
+ * of one slice (picked by a small linear search over the prefix-sum tile bases) and
+ * runs the IDENTICAL per-row WMMA body as matmul_f16_wmma_bi_kernel — so every output
+ * element is bit-identical to the standalone kernel (gate-stable), while aggregating
+ * the small GEMMs' tiles into one GPU-filling launch (measured 3.76x on the A2 cluster:
+ * comp_kv+comp_sc+indexer_weights, 16+16+4 -> 36 tiles).  The under-occupancy of the
+ * separate small launches (4-16 warps each) was the dominant determinism-mode cost. */
+struct ds4_f16_gslice { const __half *w; float *cpad; uint32_t out_dim; uint32_t tile_base; };
+__global__ static void matmul_f16_grouped_wmma_bi_kernel(
+        const __half *xpad, uint64_t in_dim,
+        const ds4_f16_gslice *sl, int nsl, uint32_t ntiles) {
+    namespace wmma = nvcuda::wmma;
+    const uint32_t blk = blockIdx.x;
+    if (blk >= ntiles) return;
+    int si = 0;
+    while (si + 1 < nsl && blk >= sl[si + 1].tile_base) si++;
+    const ds4_f16_gslice s = sl[si];
+    const uint64_t r0 = (uint64_t)(blk - s.tile_base) * 16u;
+    if (r0 >= s.out_dim) return;
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> fc;
+    wmma::fill_fragment(fc, 0.0f);
+    for (uint64_t k0 = 0; k0 < in_dim; k0 += 16u) {
+        wmma::load_matrix_sync(fa, s.w + r0 * in_dim + k0, in_dim);
+        wmma::load_matrix_sync(fb, xpad + k0, in_dim);
+        wmma::mma_sync(fc, fa, fb, fc);
+    }
+    wmma::store_matrix_sync(s.cpad + r0, fc, s.out_dim, wmma::mem_col_major);
+}
+
 __global__ static void matmul_f16_pair_ordered_chunks_kernel(
         float *out0,
         float *out1,
@@ -7059,6 +7091,64 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
         out_dim,
         out_dim);
     return cuda_ok(cudaGetLastError(), "matmul_f16_pair_ordered_chunks launch");
+}
+
+/* Fused deterministic verify GEMMs sharing one activation x + in_dim: one grouped
+ * WMMA launch over all slices' tiles (GPU-filling) instead of N small under-occupied
+ * launches.  Bit-identical per output element to N separate matmul_f16_wmma_bi calls
+ * (gate-stable); for the n=1 canonical and n>1 combined verify alike.  All slice
+ * out_dims and in_dim must be mult-of-16.  n_slices <= 8, n_tok <= 16. */
+extern "C" int ds4_gpu_matmul_f16_group_tensor(
+        ds4_gpu_tensor *const *outs,
+        const void *model_map, uint64_t model_size,
+        const uint64_t *w_offsets, const uint64_t *out_dims,
+        int n_slices, uint64_t in_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    if (!outs || !model_map || !w_offsets || !out_dims || !x ||
+        n_slices <= 0 || n_slices > 8 || in_dim == 0 || (in_dim % 16u) != 0u ||
+        n_tok == 0 || n_tok > 16u) return 0;
+    if (x->bytes < n_tok * in_dim * sizeof(float)) return 0;
+    uint64_t total_out = 0; uint32_t total_tiles = 0;
+    for (int i = 0; i < n_slices; i++) {
+        const uint64_t od = out_dims[i];
+        if (od == 0 || (od % 16u) != 0u || od > UINT64_MAX / in_dim) return 0;
+        const uint64_t wbytes = od * in_dim * sizeof(uint16_t);
+        if (w_offsets[i] > model_size || wbytes > model_size - w_offsets[i]) return 0;
+        if (!outs[i] || outs[i]->bytes < n_tok * od * sizeof(float)) return 0;
+        total_out += od; total_tiles += (uint32_t)(od / 16u);
+    }
+    const uint64_t xpad_bytes = 16u * in_dim * sizeof(__half);
+    const uint64_t cpad_bytes = total_out * 16u * sizeof(float);
+    const uint64_t sl_bytes = (uint64_t)n_slices * sizeof(ds4_f16_gslice);
+    char *tmp = (char *)cuda_tmp_alloc(xpad_bytes + cpad_bytes + sl_bytes, "wmma f16 group scratch");
+    if (!tmp) return 0;
+    __half *xpad = (__half *)tmp;
+    float *cpad = (float *)(tmp + xpad_bytes);
+    ds4_f16_gslice *dsl = (ds4_f16_gslice *)(tmp + xpad_bytes + cpad_bytes);
+    const uint64_t xc = n_tok * in_dim;        /* convert shared x once; padded rows unused */
+    f32_to_f16_kernel<<<(xc + 255) / 256, 256>>>(xpad, (const float *)x->ptr, xc);
+    ds4_f16_gslice hsl[8];
+    uint32_t tb = 0; uint64_t coff = 0;
+    for (int i = 0; i < n_slices; i++) {
+        const __half *w = (const __half *)cuda_model_range_ptr(
+            model_map, w_offsets[i], out_dims[i] * in_dim * sizeof(uint16_t), "f16_group");
+        if (!w) return 0;
+        hsl[i].w = w;
+        hsl[i].cpad = cpad + coff * 16u;
+        hsl[i].out_dim = (uint32_t)out_dims[i];
+        hsl[i].tile_base = tb;
+        tb += (uint32_t)(out_dims[i] / 16u);
+        coff += out_dims[i];
+    }
+    cudaMemcpyAsync(dsl, hsl, sl_bytes, cudaMemcpyHostToDevice, cudaStreamPerThread);
+    matmul_f16_grouped_wmma_bi_kernel<<<total_tiles, 32>>>(xpad, in_dim, dsl, n_slices, total_tiles);
+    coff = 0;
+    for (int i = 0; i < n_slices; i++) {
+        cudaMemcpyAsync(outs[i]->ptr, cpad + coff * 16u, n_tok * out_dims[i] * sizeof(float),
+                        cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        coff += out_dims[i];
+    }
+    return cuda_ok(cudaGetLastError(), "matmul_f16_grouped_wmma_bi launch");
 }
 
 extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {

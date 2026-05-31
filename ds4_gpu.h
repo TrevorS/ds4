@@ -226,6 +226,20 @@ int ds4_gpu_matmul_f16_pair_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Fused deterministic verify GEMMs sharing one activation x + in_dim: one grouped
+ * WMMA launch over all slices (GPU-filling), bit-identical to N separate WMMA GEMMs.
+ * out_dims[i] and in_dim must be mult-of-16; n_slices<=8, n_tok<=16. */
+int ds4_gpu_matmul_f16_group_tensor(
+        ds4_gpu_tensor *const  *outs,
+        const void             *model_map,
+        uint64_t                model_size,
+        const uint64_t         *w_offsets,
+        const uint64_t         *out_dims,
+        int                     n_slices,
+        uint64_t                in_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
 int ds4_gpu_matmul_f32_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
