@@ -2134,11 +2134,12 @@ __global__ static void matmul_f16_wmma_bi_kernel(
  * the small GEMMs' tiles into one GPU-filling launch (measured 3.76x on the A2 cluster:
  * comp_kv+comp_sc+indexer_weights, 16+16+4 -> 36 tiles).  The under-occupancy of the
  * separate small launches (4-16 warps each) was the dominant determinism-mode cost. */
-struct ds4_f16_gslice { const __half *w; float *cpad; uint32_t out_dim; uint32_t tile_base; };
+struct ds4_f16_gslice { const __half *w; float *out; uint32_t out_dim; uint32_t tile_base; };
 __global__ static void matmul_f16_grouped_wmma_bi_kernel(
-        const __half *xpad, uint64_t in_dim,
+        const __half *xpad, uint64_t in_dim, uint32_t n_tok,
         const ds4_f16_gslice *sl, int nsl, uint32_t ntiles) {
     namespace wmma = nvcuda::wmma;
+    __shared__ float st[16 * 16];
     const uint32_t blk = blockIdx.x;
     if (blk >= ntiles) return;
     int si = 0;
@@ -2155,7 +2156,15 @@ __global__ static void matmul_f16_grouped_wmma_bi_kernel(
         wmma::load_matrix_sync(fb, xpad + k0, in_dim);
         wmma::mma_sync(fc, fa, fb, fc);
     }
-    wmma::store_matrix_sync(s.cpad + r0, fc, s.out_dim, wmma::mem_col_major);
+    /* Store the 16x16 tile to smem, then write ONLY the n_tok valid columns straight
+     * to the slice's output (col-major out_dim x n_tok) — no padded scratch + memcpy.
+     * Bit-identical bytes to store-to-scratch + copy. */
+    wmma::store_matrix_sync(st, fc, 16, wmma::mem_col_major);
+    __syncwarp();
+    for (uint32_t i = threadIdx.x; i < 16u * n_tok; i += 32u) {
+        const uint32_t r = i & 15u, t = i >> 4;
+        s.out[r0 + r + (uint64_t)t * s.out_dim] = st[r + t * 16u];
+    }
 }
 
 __global__ static void matmul_f16_pair_ordered_chunks_kernel(
@@ -7108,46 +7117,40 @@ extern "C" int ds4_gpu_matmul_f16_group_tensor(
         n_slices <= 0 || n_slices > 8 || in_dim == 0 || (in_dim % 16u) != 0u ||
         n_tok == 0 || n_tok > 16u) return 0;
     if (x->bytes < n_tok * in_dim * sizeof(float)) return 0;
-    uint64_t total_out = 0; uint32_t total_tiles = 0;
+    uint32_t total_tiles = 0;
     for (int i = 0; i < n_slices; i++) {
         const uint64_t od = out_dims[i];
         if (od == 0 || (od % 16u) != 0u || od > UINT64_MAX / in_dim) return 0;
         const uint64_t wbytes = od * in_dim * sizeof(uint16_t);
         if (w_offsets[i] > model_size || wbytes > model_size - w_offsets[i]) return 0;
         if (!outs[i] || outs[i]->bytes < n_tok * od * sizeof(float)) return 0;
-        total_out += od; total_tiles += (uint32_t)(od / 16u);
+        total_tiles += (uint32_t)(od / 16u);
     }
+    /* Scratch = converted shared x (once) + the device slice array.  The kernel writes
+     * each slice's n_tok columns straight to its out tensor (smem -> out), so no
+     * per-slice output scratch or D2D memcpy is needed. */
     const uint64_t xpad_bytes = 16u * in_dim * sizeof(__half);
-    const uint64_t cpad_bytes = total_out * 16u * sizeof(float);
     const uint64_t sl_bytes = (uint64_t)n_slices * sizeof(ds4_f16_gslice);
-    char *tmp = (char *)cuda_tmp_alloc(xpad_bytes + cpad_bytes + sl_bytes, "wmma f16 group scratch");
+    char *tmp = (char *)cuda_tmp_alloc(xpad_bytes + sl_bytes, "wmma f16 group scratch");
     if (!tmp) return 0;
     __half *xpad = (__half *)tmp;
-    float *cpad = (float *)(tmp + xpad_bytes);
-    ds4_f16_gslice *dsl = (ds4_f16_gslice *)(tmp + xpad_bytes + cpad_bytes);
+    ds4_f16_gslice *dsl = (ds4_f16_gslice *)(tmp + xpad_bytes);
     const uint64_t xc = n_tok * in_dim;        /* convert shared x once; padded rows unused */
     f32_to_f16_kernel<<<(xc + 255) / 256, 256>>>(xpad, (const float *)x->ptr, xc);
     ds4_f16_gslice hsl[8];
-    uint32_t tb = 0; uint64_t coff = 0;
+    uint32_t tb = 0;
     for (int i = 0; i < n_slices; i++) {
         const __half *w = (const __half *)cuda_model_range_ptr(
             model_map, w_offsets[i], out_dims[i] * in_dim * sizeof(uint16_t), "f16_group");
         if (!w) return 0;
         hsl[i].w = w;
-        hsl[i].cpad = cpad + coff * 16u;
+        hsl[i].out = (float *)outs[i]->ptr;
         hsl[i].out_dim = (uint32_t)out_dims[i];
         hsl[i].tile_base = tb;
         tb += (uint32_t)(out_dims[i] / 16u);
-        coff += out_dims[i];
     }
     cudaMemcpyAsync(dsl, hsl, sl_bytes, cudaMemcpyHostToDevice, cudaStreamPerThread);
-    matmul_f16_grouped_wmma_bi_kernel<<<total_tiles, 32>>>(xpad, in_dim, dsl, n_slices, total_tiles);
-    coff = 0;
-    for (int i = 0; i < n_slices; i++) {
-        cudaMemcpyAsync(outs[i]->ptr, cpad + coff * 16u, n_tok * out_dims[i] * sizeof(float),
-                        cudaMemcpyDeviceToDevice, cudaStreamPerThread);
-        coff += out_dims[i];
-    }
+    matmul_f16_grouped_wmma_bi_kernel<<<total_tiles, 32>>>(xpad, in_dim, (uint32_t)n_tok, dsl, n_slices, total_tiles);
     return cuda_ok(cudaGetLastError(), "matmul_f16_grouped_wmma_bi launch");
 }
 
