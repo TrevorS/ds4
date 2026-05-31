@@ -1591,6 +1591,22 @@ static const char *ds4_cuda_tap_prefix(void) {
     return g_prefix;
 }
 
+/* DS4_CUDA_FAST_VERIFY=1 is "Spark fast mode": it disables ALL the deterministic-
+ * verify machinery that otherwise defaults onto the non-verify path (the batched
+ * heads8 attention dispatch, the n=1 ordered F16 GEMM, the fused A1/A2 pair).
+ * Greedy output is token-identical to the deterministic default; only sampled
+ * fidelity and the --mtp-correctness/--mtp-selfconsistency gates rely on the
+ * deterministic path, and those run without this flag.  Cached: read once. */
+static int ds4_cuda_fast_verify(void) {
+    static int g_fast = 0;
+    static int g_init = 0;
+    if (!g_init) {                       /* one-time env read */
+        g_fast = (getenv("DS4_CUDA_FAST_VERIFY") != NULL);
+        g_init = 1;
+    }
+    return g_fast;
+}
+
 extern "C" int ds4_gpu_fingerprint_tap_f32(const ds4_gpu_tensor *t, uint64_t n_f32,
                                            const char *tag, uint32_t layer, uint32_t pos) {
     const char *prefix = ds4_cuda_tap_prefix();
@@ -3716,7 +3732,8 @@ __global__ static void attention_indexed_mixed_kernel(
         uint32_t window,
         uint32_t ratio,
         uint32_t n_head,
-        uint32_t head_dim) {
+        uint32_t head_dim,
+        uint32_t deterministic) {
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tokens || h >= n_head) return;
@@ -3790,8 +3807,11 @@ __global__ static void attention_indexed_mixed_kernel(
      * bitonic sort so BOTH launches reduce in the identical, position-
      * independent order.  This is parallel (no serialization of the reduction)
      * and runs once per block over <=512 rows, so it preserves the fast path's
-     * throughput while making combined-forward bit-equal to canonical decode. */
-    {
+     * throughput while making combined-forward bit-equal to canonical decode.
+     * Skipped under DS4_CUDA_FAST_VERIFY (deterministic==0): plain/greedy decode
+     * doesn't compare n=1 against n>1, so the order-independence buys nothing and
+     * the sort is pure overhead. */
+    if (deterministic) {
         const uint32_t cc = comp_count;
         if (cc > 1u) {
             uint32_t pot = 1u;
@@ -6974,13 +6994,17 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
      * cuBLAS verify (~6% decode on GB10); greedy output is token-identical either way
      * (validated), so the fast path is what we run on Spark.  DS4_CUDA_ORDERED_F16_MAX_TOKENS
      * overrides the small-batch threshold for tuning. */
-    uint64_t ordered_max_tokens = (getenv("DS4_CUDA_FAST_VERIFY") != NULL) ? 1u : 8u;
+    /* Spark fast mode routes EVERYTHING (incl. n_tok=1 plain decode) through cuBLAS:
+     * the ordered WMMA-bi/scalar path exists only to keep the n=1 canonical row
+     * bit-identical to the n>1 verify batch, which plain/greedy decode never needs
+     * (proven token-identical).  Default keeps the small-batch verify regime ordered. */
+    uint64_t ordered_max_tokens = ds4_cuda_fast_verify() ? 0u : 8u;
     {
         const char *ord_env = getenv("DS4_CUDA_ORDERED_F16_MAX_TOKENS");
         if (ord_env && ord_env[0]) {
             char *endp = NULL;
             long v = strtol(ord_env, &endp, 10);
-            if (endp != ord_env && v >= 1 && v < 4096) ordered_max_tokens = (uint64_t)v;
+            if (endp != ord_env && v >= 0 && v < 4096) ordered_max_tokens = (uint64_t)v;
         }
     }
     const int ordered_router =
@@ -8116,10 +8140,14 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
      *
      * Set DS4_CUDA_INDEXED_HEADS8=1 to opt back into the fast heads8 kernels
      * (online by default, or rb4 via DS4_CUDA_INDEXED_TWOPASS) for the
-     * approximate-but-equal-speed path. */
+     * approximate-but-equal-speed path.  DS4_CUDA_FAST_VERIFY=1 (Spark fast mode)
+     * implies it: the batched path here is prefill + the n>1 combined verify, and
+     * the slow N=1 reference kernel here is the proven prefill regression (~1.5x)
+     * — the deterministic match only matters for the correctness gates, which run
+     * without FAST_VERIFY. */
     if (n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
         getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL &&
-        getenv("DS4_CUDA_INDEXED_HEADS8") != NULL) {
+        (getenv("DS4_CUDA_INDEXED_HEADS8") != NULL || ds4_cuda_fast_verify())) {
         if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
             dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
             attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>((float *)heads->ptr,
@@ -8181,7 +8209,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                   window,
                                                   ratio,
                                                   n_head,
-                                                  head_dim);
+                                                  head_dim,
+                                                  (uint32_t)(!ds4_cuda_fast_verify()));
     return cuda_ok(cudaGetLastError(), "attention indexed mixed launch");
 }
 
