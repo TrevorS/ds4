@@ -9949,7 +9949,7 @@ __global__ static void moe_gate_up_mid_expert_tile4_row32_kernel(
     }
 }
 
-__global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
+__global__ static void __launch_bounds__(256, 3) moe_gate_up_mid_expert_tile8_row32_kernel(
         float *gate_out,
         float *up_out,
         float *mid_out,
