@@ -21,8 +21,8 @@ from pathlib import Path
 
 from . import metrics as M, mtp, report as R, store
 
-ROOT = Path(__file__).resolve().parents[2]
-PERF = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[3]   # repo root (…/ds4)
+PERF = Path(__file__).resolve().parents[1]    # …/tools/perf
 NVCC = "/usr/local/cuda/bin/nvcc"
 ARCH = "-gencode=arch=compute_121a,code=sm_121a"
 LOCK = "/tmp/ds4-capture.lock"
