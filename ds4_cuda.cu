@@ -521,8 +521,15 @@ static int cuda_q8_f16_cache_has_budget(uint64_t request_bytes, const char *labe
         } else if (g_model_registered_size >= 88ull * 1073741824ull ||
                    g_model_range_bytes >= 88ull * 1073741824ull) {
             limit = 16ull * 1073741824ull;
-        } else if (g_model_range_bytes >= 64ull * 1073741824ull) {
-            limit = 12ull * 1073741824ull;
+        } else if (g_model_registered_size >= 64ull * 1073741824ull ||
+                   g_model_range_bytes >= 64ull * 1073741824ull) {
+            /* GB10: a ~80 GiB model host-registered on a 128 GB unified pool
+             * register-maps (g_model_range_bytes stays ~0) yet leaves as much
+             * room as the 88-112 GiB tier above — so it must NOT fall to the 8
+             * GiB else branch, which starves the prefill-critical dense f16
+             * cache (~10.5 GiB) and regresses prefill ~3x. The free-reserve
+             * check below remains the real OOM guard. */
+            limit = 16ull * 1073741824ull;
         } else {
             limit = 8ull * 1073741824ull;
         }

@@ -1801,7 +1801,17 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
     if (!accelerator_prepare_model_tensor_spans(m, span_offsets, span_sizes, span_count, &prepared)) {
         return false;
     }
-    if (!accelerator_cache_q8_tensors(m, span_offsets, span_sizes, span_count)) return false;
+    /* Opt-in only (GB10): the indiscriminate Q8->f16 dequant cache fills the
+     * bounded device cache (~8 GiB) with the first dense tensors by index, which
+     * on Spark starves the prefill-critical dense attention weights that the
+     * targeted metal_graph_prewarm_dense_f16() warms. Default off restores that
+     * prewarm's effect (~2x prefill TTFT); set DS4_CUDA_Q8_F16_PRELOAD or
+     * DS4_CUDA_Q8_F32_PRELOAD to eagerly cache all dense Q8 weights instead.
+     * (Upstream made this unconditional; our fork keeps it opt-in.) */
+    if (getenv("DS4_CUDA_Q8_F16_PRELOAD") != NULL ||
+        getenv("DS4_CUDA_Q8_F32_PRELOAD") != NULL) {
+        if (!accelerator_cache_q8_tensors(m, span_offsets, span_sizes, span_count)) return false;
+    }
     const double t1 = now_sec();
     fprintf(stderr,
             "ds4: CUDA startup model preparation covered %.2f GiB of tensor spans in %.3fs\n",
