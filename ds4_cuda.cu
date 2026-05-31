@@ -1954,10 +1954,27 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
 extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
-    if (cuda_model_range_is_cached(model_map, offset, bytes)) return 1;
 
-    const char *ptr = cuda_model_range_ptr(model_map, offset, bytes, label ? label : "model_tensor");
-    if (!ptr || !cuda_model_range_is_cached(model_map, offset, bytes)) {
+    /* Force-populate the device-resident HBM cache so hot tensors hit cudaMalloc
+     * copies (device page tables, 2 MiB pages) rather than the whole-model UVA
+     * host-register fallback (4 KiB pages through host page tables).  On GB10 the
+     * UVA path is ~25% slower for the scattered Q8 weight reads in decode (proven:
+     * disabling this on the 5/27 binary reproduces the regressed Q8 kernel times
+     * exactly).  Upstream's rebase replaced this with an is_cached() short-circuit
+     * that no-ops once the model is registered — restore the explicit copy.  The
+     * resolver (cuda_model_range_ptr) already prefers these per-offset copies over
+     * the registered pointer, so this is a pure residency win with no correctness
+     * implication; the UVA mapping remains the fallback for anything left uncached. */
+    if (getenv("DS4_CUDA_NO_HBM_CACHE") != NULL) return 1;
+    if (g_model_device_owned) return 1;                  /* whole model already device-resident */
+    const uint64_t limit = cuda_model_cache_limit_bytes();
+    if (g_model_range_bytes >= limit || bytes > limit - g_model_range_bytes) return 1;  /* over budget: UVA fallback is fine */
+    auto exact = g_model_range_by_offset.find(offset);   /* already device-copied this span? */
+    if (exact != g_model_range_by_offset.end()) {
+        const cuda_model_range &r = g_model_ranges[exact->second];
+        if (r.host_base == model_map && bytes <= r.bytes && !r.host_registered) return 1;
+    }
+    if (cuda_model_range_populate_device_copy(model_map, offset, bytes, label ? label : "model_tensor") == NULL) {
         if (!g_model_mapping_failure_notice_printed) {
             fprintf(stderr,
                     "ds4: CUDA failed to prepare model tensor spans for device access\n");
