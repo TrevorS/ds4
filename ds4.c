@@ -1679,6 +1679,15 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
             return false;
         }
     }
+    /* Routed MoE expert weights (`*_exps.weight`) are ~65 GiB of the model on
+     * V4-Flash but only top-K of N=256 experts fire per token — device-copying
+     * them into HBM wastes most of the cache budget on cold weights and starves
+     * the hot non-MoE tensors every token reads (attn / shared FFN / embedding /
+     * output head), forcing those onto the slow UVA-mapped path.  Skip them here
+     * at the span-build stage; cold MoE expert reads fall back to UVA.  Restored
+     * from bcc955f (dropped in an upstream rebase, which regressed the hot Q8
+     * decode matmuls ~29%/call).  Disable the filter with DS4_CUDA_CACHE_ALL_TENSORS=1. */
+    const int skip_moe = getenv("DS4_CUDA_CACHE_ALL_TENSORS") == NULL;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const ds4_tensor *t = &m->tensors[i];
         if (t->bytes == 0) continue;
@@ -1688,6 +1697,10 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
         }
         if (!accelerator_span_filter_contains(t->abs_offset, t->bytes,
                                               span_offsets, span_sizes, span_count)) {
+            continue;
+        }
+        if (skip_moe && t->name.len >= 6 &&
+            memmem(t->name.ptr, t->name.len, "_exps.", 6) != NULL) {
             continue;
         }
         spans[nspan++] = (accelerator_tensor_span){
