@@ -41,7 +41,7 @@ CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression token-diff cuda-tap-capture cuda-tap-regression cuda-ppl cuda-ppl-baseline
+.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression token-diff cuda-tap-capture cuda-tap-regression cuda-ppl cuda-ppl-baseline cpu-cuda-ppl cpu-ppl-baseline
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -170,6 +170,15 @@ cuda-ppl: ds4_test
 	./ds4_test --cuda-ppl
 cuda-ppl-baseline: ds4_test
 	DS4_TEST_PPL_WRITE_BASELINE=1 ./ds4_test --cuda-ppl
+
+# CPU-reference perplexity cross-check: CUDA avg-NLL on a short reference corpus
+# vs a committed CPU f32 scalar reference (the correctness claim). cpu-ppl-baseline
+# captures the CPU reference once on the Grace cores (slow); cpu-cuda-ppl runs the
+# fast CUDA-vs-committed-reference check.
+cpu-cuda-ppl: ds4_test
+	./ds4_test --cpu-cuda-ppl
+cpu-ppl-baseline: ds4_test
+	DS4_TEST_PPL_WRITE_BASELINE=1 ./ds4_test --cpu-cuda-ppl
 
 # Shared library for in-process embedding via ctypes/cffi (Linux + CUDA).
 # Core engine API lives in ds4.c (+ ds4_cuda.cu); no server/cli objects needed.
