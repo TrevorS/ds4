@@ -1687,6 +1687,113 @@ static void test_cuda_tensor_equivalence(void) {
 #endif
 }
 
+/* Perplexity regression gate. Teacher-forces a committed mixed prose+code corpus
+ * (the same NLL loop run_perplexity_file uses: token_logprob -> -logprob -> eval)
+ * and compares avg-NLL against a committed baseline. PPL integrates every layer's
+ * numeric drift into one scale-free scalar -- the standard llama.cpp-style
+ * correctness number, and the artifact for the re-upstream case. Determinism is
+ * forced so the scalar is bit-reproducible run-to-run.
+ *
+ * Regenerate the baseline after an intentional numeric change with
+ * DS4_TEST_PPL_WRITE_BASELINE=1 (or `make cuda-ppl-baseline`); it is also written
+ * automatically if the baseline file is absent. */
+static void test_cuda_perplexity(void) {
+#ifdef __APPLE__
+    fprintf(stderr, "ds4-test: cuda-ppl skipped (CUDA-only, Metal build)\n");
+    return;
+#else
+    setenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN", "1", 1);  /* bit-reproducible scalar */
+
+    const char *corpus_path = getenv("DS4_TEST_PPL_CORPUS");
+    if (!corpus_path || !corpus_path[0]) corpus_path = "tests/test-vectors/ppl-corpus.txt";
+    const char *baseline_path = getenv("DS4_TEST_PPL_BASELINE");
+    if (!baseline_path || !baseline_path[0]) baseline_path = "tests/test-vectors/ppl-baseline.txt";
+
+    char *text = test_read_file(corpus_path);
+    TEST_ASSERT(text != NULL);
+    if (!text) return;
+
+    ds4_engine *engine = test_open_engine(false);
+    if (!engine) { free(text); return; }
+
+    ds4_tokens tokens = {0};
+    ds4_tokenize_text(engine, text, &tokens);
+    free(text);
+
+    const int prefix_len = 32;
+    TEST_ASSERT(tokens.len > prefix_len + 16);
+    if (tokens.len <= prefix_len + 16) { ds4_tokens_free(&tokens); ds4_engine_close(engine); return; }
+    const int scored = tokens.len - prefix_len;
+
+    ds4_session *session = NULL;
+    TEST_ASSERT(ds4_session_create(&session, engine, 8192) == 0);
+    if (!session) { ds4_tokens_free(&tokens); ds4_engine_close(engine); return; }
+
+    char err[160];
+    ds4_tokens prefix = {0};
+    for (int i = 0; i < prefix_len; i++) ds4_tokens_push(&prefix, tokens.v[i]);
+    const int sync_rc = ds4_session_sync(session, &prefix, err, sizeof(err));
+    ds4_tokens_free(&prefix);
+    TEST_ASSERT(sync_rc == 0);
+
+    double nll = 0.0;
+    bool ok = (sync_rc == 0);
+    for (int j = 0; ok && j < scored; j++) {
+        const int i = prefix_len + j;
+        ds4_token_score score;
+        if (!ds4_session_token_logprob(session, tokens.v[i], &score)) { ok = false; break; }
+        nll -= (double)score.logprob;
+        if (j + 1 < scored && ds4_session_eval(session, tokens.v[i], err, sizeof(err)) != 0) { ok = false; break; }
+    }
+    TEST_ASSERT(ok);
+
+    if (ok) {
+        const double avg_nll = nll / (double)scored;
+        const double ppl = exp(avg_nll);
+
+        double base_avg = 0.0, base_tol = 0.03;
+        int base_scored = 0;
+        FILE *bf = fopen(baseline_path, "r");
+        bool have_base = false;
+        if (bf) {
+            have_base = (fscanf(bf, "avg_nll=%lf scored=%d tol=%lf",
+                                &base_avg, &base_scored, &base_tol) == 3);
+            fclose(bf);
+        }
+        const bool want_write = getenv("DS4_TEST_PPL_WRITE_BASELINE") != NULL;
+
+        if (!have_base || want_write) {
+            FILE *wf = fopen(baseline_path, "w");
+            if (wf) {
+                fprintf(wf, "avg_nll=%.9f\nscored=%d\ntol=%.4f\n", avg_nll, scored, base_tol);
+                fclose(wf);
+                fprintf(stderr,
+                        "ds4-test: cuda-ppl baseline %s -> %s (avg_nll=%.9f ppl=%.6f scored=%d)\n",
+                        have_base ? "rewritten" : "written", baseline_path, avg_nll, ppl, scored);
+            } else {
+                fprintf(stderr, "ds4-test: cuda-ppl could not write baseline %s\n", baseline_path);
+                TEST_ASSERT(wf != NULL);
+            }
+        } else {
+            const double base_ppl = exp(base_avg);
+            const double delta = fabs(avg_nll - base_avg);
+            fprintf(stderr,
+                    "ds4-test: cuda-ppl avg_nll=%.9f ppl=%.6f (baseline avg_nll=%.9f ppl=%.6f) "
+                    "delta=%.6f tol=%.4f scored=%d/%d\n",
+                    avg_nll, ppl, base_avg, base_ppl, delta, base_tol, scored, base_scored);
+            /* A scored-count mismatch means the corpus or tokenizer moved -> the
+             * baseline is stale, not a model regression. Fail loud to force a regen. */
+            TEST_ASSERT(scored == base_scored);
+            TEST_ASSERT(delta < base_tol);
+        }
+    }
+
+    ds4_session_free(session);
+    ds4_tokens_free(&tokens);
+    ds4_engine_close(engine);
+#endif
+}
+
 static void test_mtp_correctness(void) {
 #ifdef __APPLE__
     fprintf(stderr, "ds4-test: mtp-correctness skipped (CUDA-only, Metal build)\n");
@@ -1874,6 +1981,7 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
     {"--cuda-tensor-equivalence", "cuda-tensor-equivalence", "CUDA vs CPU per-layer hidden-state RMS gate, localizes sub-argmax drift (skips on Metal)", test_cuda_tensor_equivalence},
+    {"--cuda-ppl", "cuda-ppl", "perplexity regression vs committed baseline on a fixed corpus (skips on Metal)", test_cuda_perplexity},
     {"--mtp-correctness", "mtp-correctness", "CUDA MTP combined vs exact verify logit-RMS gate (skips on Metal)", test_mtp_correctness},
     {"--mtp-selfconsistency", "mtp-selfconsistency", "CUDA MTP combined verify run-to-run determinism (twice-run bit-diff)", test_mtp_selfconsistency},
 #endif

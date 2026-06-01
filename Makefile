@@ -41,7 +41,7 @@ CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression token-diff cuda-tap-capture cuda-tap-regression
+.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression token-diff cuda-tap-capture cuda-tap-regression cuda-ppl cuda-ppl-baseline
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -162,6 +162,14 @@ cuda-tap-regression: ds4
 	@rm -rf /tmp/ds4-tap-cand && mkdir -p /tmp/ds4-tap-cand
 	DS4_CUDA_MOE_NO_ATOMIC_DOWN=1 DS4_CUDA_TAP_PREFIX=/tmp/ds4-tap-cand/tap ./ds4 $(TAP_ARGS) >/dev/null
 	python3 tools/cuda_tap_diff.py $(TAP_GOLDEN_DIR) /tmp/ds4-tap-cand
+
+# Perplexity regression gate: teacher-forced avg-NLL on a committed corpus vs a
+# committed baseline (tests/test-vectors/ppl-baseline.txt). One scale-free scalar
+# that integrates every layer's numeric drift. Determinism is forced in the test.
+cuda-ppl: ds4_test
+	./ds4_test --cuda-ppl
+cuda-ppl-baseline: ds4_test
+	DS4_TEST_PPL_WRITE_BASELINE=1 ./ds4_test --cuda-ppl
 
 # Shared library for in-process embedding via ctypes/cffi (Linux + CUDA).
 # Core engine API lives in ds4.c (+ ds4_cuda.cu); no server/cli objects needed.
