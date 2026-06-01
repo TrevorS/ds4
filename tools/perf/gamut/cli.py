@@ -41,7 +41,8 @@ def cmd_bench(a) -> int:
     cfg = BenchCfg(
         label=a.label, matrix=a.matrix, use_mtp=not a.no_mtp, use_temp=a.temp,
         iters=a.iter, ctx_start=a.ctx_start, ctx_max=a.ctx_max,
-        gen_tokens=a.gen_tokens, fast_verify=a.fast, prewarm=not a.no_prewarm)
+        gen_tokens=a.gen_tokens, fast_verify=a.fast, prewarm=not a.no_prewarm,
+        cooldown=not a.no_cooldown, cooldown_c=a.cooldown_c)
     if a.model:
         cfg.model = a.model
     if a.prompt_file:
@@ -170,6 +171,10 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--fast", action="store_true", help="DS4_CUDA_FAST_VERIFY=1")
     b.add_argument("--no-prewarm", action="store_true",
                    help="skip reading model+MTP into page cache before the cells")
+    b.add_argument("--no-cooldown", action="store_true",
+                   help="skip the between-cell GPU cooldown (anti-soak) wait")
+    b.add_argument("--cooldown-c", type=int, default=55,
+                   help="cool the GPU to <= this °C before each next cell (default 55)")
     b.set_defaults(fn=cmd_bench)
 
     r = sub.add_parser("report", help="analyze an existing nsys sqlite")

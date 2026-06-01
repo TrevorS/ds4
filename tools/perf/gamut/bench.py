@@ -24,8 +24,21 @@ MODEL_DEFAULT = str(Path.home() / "models/ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-APr
 MTP_DEFAULT = str(Path.home() / "models/ds4/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf")
 PROMPT_DEFAULT = str(ROOT / "tests/long_context_story_prompt.txt")
 
-# (name, use_mtp, use_temp)
-MATRIX_CELLS = [("plain", False, False), ("mtp-greedy", True, False), ("mtp-sample", True, True)]
+# (name, use_mtp, use_temp, fast_verify)
+# 4 decode paths × high-accuracy (deterministic verify, FAST_VERIFY off) vs
+# fast (DS4_CUDA_FAST_VERIFY=1). Grouped path-then-accuracy so each pair reads
+# adjacently in the summary. FAST_VERIFY also reshapes the *plain* path (heads8
+# dispatch + n=1 GEMM → cuBLAS), so it's a real dimension for plain too.
+MATRIX_CELLS = [
+    ("plain-greedy-acc",   False, False, False),
+    ("plain-greedy-fast",  False, False, True),
+    ("plain-sample-acc",   False, True,  False),
+    ("plain-sample-fast",  False, True,  True),
+    ("mtp-greedy-acc",     True,  False, False),
+    ("mtp-greedy-fast",    True,  False, True),
+    ("mtp-sample-acc",     True,  True,  False),
+    ("mtp-sample-fast",    True,  True,  True),
+]
 
 
 @dataclass
@@ -44,11 +57,15 @@ class BenchCfg:
     gen_tokens: int = 32
     fast_verify: bool = False
     prewarm: bool = True          # read model+MTP into page cache before the cells
+    cooldown: bool = True         # wait for the GPU to cool between cells (anti-soak)
+    cooldown_c: int = 55          # cool to <= this (°C) before the next cell starts
+    cooldown_max_s: int = 240     # cap the wait so a stuck sensor can't hang the run
     extra_env: dict | None = None
 
 
 def _cell_args(cfg: BenchCfg, use_mtp: bool, use_temp: bool, csv_path: str) -> list[str]:
-    a = ["--prompt-file", cfg.prompt_file, "-m", cfg.model,
+    a = ["--cuda", "--warm-weights", "--power", "85",
+         "--prompt-file", cfg.prompt_file, "-m", cfg.model,
          "--ctx-start", str(cfg.ctx_start), "--ctx-max", str(cfg.ctx_max),
          "--step-mul", str(cfg.step_mul), "--gen-tokens", str(cfg.gen_tokens)]
     if use_mtp:
@@ -120,6 +137,36 @@ def _prewarm_cache(paths: list[str]) -> None:
               f"in {time.time() - t0:.1f}s", flush=True)
 
 
+def _gpu_temp() -> float | None:
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=temperature.gpu",
+                              "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=10).stdout
+        return float(out.strip().splitlines()[0])
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
+
+
+def _cooldown(mon, target_c: int, max_s: int) -> None:
+    """Block until the GPU cools to <= target_c (capped at max_s). Back-to-back
+    cells otherwise heat-soak: the 8-cell matrix climbs to ~88°C and the firmware
+    throws sw_thermal throttle on the later cells, depressing their t/s. Each
+    cell's own ~4-min startup (warm-weights + device-copy) is only light load, so
+    it doesn't shed enough heat on its own — hence an explicit gate here."""
+    t = _gpu_temp()
+    if t is None or t <= target_c:
+        return
+    mon.set_stage("cooldown")
+    t0 = time.time()
+    while time.time() - t0 < max_s:
+        time.sleep(5)
+        t = _gpu_temp()
+        if t is None or t <= target_c:
+            break
+    print(f"## cooldown {time.time() - t0:.0f}s → {t}°C (target {target_c})", flush=True)
+    mon.set_stage("idle")
+
+
 def run(cfg: BenchCfg) -> dict:
     out = PERF / "runs" / cfg.label
     out.mkdir(parents=True, exist_ok=True)
@@ -129,16 +176,20 @@ def run(cfg: BenchCfg) -> dict:
     if cfg.prewarm:
         _prewarm_cache([cfg.model] + ([cfg.mtp] if cfg.use_mtp or cfg.matrix else []))
 
-    cells = MATRIX_CELLS if cfg.matrix else [("single", cfg.use_mtp, cfg.use_temp)]
-    env = dict(os.environ)
-    if cfg.fast_verify:
-        env["DS4_CUDA_FAST_VERIFY"] = "1"
+    cells = MATRIX_CELLS if cfg.matrix else [("single", cfg.use_mtp, cfg.use_temp, cfg.fast_verify)]
+    base_env = dict(os.environ)
     if cfg.extra_env:
-        env.update(cfg.extra_env)
+        base_env.update(cfg.extra_env)
 
     results: dict = {"label": cfg.label, "cells": {}}
     with GpuMonitor(str(out)) as mon:
-        for name, use_mtp, use_temp in cells:
+        for ci, (name, use_mtp, use_temp, fast) in enumerate(cells):
+            if ci > 0 and cfg.cooldown:
+                _cooldown(mon, cfg.cooldown_c, cfg.cooldown_max_s)
+            env = dict(base_env)
+            env.pop("DS4_CUDA_FAST_VERIFY", None)
+            if fast:
+                env["DS4_CUDA_FAST_VERIFY"] = "1"
             cell_rows = []
             for it in range(1, cfg.iters + 1):
                 stage = f"{name}#{it}"
@@ -147,7 +198,8 @@ def run(cfg: BenchCfg) -> dict:
                 cell_dir.mkdir(parents=True, exist_ok=True)
                 csv_path = str(cell_dir / "bench.csv")
                 log_path = str(cell_dir / "bench.log")
-                print(f"## [{stage}] {time.strftime('%H:%M:%S')}", flush=True)
+                print(f"## [{stage}] {time.strftime('%H:%M:%S')} "
+                      f"(verify={'fast' if fast else 'det'})", flush=True)
                 with open(log_path, "w") as lf:
                     rc = subprocess.run([ds4_bench, *_cell_args(cfg, use_mtp, use_temp, csv_path)],
                                         env=env, stdout=lf, stderr=subprocess.STDOUT).returncode
@@ -190,7 +242,7 @@ def _render_summary(results: dict, mon: dict) -> str:
     L = [f"# gamut bench · {results['label']}", ""]
     for name, ctxs in results["cells"].items():
         parts = [f"{c // 1024}k:{d['gen_tps']}(n{d['n']})" for c, d in ctxs.items()]
-        L.append(f"{name:12} decode  " + "  ".join(parts))
+        L.append(f"{name:18} decode  " + "  ".join(parts))
     L.append("")
     g = mon.get("busy") or {}
     if g:
