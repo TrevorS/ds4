@@ -57,9 +57,28 @@ _COLS = ["ts", "ts_iso", "label", "phase", "hw", "code_id", "binary_sha", "flags
          "peak_bw_gbps", "digest", "kernels_json", "report_json", "source_path"]
 
 
+# Columns that may be absent in a runs.db created by an older schema. CREATE
+# TABLE IF NOT EXISTS won't add them, so _migrate ALTER-ADDs any that are
+# missing (SQLite adds them nullable, no rewrite). Keep in sync with the schema.
+_MIGRATE_COLS = {
+    "kvcache_mb": "REAL", "accept_pct": "REAL", "combined_total_ms": "REAL",
+    "verify_ms": "REAL", "tokens_per_iter": "REAL", "peak_bw_gbps": "REAL",
+    "kernels_json": "TEXT", "report_json": "TEXT", "source_path": "TEXT",
+}
+
+
+def _migrate(con: sqlite3.Connection) -> None:
+    have = {r[1] for r in con.execute("PRAGMA table_info(runs)")}
+    for name, typ in _MIGRATE_COLS.items():
+        if name not in have:
+            con.execute(f"ALTER TABLE runs ADD COLUMN {name} {typ}")
+    con.commit()
+
+
 def connect(db: str) -> sqlite3.Connection:
     con = sqlite3.connect(db)
     con.executescript(SCHEMA)
+    _migrate(con)
     return con
 
 
