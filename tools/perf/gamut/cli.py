@@ -41,7 +41,7 @@ def cmd_bench(a) -> int:
     cfg = BenchCfg(
         label=a.label, matrix=a.matrix, use_mtp=not a.no_mtp, use_temp=a.temp,
         iters=a.iter, ctx_start=a.ctx_start, ctx_max=a.ctx_max,
-        gen_tokens=a.gen_tokens, fast_verify=a.fast)
+        gen_tokens=a.gen_tokens, fast_verify=a.fast, prewarm=not a.no_prewarm)
     if a.model:
         cfg.model = a.model
     if a.prompt_file:
@@ -168,6 +168,8 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--ctx-max", type=int, default=32768)
     b.add_argument("--gen-tokens", type=int, default=32)
     b.add_argument("--fast", action="store_true", help="DS4_CUDA_FAST_VERIFY=1")
+    b.add_argument("--no-prewarm", action="store_true",
+                   help="skip reading model+MTP into page cache before the cells")
     b.set_defaults(fn=cmd_bench)
 
     r = sub.add_parser("report", help="analyze an existing nsys sqlite")

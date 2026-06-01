@@ -43,6 +43,7 @@ class BenchCfg:
     step_mul: int = 2
     gen_tokens: int = 32
     fast_verify: bool = False
+    prewarm: bool = True          # read model+MTP into page cache before the cells
     extra_env: dict | None = None
 
 
@@ -94,12 +95,39 @@ def _fit_prompt(prompt_file: str, ctx_max: int, out_dir: Path) -> str:
     return str(stitched)
 
 
+def _prewarm_cache(paths: list[str]) -> None:
+    """Sequentially read the model/MTP files into the OS page cache once, so the
+    per-cell ds4-bench reloads hit cache instead of faulting ~80 GB from disk.
+    The matrix spawns a fresh process per cell (model loads each time); without
+    this the first cell pays a ~5-minute cold device-copy and later cells re-fault
+    if the cache got churned. Turns the 9x-cold tax into 1x. Best-effort."""
+    seen = set()
+    for p in paths:
+        rp = os.path.realpath(p)
+        if not p or rp in seen or not os.path.exists(rp):
+            continue
+        seen.add(rp)
+        gib = os.path.getsize(rp) / (1 << 30)
+        t0 = time.time()
+        try:
+            with open(rp, "rb", buffering=0) as f:
+                while f.read(1 << 24):   # 16 MiB chunks; kernel reads ahead into cache
+                    pass
+        except OSError as e:
+            print(f"## prewarm skipped {os.path.basename(rp)}: {e}", flush=True)
+            continue
+        print(f"## prewarmed {os.path.basename(rp)} ({gib:.1f} GiB) into page cache "
+              f"in {time.time() - t0:.1f}s", flush=True)
+
+
 def run(cfg: BenchCfg) -> dict:
     out = PERF / "runs" / cfg.label
     out.mkdir(parents=True, exist_ok=True)
     ds4_bench = str(ROOT / "ds4-bench")
     Path("/tmp/ds4.lock").unlink(missing_ok=True)
     cfg.prompt_file = _fit_prompt(cfg.prompt_file, cfg.ctx_max, out)
+    if cfg.prewarm:
+        _prewarm_cache([cfg.model] + ([cfg.mtp] if cfg.use_mtp or cfg.matrix else []))
 
     cells = MATRIX_CELLS if cfg.matrix else [("single", cfg.use_mtp, cfg.use_temp)]
     env = dict(os.environ)
