@@ -97,30 +97,41 @@ Environment variables (perf / observability):
 
 ### Benchmarks (GB10 / DGX Spark)
 
-Reproduce the full 3-cell decode matrix (plain · MTP-greedy · MTP-sample), 3 iterations each at 4k–32k context (`--fast` = the Spark `DS4_CUDA_FAST_VERIFY` path):
+Reproduce the full 8-cell decode matrix — four paths (plain / MTP × greedy / sample) crossed with the accuracy dial (high-accuracy deterministic verify vs the `DS4_CUDA_FAST_VERIFY` Spark fast path) — at 4k–32k context. The matrix sets the accuracy mode per-cell and cools the GPU to ≤55 °C between cells (anti-soak), so one run captures the whole grid:
 
 ```sh
-tools/perf/gamut-cli bench --label decode-matrix --matrix --iter 3 --fast
+tools/perf/gamut-cli bench --label decode-matrix --matrix --iter 1 --gen-tokens 256
 ```
 
-Or a single-cell sanity check (1 iter, same ctx sweep):
+Or a single-cell sanity check (plain, fast path, same ctx sweep):
 
 ```sh
-tools/perf/gamut-cli bench --label sanity --fast
+tools/perf/gamut-cli bench --label sanity --no-mtp --fast
 ```
 
-Defaults the wrapper bakes in: model `DeepSeek-V4-Flash-IQ2XXS` chat-v2, draft `DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32` with `--mtp-draft 2`, prompt `tests/long_context_story_prompt.txt` (auto-stitched to fit `--ctx-max`), `--gen-tokens 32`, ctx sweep `--ctx-start 4096 --ctx-max 32768 --step-mul 2`; the sample cell adds `--temp 1.0 --top-p 0.95 --seed 1234`. Per-cell GPU/CPU/throttle monitors stream into `tools/perf/runs/<label>/` alongside the bench CSVs.
+Defaults the wrapper bakes in: model `DeepSeek-V4-Flash-IQ2XXS` chat-v2, draft `DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32` with `--mtp-draft 2`, core flags `--cuda --warm-weights --power 85`, prompt `tests/long_context_story_prompt.txt` (auto-stitched to fit `--ctx-max`), ctx sweep `--ctx-start 4096 --ctx-max 32768 --step-mul 2`; sample cells add `--temp 1.0 --top-p 0.95 --seed 1234`. Per-cell GPU/CPU/throttle monitors stream into `tools/perf/runs/<label>/` alongside the bench CSVs. (`--no-cooldown` / `--cooldown-c N` tune the between-cell cooldown.)
 
-**Decode t/s** (median of 3 iters per cell, `tools/perf/runs/thermal-matrix/`):
+**Decode t/s** (`--gen-tokens 256` steady-state, cooled between cells, `tools/perf/runs/readme-matrix/`). MTP `(N×)` is the speedup over plain in the same mode.
 
-| context | plain | mtp-greedy   | mtp-sample   |
-| ------: | ----: | -----------: | -----------: |
-|   4,096 |  14.4 | 21.7 (1.50×) | 18.1 (1.25×) |
-|   8,192 |  14.4 | 22.1 (1.54×) | 20.6 (1.43×) |
-|  16,384 |  14.2 | 20.7 (1.45×) | 19.8 (1.39×) |
-|  32,768 |  13.2 | 20.0 (1.51×) | 17.4 (1.32×) |
+Fast path (`DS4_CUDA_FAST_VERIFY=1` — the Spark default):
 
-MTP-greedy holds ~1.5× across the whole ctx range; MTP-sample stays in the 1.25–1.43× band (slightly lower at the extremes where spec-sampling acceptance and the qsort-sampler path pull against each other). Prefill is identical across cells (340–400 t/s at 4k–32k) — MTP doesn't affect prefill.
+| context | plain-greedy | plain-sample | mtp-greedy   | mtp-sample   |
+| ------: | -----------: | -----------: | -----------: | -----------: |
+|   4,096 |         12.7 |         12.6 | 21.3 (1.68×) | 18.8 (1.49×) |
+|   8,192 |         12.6 |         12.4 | 21.2 (1.68×) | 18.8 (1.52×) |
+|  16,384 |         12.4 |         12.2 | 20.7 (1.67×) | 18.9 (1.55×) |
+|  32,768 |         11.6 |         11.4 | 19.9 (1.72×) | 17.9 (1.57×) |
+
+High-accuracy path (deterministic bit-exact verify — the default; gates run here):
+
+| context | plain-greedy | plain-sample | mtp-greedy   | mtp-sample   |
+| ------: | -----------: | -----------: | -----------: | -----------: |
+|   4,096 |          9.7 |          9.6 | 18.8 (1.94×) | 16.0 (1.67×) |
+|   8,192 |          9.5 |          9.5 | 18.7 (1.97×) | 16.1 (1.69×) |
+|  16,384 |          9.4 |          9.4 | 18.3 (1.95×) | 15.7 (1.67×) |
+|  32,768 |          8.9 |          8.8 | 16.9 (1.90×) | 15.1 (1.72×) |
+
+The fast path buys **~30 % plain decode, ~13 % MTP decode, and ~55 % prefill** over deterministic verify (greedy output is bit-identical between the two — determinism only changes sampled-path fidelity, validated by the `mtp-correctness`/`mtp-selfconsistency` gates). MTP-greedy holds **~1.7× over plain** across the whole ctx range on the fast path (and ~1.9× on the accuracy path, where the determinism tax falls harder on plain). Plain decode is memory-bandwidth-bound (≈12.7 t/s × ~18.9 GB/token ≈ the measured 236 GB/s LPDDR5X read ceiling) — MTP is the only lever past it, by amortizing the per-token weight read across accepted drafts. Prefill is identical across decode paths (~350 t/s fast, ~228 t/s deterministic at 4k–32k) — MTP doesn't affect prefill.
 
 **Long-context decode** (MTP-greedy, `--mtp-draft 2 --power 85`, KV-restore single-context points, 2026-05-29):
 
