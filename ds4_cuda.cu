@@ -1518,15 +1518,19 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
  * can localize numerical drift to a specific kernel x layer (today drift hunts
  * are a manual binary search). The four fields:
  *   sum       - f64-accumulated sum of the f32 values (fp-tolerant signal)
+ *   sumsq     - f64 sum of squares; sqrt(sumsq/n) is the per-tensor RMS
+ *               magnitude, which (unlike sum) does NOT cancel under symmetric
+ *               drift — the load-bearing soft-drift signal for the tap-diff gate
  *   amax      - max(|value|)                          (fp-tolerant signal)
  *   nan_count - count of NaN/Inf elements             (fp-tolerant signal)
  *   byte_xor  - u32 XOR of the raw 32-bit element bits (bit-EXACT only)
  * NOTE: byte_xor is bit-exact-only. It false-fires on benign reduction-order
  * differences (e.g. atomic-down accumulation order), so it is ONLY meaningful
  * for bit-equality replay checks. The load-bearing fp-tolerant drift signals
- * are sum/amax/nan_count; treat byte_xor as a strict equality tripwire. */
+ * are sum/sumsq/amax/nan_count; treat byte_xor as a strict equality tripwire. */
 struct ds4_cuda_fingerprint {
     double   sum;        /* f64 accumulator over f32 values */
+    double   sumsq;      /* f64 accumulator of v*v (per-tensor L2 / RMS) */
     float    amax;       /* max abs value */
     uint32_t nan_count;  /* count of !isfinite elements */
     uint32_t byte_xor;   /* xor of raw 32-bit element bit patterns */
@@ -1536,11 +1540,13 @@ struct ds4_cuda_fingerprint {
 __global__ static void fingerprint_reduce_kernel(const float *x, uint64_t n,
                                                   ds4_cuda_fingerprint *out) {
     __shared__ double s_sum[256];
+    __shared__ double s_sumsq[256];
     __shared__ float  s_amax[256];
     __shared__ uint32_t s_nan[256];
     __shared__ uint32_t s_xor[256];
     const uint32_t t = threadIdx.x;
     double   l_sum = 0.0;
+    double   l_sumsq = 0.0;
     float    l_amax = 0.0f;
     uint32_t l_nan = 0u;
     uint32_t l_xor = 0u;
@@ -1551,18 +1557,21 @@ __global__ static void fingerprint_reduce_kernel(const float *x, uint64_t n,
         memcpy(&bits, &v, sizeof(bits));
         l_xor ^= bits;
         if (isfinite(v)) {
-            l_sum += (double)v;
+            const double dv = (double)v;
+            l_sum += dv;
+            l_sumsq += dv * dv;
             const float a = fabsf(v);
             if (a > l_amax) l_amax = a;
         } else {
             l_nan++;
         }
     }
-    s_sum[t] = l_sum; s_amax[t] = l_amax; s_nan[t] = l_nan; s_xor[t] = l_xor;
+    s_sum[t] = l_sum; s_sumsq[t] = l_sumsq; s_amax[t] = l_amax; s_nan[t] = l_nan; s_xor[t] = l_xor;
     __syncthreads();
     for (uint32_t stride = blockDim.x / 2u; stride > 0u; stride >>= 1) {
         if (t < stride) {
             s_sum[t] += s_sum[t + stride];
+            s_sumsq[t] += s_sumsq[t + stride];
             if (s_amax[t + stride] > s_amax[t]) s_amax[t] = s_amax[t + stride];
             s_nan[t] += s_nan[t + stride];
             s_xor[t] ^= s_xor[t + stride];
@@ -1571,6 +1580,7 @@ __global__ static void fingerprint_reduce_kernel(const float *x, uint64_t n,
     }
     if (t == 0u) {
         atomicAdd(&out->sum, s_sum[0]);
+        atomicAdd(&out->sumsq, s_sumsq[0]);
         atomicMax((int *)&out->amax, __float_as_int(s_amax[0]));  /* amax >= 0 so int order == float order */
         atomicAdd(&out->nan_count, s_nan[0]);
         atomicXor(&out->byte_xor, s_xor[0]);
@@ -1632,11 +1642,12 @@ extern "C" int ds4_gpu_fingerprint_tap_f32(const ds4_gpu_tensor *t, uint64_t n_f
     snprintf(path, sizeof(path), "%s_%s_L%u_p%u.fp", prefix, tag, layer, pos);
     FILE *f = fopen(path, "a");
     if (!f) return 0;
-    /* One line per fingerprint: sum amax nan xor count. sum/amax/nan are the
-     * fp-tolerant drift signals; xor is the bit-exact equality tripwire. */
-    fprintf(f, "tag=%s L=%u pos=%u n=%llu sum=%.9g amax=%.9g nan=%u xor=0x%08x\n",
+    /* One line per fingerprint: sum sumsq amax nan xor. sum/sumsq/amax/nan are
+     * the fp-tolerant drift signals (sqrt(sumsq/n) is the per-tensor RMS); xor
+     * is the bit-exact equality tripwire. */
+    fprintf(f, "tag=%s L=%u pos=%u n=%llu sum=%.9g sumsq=%.9g amax=%.9g nan=%u xor=0x%08x\n",
             tag, layer, pos, (unsigned long long)n_f32,
-            h_fp.sum, (double)h_fp.amax, h_fp.nan_count, h_fp.byte_xor);
+            h_fp.sum, h_fp.sumsq, (double)h_fp.amax, h_fp.nan_count, h_fp.byte_xor);
     fclose(f);
     return 1;
 }

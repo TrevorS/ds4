@@ -561,6 +561,18 @@ int main(int argc, char **argv) {
     {
         const char *tdpath = getenv("DS4_BENCH_TOKEN_DUMP");
         if (tdpath && tdpath[0]) {
+            /* Greedy token-diff is only a valid gate if the MoE down-proj is
+             * deterministic: with scheduling-order atomicAdd (the n_tokens>=128
+             * default) f32 rounding can flip argmax run-to-run, which has
+             * false-reverted good changes (C13/C20). Force the ordered path so
+             * an operator can't forget. overwrite=0 respects an explicit
+             * DS4_CUDA_MOE_NO_ATOMIC_DOWN=0 for those intentionally testing the
+             * nondeterministic path. */
+            if (!getenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN")) {
+                setenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN", "1", 0);
+                fprintf(stderr, "ds4-bench: DS4_CUDA_MOE_NO_ATOMIC_DOWN=1 auto-set "
+                                "(token-diff requested; ordered MoE down for determinism)\n");
+            }
             tdump = fopen(tdpath, "w");
             if (!tdump)
                 fprintf(stderr, "ds4-bench: token dump open %s: %s\n", tdpath, strerror(errno));

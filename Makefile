@@ -41,7 +41,7 @@ CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression
+.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression token-diff cuda-tap-capture cuda-tap-regression
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -127,6 +127,41 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu
 
 cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
+
+# Two-shot greedy token-diff determinism gate. ds4-bench auto-sets
+# DS4_CUDA_MOE_NO_ATOMIC_DOWN=1 whenever DS4_BENCH_TOKEN_DUMP is present, so a
+# re-run of the same command must produce a byte-identical token stream.
+# Override TOKEN_DIFF_ARGS to point at your model / MTP / KV anchor.
+TOKEN_DIFF_ARGS ?= --cuda --warm-weights -m ds4flash.gguf --gen-tokens 32 --temp 0
+token-diff: ds4-bench
+	DS4_BENCH_TOKEN_DUMP=/tmp/ds4-tokdiff-a.txt ./ds4-bench $(TOKEN_DIFF_ARGS)
+	DS4_BENCH_TOKEN_DUMP=/tmp/ds4-tokdiff-b.txt ./ds4-bench $(TOKEN_DIFF_ARGS)
+	@diff -u /tmp/ds4-tokdiff-a.txt /tmp/ds4-tokdiff-b.txt \
+		&& echo "token-diff: OK (deterministic)" \
+		|| { echo "token-diff: MISMATCH — nondeterministic decode"; exit 1; }
+
+# CUDA fingerprint-tap regression gate (ds4_gpu_fingerprint_tap_f32). Capture
+# per-layer tap fingerprints for a fixed prompt into a committed golden dir;
+# cuda-tap-regression re-captures and diffs (bit-exact byte_xor + soft RMS).
+# byte_xor is per-binary/per-arch (GB10 sm_121a) — golden lives under the
+# arch-tagged dir. Override TAP_ARGS for your model.
+TAP_GOLDEN_DIR ?= tests/golden/cuda-taps-gb10
+TAP_ARGS       ?= --cuda -m ds4flash.gguf -p "The quick brown fox jumps over the lazy dog." -n 4 --temp 0
+cuda-tap-capture: ds4
+	@mkdir -p $(TAP_GOLDEN_DIR)
+	@rm -f $(TAP_GOLDEN_DIR)/*.fp
+	DS4_CUDA_MOE_NO_ATOMIC_DOWN=1 DS4_CUDA_TAP_PREFIX=$(TAP_GOLDEN_DIR)/tap ./ds4 $(TAP_ARGS) >/dev/null
+	@# Consolidate the per-(tag,layer,pos) files into one git-friendly golden,
+	@# dropping ffn_moe_gate — a debug-materialize-only scratch tap that is stale
+	@# (nondeterministic) in a normal decode forward. The differ ignores it too
+	@# (tools/cuda_tap_diff.py DEFAULT_IGNORE_TAGS is the policy source of truth);
+	@# we just keep the committed baseline to gateable signals only.
+	@grep -hv 'tag=ffn_moe_gate ' $(TAP_GOLDEN_DIR)/tap_*.fp > $(TAP_GOLDEN_DIR)/golden.fp && rm -f $(TAP_GOLDEN_DIR)/tap_*.fp
+	@echo "cuda-tap-capture: golden -> $(TAP_GOLDEN_DIR)/golden.fp ($$(wc -l < $(TAP_GOLDEN_DIR)/golden.fp) taps, ffn_moe_gate excluded)"
+cuda-tap-regression: ds4
+	@rm -rf /tmp/ds4-tap-cand && mkdir -p /tmp/ds4-tap-cand
+	DS4_CUDA_MOE_NO_ATOMIC_DOWN=1 DS4_CUDA_TAP_PREFIX=/tmp/ds4-tap-cand/tap ./ds4 $(TAP_ARGS) >/dev/null
+	python3 tools/cuda_tap_diff.py $(TAP_GOLDEN_DIR) /tmp/ds4-tap-cand
 
 # Shared library for in-process embedding via ctypes/cffi (Linux + CUDA).
 # Core engine API lives in ds4.c (+ ds4_cuda.cu); no server/cli objects needed.

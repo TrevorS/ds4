@@ -195,6 +195,19 @@ int ds4_mtp_selfconsistency_selftest(ds4_session *s,
                                      double *out_maxabs,
                                      double *out_rms,
                                      int *out_top_stable);
+/* CUDA per-layer tensor-equivalence gate (CUDA-only).  Teacher-forces a single-
+ * token decode forward layer by layer and RMS/max-abs-diffs each GPU layer's
+ * post-FFN state against the CPU reference, localizing sub-argmax drift to the
+ * first diverging layer.  Returns the number of layers exceeding tolerance
+ * (0 = pass); optional out params report worst RMS / max-abs, first failing
+ * layer (-1 if none), and the non-finite GPU element count. */
+int ds4_cuda_tensor_equivalence_selftest(ds4_session *s,
+                                         double rms_tol,
+                                         double max_abs_tol,
+                                         double *out_worst_rms,
+                                         double *out_worst_max_abs,
+                                         int *out_first_fail_layer,
+                                         int *out_nonfinite);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt);

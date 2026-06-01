@@ -1634,6 +1634,59 @@ static void test_tool_call_quality(void) {
  *
  * Skips on Metal/Apple: the divergence and fix are CUDA-batched-attention
  * specific. */
+static void test_cuda_tensor_equivalence(void) {
+#ifdef __APPLE__
+    fprintf(stderr, "ds4-test: cuda-tensor-equivalence skipped (CUDA-only, Metal build)\n");
+    return;
+#else
+    ds4_engine *engine = test_open_engine(false);
+    if (!engine) return;
+
+    /* A short prompt suffices: the gate runs its own teacher-forced single-token
+     * forward off the first checkpoint token, independent of prefill KV depth. */
+    ds4_tokens prompt = {0};
+    ds4_tokenize_text(engine, "The quick brown fox jumps over the lazy dog.", &prompt);
+    TEST_ASSERT(prompt.len >= 1);
+
+    ds4_session *session = NULL;
+    TEST_ASSERT(ds4_session_create(&session, engine, 8192) == 0);
+    if (!session) {
+        ds4_tokens_free(&prompt);
+        ds4_engine_close(engine);
+        return;
+    }
+
+    char err[160];
+    TEST_ASSERT(ds4_session_sync(session, &prompt, err, sizeof(err)) == 0);
+
+    /* Scale-invariant (relative-to-reference-RMS) tolerances on the per-layer
+     * hidden-channel state. Measured clean-run noise floor on GB10 is worst
+     * rel_rms ~0.005 / rel_max ~0.039 across all 43 layers; the committed
+     * defaults sit ~10x above that and far below the relative drift a real
+     * kernel regression (the ~0.2 absolute-RMS class) would produce.
+     * Overridable for calibration via DS4_TEST_TE_{RMS,MAX}_TOL. */
+    double rms_tol = 0.05, max_abs_tol = 0.5;
+    const char *rt = getenv("DS4_TEST_TE_RMS_TOL"); if (rt && rt[0]) rms_tol = atof(rt);
+    const char *mt = getenv("DS4_TEST_TE_MAX_TOL"); if (mt && mt[0]) max_abs_tol = atof(mt);
+
+    double worst_rms = 0.0, worst_max = 0.0;
+    int first_fail = -1, nonfinite = 0;
+    const int fails = ds4_cuda_tensor_equivalence_selftest(
+        session, rms_tol, max_abs_tol, &worst_rms, &worst_max, &first_fail, &nonfinite);
+    fprintf(stderr,
+            "ds4-test: cuda-tensor-equivalence fails=%d worst_rms=%g worst_max=%g "
+            "first_fail_layer=%d nonfinite=%d (rms_tol=%g max_tol=%g)\n",
+            fails, worst_rms, worst_max, first_fail, nonfinite, rms_tol, max_abs_tol);
+    TEST_ASSERT(nonfinite == 0);
+    TEST_ASSERT(first_fail < 0);
+    TEST_ASSERT(fails == 0);
+
+    ds4_session_free(session);
+    ds4_tokens_free(&prompt);
+    ds4_engine_close(engine);
+#endif
+}
+
 static void test_mtp_correctness(void) {
 #ifdef __APPLE__
     fprintf(stderr, "ds4-test: mtp-correctness skipped (CUDA-only, Metal build)\n");
@@ -1820,6 +1873,7 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
+    {"--cuda-tensor-equivalence", "cuda-tensor-equivalence", "CUDA vs CPU per-layer hidden-state RMS gate, localizes sub-argmax drift (skips on Metal)", test_cuda_tensor_equivalence},
     {"--mtp-correctness", "mtp-correctness", "CUDA MTP combined vs exact verify logit-RMS gate (skips on Metal)", test_mtp_correctness},
     {"--mtp-selfconsistency", "mtp-selfconsistency", "CUDA MTP combined verify run-to-run determinism (twice-run bit-diff)", test_mtp_selfconsistency},
 #endif
