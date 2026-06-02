@@ -173,7 +173,7 @@ def main():
 
     head = MM.DeepseekV4MtpHead.from_pt(dtype=dtype).to(device)
     head.freeze_for_finetune()
-    head.decoder.gradient_checkpointing = True
+    head.enable_grad_ckpt()
     head.train()
     n_train = sum(p.numel() for p in head.trainable_parameters())
     print(f"trainable params: {n_train / 1e6:.1f}M (experts frozen)")

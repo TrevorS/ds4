@@ -97,6 +97,18 @@ class DeepseekV4MtpHead(nn.Module):
         self.decoder.mlp.experts.requires_grad_(False)  # freeze the 256 routed experts
         # embed/output_w are buffers (no grad); nothing else to do.
 
+    def enable_grad_ckpt(self):
+        """Wire gradient checkpointing on the bare DecoderLayer. The model-level
+        gradient_checkpointing_enable() (which sets _gradient_checkpointing_func)
+        isn't available on a standalone GradientCheckpointingLayer, so set both."""
+        import functools
+        from torch.utils.checkpoint import checkpoint
+
+        self.decoder.gradient_checkpointing = True
+        self.decoder._gradient_checkpointing_func = functools.partial(
+            checkpoint, use_reentrant=False
+        )
+
     def trainable_parameters(self):
         return [p for p in self.parameters() if p.requires_grad]
 
