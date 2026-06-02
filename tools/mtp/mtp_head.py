@@ -12,6 +12,7 @@ Weight map is ~1:1 (see ATTN_MAP); only the routed experts need stacking
 (gate_up_proj[e] = cat([w1,w3]); down_proj[e] = w2 — F.linear convention, no
 transpose). Validated: load_state_dict(strict=True) with zero missing/unexpected.
 """
+
 from __future__ import annotations
 import json
 import sys
@@ -24,9 +25,12 @@ if _FORK not in sys.path:
 from transformers.models.deepseek_v4 import modeling_deepseek_v4 as M  # noqa: E402
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config  # noqa: E402
 
-SNAP = ("/home/trevor/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/"
-        "snapshots/6c858e71890b508e4f3fd6491f45b325580ba934")
+SNAP = (
+    "/home/trevor/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/"
+    "snapshots/6c858e71890b508e4f3fd6491f45b325580ba934"
+)
 MTP_PT = "/home/trevor/Projects/spark-vllm/mv0/mtp_bf16.pt"
+BASE_GGUF = "/home/trevor/Projects/ds4/ds4flash.gguf"
 MTP_LAYER = 43
 N_EXPERTS = 256
 
@@ -47,30 +51,52 @@ ATTN_MAP = {
     "mlp.shared_experts.down_proj.weight": "ffn.shared_experts.w2.weight",
     "input_layernorm.weight": "attn_norm.weight",
     "post_attention_layernorm.weight": "ffn_norm.weight",
-    "attn_hc.fn": "hc_attn_fn", "attn_hc.base": "hc_attn_base", "attn_hc.scale": "hc_attn_scale",
-    "ffn_hc.fn": "hc_ffn_fn", "ffn_hc.base": "hc_ffn_base", "ffn_hc.scale": "hc_ffn_scale",
+    "attn_hc.fn": "hc_attn_fn",
+    "attn_hc.base": "hc_attn_base",
+    "attn_hc.scale": "hc_attn_scale",
+    "ffn_hc.fn": "hc_ffn_fn",
+    "ffn_hc.base": "hc_ffn_base",
+    "ffn_hc.scale": "hc_ffn_scale",
 }
 # nextn glue (lives on the wrapper, not the DecoderLayer)
-GLUE = ["enorm.weight", "hnorm.weight", "e_proj.weight", "h_proj.weight", "norm.weight",
-        "hc_head_fn", "hc_head_base", "hc_head_scale"]
+GLUE = [
+    "enorm.weight",
+    "hnorm.weight",
+    "e_proj.weight",
+    "h_proj.weight",
+    "norm.weight",
+    "hc_head_fn",
+    "hc_head_base",
+    "hc_head_scale",
+]
 
 
 def build_config() -> DeepseekV4Config:
     cfg = DeepseekV4Config(**json.load(open(f"{SNAP}/config.json")))
-    cfg.layer_types = list(cfg.layer_types) + ["sliding_attention"]
-    cfg.mlp_layer_types = list(cfg.mlp_layer_types) + ["moe"]
+    assert cfg.layer_types is not None and cfg.mlp_layer_types is not None
+    cfg.layer_types = [*cfg.layer_types, "sliding_attention"]
+    cfg.mlp_layer_types = [*cfg.mlp_layer_types, "moe"]
     return cfg
 
 
 def build_decoder_state(sd: dict, dtype=torch.bfloat16) -> dict:
     """mtp_bf16.pt -> DeepseekV4DecoderLayer state_dict (experts stacked)."""
-    g = lambda k: sd["mtp.0." + k].to(dtype)
+
+    def g(k):
+        return sd["mtp.0." + k].to(dtype)
+
     out = {dk: g(sk) for dk, sk in ATTN_MAP.items()}
     out["mlp.experts.gate_up_proj"] = torch.stack(
-        [torch.cat([g(f"ffn.experts.{i}.w1.weight"), g(f"ffn.experts.{i}.w3.weight")], 0)
-         for i in range(N_EXPERTS)])
+        [
+            torch.cat(
+                [g(f"ffn.experts.{i}.w1.weight"), g(f"ffn.experts.{i}.w3.weight")], 0
+            )
+            for i in range(N_EXPERTS)
+        ]
+    )
     out["mlp.experts.down_proj"] = torch.stack(
-        [g(f"ffn.experts.{i}.w2.weight") for i in range(N_EXPERTS)])
+        [g(f"ffn.experts.{i}.w2.weight") for i in range(N_EXPERTS)]
+    )
     return out
 
 
@@ -79,14 +105,18 @@ def load_head(dtype=torch.bfloat16):
     cfg = build_config()
     sd = torch.load(MTP_PT, map_location="cpu", mmap=True, weights_only=True)
     layer = M.DeepseekV4DecoderLayer(cfg, MTP_LAYER).to(dtype)
-    missing, unexpected = layer.load_state_dict(build_decoder_state(sd, dtype), strict=False)
+    missing, unexpected = layer.load_state_dict(
+        build_decoder_state(sd, dtype), strict=False
+    )
     glue = {k: sd["mtp.0." + k].to(dtype) for k in GLUE}
     return layer, glue, cfg, missing, unexpected
 
 
 if __name__ == "__main__":
     layer, glue, cfg, missing, unexpected = load_head()
-    print(f"DecoderLayer loaded: {sum(p.numel() for p in layer.parameters())/1e9:.2f}B params")
+    print(
+        f"DecoderLayer loaded: {sum(p.numel() for p in layer.parameters()) / 1e9:.2f}B params"
+    )
     print(f"  missing   = {list(missing)}")
     print(f"  unexpected= {list(unexpected)}")
     print(f"  glue loaded = {sorted(glue)}")

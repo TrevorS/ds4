@@ -15,7 +15,10 @@ plumbing of a reimpl is faithful (stage 1 of the FastMTP de-risk). No torch.
 
 Usage: validate_projection.py <dump.bin> [--base ds4flash.gguf] [--mtp MTP.gguf]
 """
-import argparse, struct, sys
+
+import argparse
+import struct
+import sys
 import numpy as np
 
 FORK = "/home/trevor/Projects/llama.cpp-tjs-fork/gguf-py"
@@ -37,8 +40,10 @@ def kv_float(reader, *names, default):
     for n in names:
         f = reader.fields.get(n)
         if f is not None:
-            try: return float(f.contents())
-            except Exception: pass
+            try:
+                return float(f.contents())
+            except Exception:
+                pass
     return default
 
 
@@ -50,7 +55,7 @@ def rmsnorm(x, w, eps):
 
 def rel_rms(a, b):
     num = np.sqrt(np.mean((a - b) ** 2))
-    den = np.sqrt(np.mean(b ** 2)) + 1e-12
+    den = np.sqrt(np.mean(b**2)) + 1e-12
     return float(num / den)
 
 
@@ -58,24 +63,33 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dump")
     ap.add_argument("--base", default="ds4flash.gguf")
-    ap.add_argument("--mtp", default="/home/trevor/models/ds4/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf")
+    ap.add_argument(
+        "--mtp",
+        default="/home/trevor/models/ds4/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf",
+    )
     ap.add_argument("--max-records", type=int, default=8)
     args = ap.parse_args()
 
     base = GGUFReader(args.base)
     mtp = GGUFReader(args.mtp)
-    eps = kv_float(base, "deepseek4.attention.layer_norm_rms_epsilon",
-                   "deepseek2.attention.layer_norm_rms_epsilon", default=1e-6)
+    eps = kv_float(
+        base,
+        "deepseek4.attention.layer_norm_rms_epsilon",
+        "deepseek2.attention.layer_norm_rms_epsilon",
+        default=1e-6,
+    )
     print(f"rms_eps = {eps}")
 
-    embed, _ = deq(base, "token_embd.weight")             # [N_VOCAB, N_EMBD] flat
+    embed, _ = deq(base, "token_embd.weight")  # [N_VOCAB, N_EMBD] flat
     enorm, _ = deq(mtp, "mtp.0.enorm.weight")
     hnorm, _ = deq(mtp, "mtp.0.hnorm.weight")
     eproj, eproj_shape = deq(mtp, "mtp.0.e_proj.weight")
     hproj, hproj_shape = deq(mtp, "mtp.0.h_proj.weight")
     n_embd = enorm.shape[0]
-    embed = embed.reshape(-1, n_embd)                      # [N_VOCAB, N_EMBD]
-    print(f"shapes: embed={embed.shape} e_proj={eproj_shape} h_proj={hproj_shape} N_EMBD={n_embd}")
+    embed = embed.reshape(-1, n_embd)  # [N_VOCAB, N_EMBD]
+    print(
+        f"shapes: embed={embed.shape} e_proj={eproj_shape} h_proj={hproj_shape} N_EMBD={n_embd}"
+    )
 
     # e_proj/h_proj are square [N_EMBD,N_EMBD]; orientation (W@x vs W.T@x) is
     # ambiguous from shape, so try both and report which matches ds4.
@@ -87,11 +101,15 @@ def main():
         data = f.read()
     off = 0
     while off < len(data) and len(records) < args.max_records:
-        magic, pos, tok, arg, hcd = struct.unpack_from("<IIiiI", data, off); off += 20
+        magic, pos, tok, arg, hcd = struct.unpack_from("<IIiiI", data, off)
+        off += 20
         if magic != MAGIC:
-            print(f"bad magic {magic:#x} (expected MTP2 {MAGIC:#x}) — rebuild+redump"); return 2
-        prev = np.frombuffer(data, np.float32, hcd, off).copy(); off += hcd * 4
-        inp = np.frombuffer(data, np.float32, hcd, off).copy(); off += hcd * 4
+            print(f"bad magic {magic:#x} (expected MTP2 {MAGIC:#x}) — rebuild+redump")
+            return 2
+        prev = np.frombuffer(data, np.float32, hcd, off).copy()
+        off += hcd * 4
+        inp = np.frombuffer(data, np.float32, hcd, off).copy()
+        off += hcd * 4
         records.append((pos, tok, arg, hcd, prev, inp))
 
     n_hc = records[0][3] // n_embd
@@ -102,15 +120,19 @@ def main():
         hM = hW if orient == "W@x" else hW.T
         errs = []
         for pos, tok, arg, hcd, prev, inp in records:
-            e = eM @ rmsnorm(embed[tok], enorm, eps)                 # [N_EMBD]
+            e = eM @ rmsnorm(embed[tok], enorm, eps)  # [N_EMBD]
             prev_hc = prev.reshape(n_hc, n_embd)
-            h = (hM @ rmsnorm(prev_hc, hnorm, eps).T).T              # [N_HC, N_EMBD]
+            h = (hM @ rmsnorm(prev_hc, hnorm, eps).T).T  # [N_HC, N_EMBD]
             mine = (e[None, :] + h).reshape(-1)
             errs.append(rel_rms(mine, inp))
-        print(f"orientation {orient:7s}: per-record rel_rms = "
-              + " ".join(f"{e:.2e}" for e in errs))
+        print(
+            f"orientation {orient:7s}: per-record rel_rms = "
+            + " ".join(f"{e:.2e}" for e in errs)
+        )
 
-    print("\nstage-1 PASS if one orientation gives rel_rms ~1e-3 or below across records.")
+    print(
+        "\nstage-1 PASS if one orientation gives rel_rms ~1e-3 or below across records."
+    )
 
 
 if __name__ == "__main__":

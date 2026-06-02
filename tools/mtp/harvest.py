@@ -12,6 +12,7 @@ skipping i=0 (BOS) and the last K positions.
 Corpus: one document per line. HC stored fp32 (BOS/massive-activation channels
 overflow fp16). Usage: harvest.py --corpus FILE --out DIR [--model ds4flash.gguf].
 """
+
 import argparse
 import glob
 import json
@@ -38,10 +39,12 @@ def pack_shard(mhcd_path):
     data = open(mhcd_path, "rb").read()
     off, recs = 0, {}
     while off < len(data):
-        magic, pos, hcd = struct.unpack_from("<III", data, off); off += 12
+        magic, pos, hcd = struct.unpack_from("<III", data, off)
+        off += 12
         if magic != MHCD_MAGIC:
             return None, None
-        hc = np.frombuffer(data, np.float32, hcd, off).copy(); off += hcd * 4
+        hc = np.frombuffer(data, np.float32, hcd, off).copy()
+        off += hcd * 4
         recs[pos] = hc
     if not recs or len(recs) != n:
         return None, None
@@ -57,29 +60,53 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     # 1) one ds4 process, model loaded once, all docs.
-    print(f"harvest: running ds4 --mtp-harvest (single model load) ...")
+    print("harvest: running ds4 --mtp-harvest (single model load) ...")
     env = dict(os.environ, DS4_CUDA_FAST_VERIFY="1")
-    rc = subprocess.run([DS4, "--cuda", "-m", args.model,
-                         "--mtp-harvest", os.path.abspath(args.corpus), os.path.abspath(args.out)],
-                        cwd=ROOT, env=env).returncode
+    rc = subprocess.run(
+        [
+            DS4,
+            "--cuda",
+            "-m",
+            args.model,
+            "--mtp-harvest",
+            os.path.abspath(args.corpus),
+            os.path.abspath(args.out),
+        ],
+        cwd=ROOT,
+        env=env,
+    ).returncode
     if rc != 0:
-        print(f"harvest: ds4 --mtp-harvest exited {rc}", file=sys.stderr); return 1
+        print(f"harvest: ds4 --mtp-harvest exited {rc}", file=sys.stderr)
+        return 1
 
     # 2) pack raw shards -> npz, drop raw.
     manifest, total, hc_dim = [], 0, 0
     for mh in sorted(glob.glob(os.path.join(args.out, "shard_*.mhcd"))):
         toks, hc = pack_shard(mh)
         if toks is None or hc is None:
-            print(f"  skip {os.path.basename(mh)} (align/parse)"); continue
-        npz = mh[:-len(".mhcd")] + ".npz"
+            print(f"  skip {os.path.basename(mh)} (align/parse)")
+            continue
+        npz = mh[: -len(".mhcd")] + ".npz"
         np.savez(npz, tokens=toks, hc=hc)
         manifest.append({"shard": os.path.basename(npz), "n": int(hc.shape[0])})
-        total += hc.shape[0]; hc_dim = hc.shape[1]
-        os.unlink(mh); os.unlink(mh + ".tok")
+        total += hc.shape[0]
+        hc_dim = hc.shape[1]
+        os.unlink(mh)
+        os.unlink(mh + ".tok")
     with open(os.path.join(args.out, "manifest.json"), "w") as f:
-        json.dump({"shards": manifest, "total_positions": total,
-                   "hc_dim": hc_dim, "n_docs": len(manifest)}, f, indent=2)
-    print(f"harvest done: {len(manifest)} docs, {total} positions, hc_dim={hc_dim} -> {args.out}")
+        json.dump(
+            {
+                "shards": manifest,
+                "total_positions": total,
+                "hc_dim": hc_dim,
+                "n_docs": len(manifest),
+            },
+            f,
+            indent=2,
+        )
+    print(
+        f"harvest done: {len(manifest)} docs, {total} positions, hc_dim={hc_dim} -> {args.out}"
+    )
     return 0
 
 
