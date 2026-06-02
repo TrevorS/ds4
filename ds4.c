@@ -15230,6 +15230,28 @@ static bool metal_graph_prefill_layer_major(
     if (start > (uint32_t)prompt->len) return false;
     if (n_tokens > (uint32_t)prompt->len - start) return false;
 
+    /* FastMTP harvester: at the first prefill chunk (start==0), when
+     * DS4_MTP_HC_DUMP is set, write the FULL prefill token sequence (post chat
+     * template) to <path>.tok so it aligns 1:1 with the per-position MHCD HC
+     * records this same prefill produces. Record (LE): i32 n, i32 tokens[n]. */
+    if (start == 0) {
+        const char *hcdump = getenv("DS4_MTP_HC_DUMP");
+        if (hcdump && hcdump[0]) {
+            char tok_path[1200];
+            snprintf(tok_path, sizeof(tok_path), "%s.tok", hcdump);
+            FILE *tf = fopen(tok_path, "wb");
+            if (tf) {
+                int32_t nn = (int32_t)prompt->len;
+                fwrite(&nn, sizeof(nn), 1, tf);
+                for (int i = 0; i < prompt->len; i++) {
+                    int32_t t = (int32_t)prompt->v[i];
+                    fwrite(&t, sizeof(t), 1, tf);
+                }
+                fclose(tf);
+            }
+        }
+    }
+
     if (display_progress)
         display_progress(display_progress_ud, "prefill_display", (int)start, prompt->len);
 
