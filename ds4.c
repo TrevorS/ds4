@@ -14213,6 +14213,46 @@ static bool metal_graph_encode_layer_attention_batch(
     return ok;
 }
 
+/* Prefill HC harvest for FastMTP training data. When DS4_MTP_HC_DUMP is set,
+ * at the LAST layer dump every prefill position's final base HC (= the
+ * combined_prev_hc that conditions the MTP head) keyed by position, giving
+ * offline (base_HC, next-token) training pairs (next-token recovered by the
+ * harvester re-tokenizing the same prompt). Run with --mtp OFF so this batch
+ * path is pure prefill, not MTP verify. Record (LE): u32 magic 'MHCD' · u32 pos
+ * · u32 hc_dim · f32 hc[hc_dim]. One cached getenv when unset -> no-op. */
+static void mtp_hc_dump_prefill(const ds4_gpu_tensor *batch_next_hc,
+                                uint32_t il, uint32_t pos0, uint32_t n_tokens) {
+    if (il != (uint32_t)(DS4_N_LAYER - 1)) return;
+    static int   g_init = 0;
+    static FILE *g_fp = NULL;
+    static float *g_buf = NULL;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    if (!g_init) {
+        g_init = 1;
+        const char *p = getenv("DS4_MTP_HC_DUMP");
+        if (p && p[0]) {
+            g_fp = fopen(p, "ab");
+            if (g_fp) {
+                g_buf = (float *)malloc(hc_dim * sizeof(float));
+                if (!g_buf) { fclose(g_fp); g_fp = NULL; }
+            }
+        }
+    }
+    if (!g_fp || !g_buf || !batch_next_hc) return;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        if (ds4_gpu_tensor_read(batch_next_hc, (uint64_t)t * hc_dim * sizeof(float),
+                                g_buf, hc_dim * sizeof(float)) == 0) return;
+        const uint32_t magic = 0x4D484344u;  /* 'MHCD' */
+        const uint32_t pos = pos0 + t;
+        const uint32_t hcd = (uint32_t)hc_dim;
+        fwrite(&magic, sizeof(magic), 1, g_fp);
+        fwrite(&pos,   sizeof(pos),   1, g_fp);
+        fwrite(&hcd,   sizeof(hcd),   1, g_fp);
+        fwrite(g_buf,  sizeof(float), hc_dim, g_fp);
+    }
+    fflush(g_fp);
+}
+
 /* Encode the batched prefill FFN half: HC pre/norm, shared expert, routed
  * experts, sum, and HC post. */
 static bool metal_graph_encode_layer_ffn_batch(
@@ -14559,6 +14599,7 @@ static bool metal_graph_encode_layer_ffn_batch(
     /* C20 tap: batch verify post-ffn HC, FIRST position only (first hc_dim
      * floats) so it is directly comparable to the canonical N=1 tap. */
     if (ok) ds4_gpu_fingerprint_tap_f32(g->batch_next_hc, hc_dim, "hc_ffn_post", il, pos0);
+    if (ok) mtp_hc_dump_prefill(g->batch_next_hc, il, pos0, n_tokens);
     DS4_METAL_PROFILE_FFN_STAGE("hc_post");
     ds4_gpu_tensor_free(next_hc_view);
     ds4_gpu_tensor_free(ffn_cur_view);
