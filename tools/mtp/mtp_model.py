@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 
 sys.path.insert(0, "/home/trevor/Projects/ds4/tools/mtp")
+sys.path.insert(0, "/home/trevor/Projects/llama.cpp-tjs-fork/gguf-py")  # gguf (runtime)
 from gguf import GGUFReader, GGMLQuantizationType, quants  # noqa: E402
 from transformers.models.deepseek_v4 import modeling_deepseek_v4 as M  # noqa: E402
 from transformers.masking_utils import create_sliding_window_causal_mask  # noqa: E402
