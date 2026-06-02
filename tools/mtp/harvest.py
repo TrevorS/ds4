@@ -1,26 +1,24 @@
-"""Harvest FastMTP training data from ds4: for each corpus doc, prefill it through
-ds4 (the only thing that forwards V4-Flash here) and capture per-position base HC
-(combined_prev_hc) via DS4_MTP_HC_DUMP, aligned with the doc's token ids.
+"""Harvest FastMTP training data: drive `ds4 --mtp-harvest` ONCE (model loaded a
+single time) over a corpus, then pack the per-doc (base_HC, token) shards to npz.
 
-Output per doc: shard_NNNNN.npz {tokens int32[N], hc float16[N, hc_dim]}, position
-i = (token t_i, base HC h_i after t_i). The trainer forms FastMTP windows
-(h_i, t_{i+1..i+K}) -> targets t_{i+2..i+K+1}); it skips i=0 (BOS massive
-activation) and the last K positions. This is FIXED-DATA harvest (raw corpus text,
-no chat template) — fast (~350 t/s prefill); self-distill (gen first) is a later
-swap of the corpus source.
+ds4 --mtp-harvest writes, per doc (one corpus line, raw-tokenized, fresh session
+-> clean per-doc HCs): <out>/shard_NNNNN.mhcd (MHCD HC records) + .tok (token ids),
+guaranteed 1:1 aligned (same prefill produces both). This packer converts each to
+shard_NNNNN.npz {tokens int32[N], hc float32[N, hc_dim]} and removes the raw files.
 
-Corpus: one document per line, OR a .jsonl with a "text" field.
-Usage: harvest.py --corpus FILE --out DIR [--model ds4flash.gguf] [--max-docs N]
-                   [--min-tokens 16] [--max-tokens 512]
-Run with the venv python (numpy). ds4 binary must be built (make cuda-spark).
+The trainer forms FastMTP windows (h_i, t_{i+1..i+K}) -> targets t_{i+2..i+K+1},
+skipping i=0 (BOS) and the last K positions.
+
+Corpus: one document per line. HC stored fp32 (BOS/massive-activation channels
+overflow fp16). Usage: harvest.py --corpus FILE --out DIR [--model ds4flash.gguf].
 """
 import argparse
+import glob
 import json
 import os
 import struct
 import subprocess
 import sys
-import tempfile
 
 import numpy as np
 
@@ -29,43 +27,15 @@ DS4 = os.path.join(ROOT, "ds4")
 MHCD_MAGIC = 0x4D484344
 
 
-def read_corpus(path):
-    docs = []
-    with open(path) as f:
-        if path.endswith(".jsonl"):
-            for line in f:
-                line = line.strip()
-                if line:
-                    docs.append(json.loads(line)["text"])
-        else:
-            for line in f:
-                line = line.rstrip("\n")
-                if line.strip():
-                    docs.append(line)
-    return docs
-
-
-def harvest_doc(model, text, hc_dim_out):
-    """One ds4 prefill: returns (tokens list[int], hc array [N, hc_dim]) aligned.
-    Tokens come from the .tok sidecar (exact post-template prefill ids); HCs from
-    the MHCD dump — both from the SAME prefill, so alignment is guaranteed."""
-    with tempfile.NamedTemporaryFile(suffix=".mhcd", delete=False) as tf:
-        tmp = tf.name
-    tok_path = tmp + ".tok"
-    try:
-        env = dict(os.environ, DS4_MTP_HC_DUMP=tmp, DS4_CUDA_FAST_VERIFY="1")
-        subprocess.run([DS4, "--cuda", "-m", model, "-p", text, "-n", "1", "--temp", "0"],
-                       capture_output=True, cwd=ROOT, env=env)
-        data = open(tmp, "rb").read()
-        tdata = open(tok_path, "rb").read() if os.path.exists(tok_path) else b""
-    finally:
-        for p in (tmp, tok_path):
-            if os.path.exists(p):
-                os.unlink(p)
-    if not tdata:
+def pack_shard(mhcd_path):
+    """Read shard.mhcd + shard.mhcd.tok -> (tokens, hc[N, hc_dim]) or (None, None)."""
+    tok_path = mhcd_path + ".tok"
+    if not os.path.exists(tok_path):
         return None, None
-    n = struct.unpack_from("<i", tdata, 0)[0]
-    toks = list(struct.unpack_from("<%di" % n, tdata, 4))
+    td = open(tok_path, "rb").read()
+    n = struct.unpack_from("<i", td, 0)[0]
+    toks = np.array(struct.unpack_from("<%di" % n, td, 4), np.int32)
+    data = open(mhcd_path, "rb").read()
     off, recs = 0, {}
     while off < len(data):
         magic, pos, hcd = struct.unpack_from("<III", data, off); off += 12
@@ -73,11 +43,9 @@ def harvest_doc(model, text, hc_dim_out):
             return None, None
         hc = np.frombuffer(data, np.float32, hcd, off).copy(); off += hcd * 4
         recs[pos] = hc
-        hc_dim_out[0] = hcd
-    if not recs:
+    if not recs or len(recs) != n:
         return None, None
-    hc = np.stack([recs[i] for i in range(len(recs))])  # [N, hc_dim]
-    return toks, hc
+    return toks, np.stack([recs[i] for i in range(n)])
 
 
 def main():
@@ -85,41 +53,34 @@ def main():
     ap.add_argument("--corpus", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--model", default="ds4flash.gguf")
-    ap.add_argument("--max-docs", type=int, default=0)
-    ap.add_argument("--min-tokens", type=int, default=16)
-    ap.add_argument("--max-tokens", type=int, default=512)
     args = ap.parse_args()
-
     os.makedirs(args.out, exist_ok=True)
-    docs = read_corpus(args.corpus)
-    if args.max_docs:
-        docs = docs[:args.max_docs]
-    print(f"harvest: {len(docs)} docs -> {args.out}")
 
-    manifest, total_pos, kept = [], 0, 0
-    hc_dim_box = [0]
-    for k, text in enumerate(docs):
-        toks, hc = harvest_doc(args.model, text, hc_dim_box)
+    # 1) one ds4 process, model loaded once, all docs.
+    print(f"harvest: running ds4 --mtp-harvest (single model load) ...")
+    env = dict(os.environ, DS4_CUDA_FAST_VERIFY="1")
+    rc = subprocess.run([DS4, "--cuda", "-m", args.model,
+                         "--mtp-harvest", os.path.abspath(args.corpus), os.path.abspath(args.out)],
+                        cwd=ROOT, env=env).returncode
+    if rc != 0:
+        print(f"harvest: ds4 --mtp-harvest exited {rc}", file=sys.stderr); return 1
+
+    # 2) pack raw shards -> npz, drop raw.
+    manifest, total, hc_dim = [], 0, 0
+    for mh in sorted(glob.glob(os.path.join(args.out, "shard_*.mhcd"))):
+        toks, hc = pack_shard(mh)
         if toks is None or hc is None:
-            print(f"  [{k}] skip (no data)"); continue
-        if len(toks) < args.min_tokens:
-            print(f"  [{k}] skip (tokens={len(toks)} < {args.min_tokens})"); continue
-        if len(toks) > args.max_tokens:
-            print(f"  [{k}] skip (>{args.max_tokens} tokens)"); continue
-        if hc.shape[0] != len(toks):
-            print(f"  [{k}] skip (align mismatch: {hc.shape[0]} hc vs {len(toks)} tok)"); continue
-        path = os.path.join(args.out, f"shard_{k:05d}.npz")
-        # fp32 (not fp16): BOS/massive-activation channels overflow fp16's 65504
-        # max. bf16 would fit but numpy lacks a native dtype; fp32 is safe.
-        np.savez(path, tokens=np.array(toks, np.int32), hc=hc.astype(np.float32))
-        manifest.append({"shard": os.path.basename(path), "n": int(hc.shape[0])})
-        total_pos += hc.shape[0]; kept += 1
-        if kept % 20 == 0:
-            print(f"  kept {kept} docs, {total_pos} positions")
+            print(f"  skip {os.path.basename(mh)} (align/parse)"); continue
+        npz = mh[:-len(".mhcd")] + ".npz"
+        np.savez(npz, tokens=toks, hc=hc)
+        manifest.append({"shard": os.path.basename(npz), "n": int(hc.shape[0])})
+        total += hc.shape[0]; hc_dim = hc.shape[1]
+        os.unlink(mh); os.unlink(mh + ".tok")
     with open(os.path.join(args.out, "manifest.json"), "w") as f:
-        json.dump({"shards": manifest, "total_positions": total_pos,
-                   "hc_dim": hc_dim_box[0], "n_docs_kept": kept}, f, indent=2)
-    print(f"harvest done: {kept}/{len(docs)} docs, {total_pos} positions, hc_dim={hc_dim_box[0]}")
+        json.dump({"shards": manifest, "total_positions": total,
+                   "hc_dim": hc_dim, "n_docs": len(manifest)}, f, indent=2)
+    print(f"harvest done: {len(manifest)} docs, {total} positions, hc_dim={hc_dim} -> {args.out}")
+    return 0
 
 
 if __name__ == "__main__":

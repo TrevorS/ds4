@@ -14220,37 +14220,65 @@ static bool metal_graph_encode_layer_attention_batch(
  * harvester re-tokenizing the same prompt). Run with --mtp OFF so this batch
  * path is pure prefill, not MTP verify. Record (LE): u32 magic 'MHCD' · u32 pos
  * · u32 hc_dim · f32 hc[hc_dim]. One cached getenv when unset -> no-op. */
+/* Batch-harvest dump target (set per-doc by ds4_mtp_dump_begin so the harvester
+ * loads the model ONCE and loops docs). When g_mtp_dump_fp is set it overrides
+ * the legacy DS4_MTP_HC_DUMP env (append) single-doc path. g_mtp_dump_tokbase
+ * is the base for the <base>.tok token sidecar. */
+static FILE *g_mtp_dump_fp = NULL;
+static char  g_mtp_dump_tokbase[1200] = {0};
+static float *g_mtp_hc_buf = NULL;
+
+/* Begin a per-doc batch dump: HC records -> <base>, tokens -> <base>.tok. */
+void ds4_mtp_dump_begin(const char *base) {
+    if (g_mtp_dump_fp) { fclose(g_mtp_dump_fp); g_mtp_dump_fp = NULL; }
+    g_mtp_dump_tokbase[0] = 0;
+    if (base && base[0]) {
+        g_mtp_dump_fp = fopen(base, "wb");
+        snprintf(g_mtp_dump_tokbase, sizeof(g_mtp_dump_tokbase), "%s", base);
+    }
+}
+
+void ds4_mtp_dump_end(void) {
+    if (g_mtp_dump_fp) { fclose(g_mtp_dump_fp); g_mtp_dump_fp = NULL; }
+    g_mtp_dump_tokbase[0] = 0;
+}
+
+/* Effective HC dump FILE*: per-doc batch target if set, else lazy-open the
+ * legacy env path (append). */
+static FILE *mtp_dump_fp(void) {
+    if (g_mtp_dump_fp) return g_mtp_dump_fp;
+    static int   env_init = 0;
+    static FILE *env_fp = NULL;
+    if (!env_init) {
+        env_init = 1;
+        const char *p = getenv("DS4_MTP_HC_DUMP");
+        if (p && p[0]) env_fp = fopen(p, "ab");
+    }
+    return env_fp;
+}
+
 static void mtp_hc_dump_prefill(const ds4_gpu_tensor *batch_next_hc,
                                 uint32_t il, uint32_t pos0, uint32_t n_tokens) {
     if (il != (uint32_t)(DS4_N_LAYER - 1)) return;
-    static int   g_init = 0;
-    static FILE *g_fp = NULL;
-    static float *g_buf = NULL;
+    FILE *fp = mtp_dump_fp();
+    if (!fp || !batch_next_hc) return;
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    if (!g_init) {
-        g_init = 1;
-        const char *p = getenv("DS4_MTP_HC_DUMP");
-        if (p && p[0]) {
-            g_fp = fopen(p, "ab");
-            if (g_fp) {
-                g_buf = (float *)malloc(hc_dim * sizeof(float));
-                if (!g_buf) { fclose(g_fp); g_fp = NULL; }
-            }
-        }
+    if (!g_mtp_hc_buf) {
+        g_mtp_hc_buf = (float *)malloc(hc_dim * sizeof(float));
+        if (!g_mtp_hc_buf) return;
     }
-    if (!g_fp || !g_buf || !batch_next_hc) return;
     for (uint32_t t = 0; t < n_tokens; t++) {
         if (ds4_gpu_tensor_read(batch_next_hc, (uint64_t)t * hc_dim * sizeof(float),
-                                g_buf, hc_dim * sizeof(float)) == 0) return;
+                                g_mtp_hc_buf, hc_dim * sizeof(float)) == 0) return;
         const uint32_t magic = 0x4D484344u;  /* 'MHCD' */
         const uint32_t pos = pos0 + t;
         const uint32_t hcd = (uint32_t)hc_dim;
-        fwrite(&magic, sizeof(magic), 1, g_fp);
-        fwrite(&pos,   sizeof(pos),   1, g_fp);
-        fwrite(&hcd,   sizeof(hcd),   1, g_fp);
-        fwrite(g_buf,  sizeof(float), hc_dim, g_fp);
+        fwrite(&magic, sizeof(magic), 1, fp);
+        fwrite(&pos,   sizeof(pos),   1, fp);
+        fwrite(&hcd,   sizeof(hcd),   1, fp);
+        fwrite(g_mtp_hc_buf, sizeof(float), hc_dim, fp);
     }
-    fflush(g_fp);
+    fflush(fp);
 }
 
 /* Encode the batched prefill FFN half: HC pre/norm, shared expert, routed
@@ -15235,10 +15263,11 @@ static bool metal_graph_prefill_layer_major(
      * template) to <path>.tok so it aligns 1:1 with the per-position MHCD HC
      * records this same prefill produces. Record (LE): i32 n, i32 tokens[n]. */
     if (start == 0) {
-        const char *hcdump = getenv("DS4_MTP_HC_DUMP");
-        if (hcdump && hcdump[0]) {
-            char tok_path[1200];
-            snprintf(tok_path, sizeof(tok_path), "%s.tok", hcdump);
+        const char *base = g_mtp_dump_tokbase[0] ? g_mtp_dump_tokbase
+                                                  : getenv("DS4_MTP_HC_DUMP");
+        if (base && base[0]) {
+            char tok_path[1208];
+            snprintf(tok_path, sizeof(tok_path), "%s.tok", base);
             FILE *tf = fopen(tok_path, "wb");
             if (tf) {
                 int32_t nn = (int32_t)prompt->len;

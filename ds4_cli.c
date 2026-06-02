@@ -39,6 +39,8 @@ typedef struct {
     const char *dump_logprobs_path;
     int dump_logprobs_top_k;
     const char *perplexity_file_path;
+    const char *mtp_harvest_corpus;
+    const char *mtp_harvest_out;
     const char *imatrix_dataset_path;
     const char *imatrix_output_path;
     int imatrix_max_prompts;
@@ -874,6 +876,50 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
     return 0;
 }
 
+/* FastMTP data harvest: load the model ONCE, prefill each corpus doc in a fresh
+ * session, and dump per-doc (base-HC, token) shards via ds4_mtp_dump_begin/end.
+ * Corpus = one document per line (raw text, tokenized as-is). Out dir must exist.
+ * Per-doc: <out>/shard_NNNNN.mhcd (MHCD HC records) + .tok (token ids). */
+static int run_mtp_harvest(ds4_engine *engine, const cli_config *cfg) {
+    FILE *fp = fopen(cfg->gen.mtp_harvest_corpus, "r");
+    if (!fp) {
+        fprintf(stderr, "ds4: cannot open corpus %s\n", cfg->gen.mtp_harvest_corpus);
+        return 1;
+    }
+    const int MIN_TOK = 16, MAX_TOK = 512;
+    char *line = NULL; size_t cap = 0; ssize_t len;
+    char err[256];
+    int k = 0, kept = 0; long total_pos = 0;
+    while ((len = getline(&line, &cap, fp)) != -1) {
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = 0;
+        if (len < 2) { k++; continue; }
+        ds4_tokens toks = {0};
+        ds4_tokenize_text(engine, line, &toks);
+        if (toks.len < MIN_TOK || toks.len > MAX_TOK) { ds4_tokens_free(&toks); k++; continue; }
+        ds4_session *session = NULL;
+        if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
+            ds4_tokens_free(&toks); k++; continue;
+        }
+        char base[1024];
+        snprintf(base, sizeof(base), "%s/shard_%05d.mhcd", cfg->gen.mtp_harvest_out, k);
+        ds4_mtp_dump_begin(base);
+        const int rc = ds4_session_sync(session, &toks, err, sizeof(err));
+        ds4_mtp_dump_end();
+        ds4_session_free(session);
+        if (rc == 0) { kept++; total_pos += toks.len; }
+        else fprintf(stderr, "\nds4: harvest doc %d sync failed: %s\n", k, err);
+        ds4_tokens_free(&toks);
+        if (kept && kept % 20 == 0)
+            fprintf(stderr, "ds4: harvested %d docs, %ld positions\r", kept, total_pos);
+        k++;
+    }
+    free(line);
+    fclose(fp);
+    fprintf(stderr, "\nds4: mtp-harvest done: %d/%d docs, %ld positions -> %s\n",
+            kept, k, total_pos, cfg->gen.mtp_harvest_out);
+    return 0;
+}
+
 static int run_generation(ds4_engine *engine, const cli_config *cfg) {
     ds4_tokens prompt = {0};
     build_prompt(engine, &cfg->gen, &prompt);
@@ -1528,6 +1574,9 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.dump_logprobs_top_k = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--perplexity-file")) {
             c.gen.perplexity_file_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp-harvest")) {
+            c.gen.mtp_harvest_corpus = need_arg(&i, argc, argv, arg);
+            c.gen.mtp_harvest_out = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--imatrix-dataset")) {
             c.gen.imatrix_dataset_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--imatrix-out")) {
@@ -1654,6 +1703,8 @@ int main(int argc, char **argv) {
                                         cfg.gen.ctx_size,
                                         cfg.gen.imatrix_max_prompts,
                                         cfg.gen.imatrix_max_tokens);
+    } else if (cfg.gen.mtp_harvest_corpus) {
+        rc = run_mtp_harvest(engine, &cfg);
     } else if (cfg.gen.perplexity_file_path) {
         rc = run_perplexity_file(engine, &cfg);
     } else if (cfg.gen.prompt == NULL) {

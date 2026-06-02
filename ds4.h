@@ -208,6 +208,12 @@ int ds4_cuda_tensor_equivalence_selftest(ds4_session *s,
                                          double *out_worst_max_abs,
                                          int *out_first_fail_layer,
                                          int *out_nonfinite);
+/* FastMTP harvest: per-doc batch dump target. ds4_mtp_dump_begin(base) routes
+ * the prefill base-HC dump to <base> and tokens to <base>.tok (overriding the
+ * legacy DS4_MTP_HC_DUMP env); ds4_mtp_dump_end() closes it. Lets a harvester
+ * load the model once and loop docs with a fresh session per doc. */
+void ds4_mtp_dump_begin(const char *base);
+void ds4_mtp_dump_end(void);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt);
