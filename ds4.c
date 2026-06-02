@@ -14687,13 +14687,19 @@ static bool metal_graph_eval_token_raw_swa_top(
  * this path (reimpl argmax must equal ds4's on identical inputs) before any
  * fine-tuning. All draft steps funnel through eval_mtp_draft_from_hc, so this one
  * tap covers drafts[0] (target-HC conditioned) and drafts[1+] (self-HC).
- * Record (LE): u32 magic 'MTPD' · u32 pos · i32 token · i32 draft_argmax ·
- * u32 hc_dim · f32 hc[hc_dim].  One cached getenv when unset -> no-op. */
-static void mtp_dump_draft_record(const ds4_gpu_tensor *prev_hc, uint32_t pos,
+ * Record (LE): u32 magic 'MTP2' · u32 pos · i32 token · i32 draft_argmax ·
+ * u32 hc_dim · f32 prev_hc[hc_dim] · f32 input_hc[hc_dim].  input_hc is ds4's
+ * post-projection sum (e_proj(enorm(embed)) repeated + h_proj(hnorm(prev_hc))),
+ * the exact ground truth for stage-1 (input-projection) validation of a numpy/
+ * gguf reimpl — no attention/MoE needed for that stage. One cached getenv when
+ * unset -> no-op. */
+static void mtp_dump_draft_record(const ds4_gpu_tensor *prev_hc,
+                                  const ds4_gpu_tensor *input_hc, uint32_t pos,
                                   int token, int draft_argmax) {
     static int   g_init = 0;
     static FILE *g_fp = NULL;
-    static float *g_buf = NULL;
+    static float *g_prev = NULL;
+    static float *g_in = NULL;
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     if (!g_init) {
         g_init = 1;
@@ -14701,14 +14707,16 @@ static void mtp_dump_draft_record(const ds4_gpu_tensor *prev_hc, uint32_t pos,
         if (path && path[0]) {
             g_fp = fopen(path, "ab");
             if (g_fp) {
-                g_buf = (float *)malloc(hc_dim * sizeof(float));
-                if (!g_buf) { fclose(g_fp); g_fp = NULL; }
+                g_prev = (float *)malloc(hc_dim * sizeof(float));
+                g_in   = (float *)malloc(hc_dim * sizeof(float));
+                if (!g_prev || !g_in) { fclose(g_fp); g_fp = NULL; free(g_prev); free(g_in); g_prev = g_in = NULL; }
             }
         }
     }
-    if (!g_fp || !g_buf || !prev_hc) return;
-    if (ds4_gpu_tensor_read(prev_hc, 0, g_buf, hc_dim * sizeof(float)) == 0) return;
-    const uint32_t magic = 0x4D545044u;  /* 'MTPD' */
+    if (!g_fp || !g_prev || !g_in || !prev_hc || !input_hc) return;
+    if (ds4_gpu_tensor_read(prev_hc,  0, g_prev, hc_dim * sizeof(float)) == 0) return;
+    if (ds4_gpu_tensor_read(input_hc, 0, g_in,   hc_dim * sizeof(float)) == 0) return;
+    const uint32_t magic = 0x4D545032u;  /* 'MTP2' */
     const uint32_t hcd = (uint32_t)hc_dim;
     const int32_t  tok = (int32_t)token;
     const int32_t  arg = (int32_t)draft_argmax;
@@ -14717,7 +14725,8 @@ static void mtp_dump_draft_record(const ds4_gpu_tensor *prev_hc, uint32_t pos,
     fwrite(&tok,   sizeof(tok),   1, g_fp);
     fwrite(&arg,   sizeof(arg),   1, g_fp);
     fwrite(&hcd,   sizeof(hcd),   1, g_fp);
-    fwrite(g_buf,  sizeof(float), hc_dim, g_fp);
+    fwrite(g_prev, sizeof(float), hc_dim, g_fp);
+    fwrite(g_in,   sizeof(float), hc_dim, g_fp);
     fflush(g_fp);
 }
 
@@ -14827,7 +14836,7 @@ static bool metal_graph_eval_mtp_draft_from_hc(
     if (ok && top_id) {
         ok = ds4_gpu_tensor_read(g->comp_selected, 0, top_id, sizeof(*top_id)) != 0;
     }
-    if (ok && top_id) mtp_dump_draft_record(prev_hc, pos, token, *top_id);
+    if (ok && top_id) mtp_dump_draft_record(prev_hc, g->mtp_input_hc, pos, token, *top_id);
     if (ok && g->mtp_n_raw < g->raw_window) g->mtp_n_raw++;
     if (!ok) {
         (void)ds4_gpu_synchronize();
