@@ -887,12 +887,18 @@ static int run_mtp_harvest(ds4_engine *engine, const cli_config *cfg) {
         return 1;
     }
     const int MIN_TOK = 16, MAX_TOK = 512;
-    char *line = NULL; size_t cap = 0; ssize_t len;
+    /* Docs are NUL-separated (not one-per-line) so multi-line content — code,
+     * lists, multi-paragraph chat — survives intact (critical for the
+     * structured-list/code/essay classes we target). */
+    char *line = NULL; size_t cap = 0;
     char err[256];
     int k = 0, kept = 0; long total_pos = 0;
-    while ((len = getline(&line, &cap, fp)) != -1) {
-        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = 0;
-        if (len < 2) { k++; continue; }
+    while (getdelim(&line, &cap, '\0', fp) != -1) {
+        size_t L = strlen(line);
+        while (L > 0 && (line[L - 1] == '\n' || line[L - 1] == '\r' ||
+                         line[L - 1] == ' ' || line[L - 1] == '\t'))
+            line[--L] = 0;
+        if (L < 2) { k++; continue; }
         ds4_tokens toks = {0};
         ds4_tokenize_text(engine, line, &toks);
         if (toks.len < MIN_TOK || toks.len > MAX_TOK) { ds4_tokens_free(&toks); k++; continue; }

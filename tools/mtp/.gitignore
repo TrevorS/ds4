@@ -1,1 +1,6 @@
 .venv/
+corpus_pol.txt
+*.pt
+ckpt/
+__pycache__/
+wandb/
