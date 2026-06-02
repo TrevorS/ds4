@@ -105,8 +105,12 @@ class DeepseekV4MtpHead(nn.Module):
         from torch.utils.checkpoint import checkpoint
 
         self.decoder.gradient_checkpointing = True
-        self.decoder._gradient_checkpointing_func = functools.partial(
-            checkpoint, use_reentrant=False
+        # private attr the GradientCheckpointingLayer reads; normally set by the
+        # model-level enable(). setattr keeps it dynamic (ty-clean).
+        setattr(
+            self.decoder,
+            "_gradient_checkpointing_func",
+            functools.partial(checkpoint, use_reentrant=False),
         )
 
     def trainable_parameters(self):
