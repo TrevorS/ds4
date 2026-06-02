@@ -14680,6 +14680,47 @@ static bool metal_graph_eval_token_raw_swa_top(
     return ok;
 }
 
+/* Optional MTP draft-input dump for the FastMTP de-risk harness. When DS4_MTP_DUMP
+ * is set, append one binary record per draft eval capturing the EXACT inputs ds4
+ * fed the mtp.0 head (token + prev_hc) and ds4's resulting draft argmax, so a
+ * standalone PyTorch reimpl of the head can be validated bit-faithfully against
+ * this path (reimpl argmax must equal ds4's on identical inputs) before any
+ * fine-tuning. All draft steps funnel through eval_mtp_draft_from_hc, so this one
+ * tap covers drafts[0] (target-HC conditioned) and drafts[1+] (self-HC).
+ * Record (LE): u32 magic 'MTPD' · u32 pos · i32 token · i32 draft_argmax ·
+ * u32 hc_dim · f32 hc[hc_dim].  One cached getenv when unset -> no-op. */
+static void mtp_dump_draft_record(const ds4_gpu_tensor *prev_hc, uint32_t pos,
+                                  int token, int draft_argmax) {
+    static int   g_init = 0;
+    static FILE *g_fp = NULL;
+    static float *g_buf = NULL;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    if (!g_init) {
+        g_init = 1;
+        const char *path = getenv("DS4_MTP_DUMP");
+        if (path && path[0]) {
+            g_fp = fopen(path, "ab");
+            if (g_fp) {
+                g_buf = (float *)malloc(hc_dim * sizeof(float));
+                if (!g_buf) { fclose(g_fp); g_fp = NULL; }
+            }
+        }
+    }
+    if (!g_fp || !g_buf || !prev_hc) return;
+    if (ds4_gpu_tensor_read(prev_hc, 0, g_buf, hc_dim * sizeof(float)) == 0) return;
+    const uint32_t magic = 0x4D545044u;  /* 'MTPD' */
+    const uint32_t hcd = (uint32_t)hc_dim;
+    const int32_t  tok = (int32_t)token;
+    const int32_t  arg = (int32_t)draft_argmax;
+    fwrite(&magic, sizeof(magic), 1, g_fp);
+    fwrite(&pos,   sizeof(pos),   1, g_fp);
+    fwrite(&tok,   sizeof(tok),   1, g_fp);
+    fwrite(&arg,   sizeof(arg),   1, g_fp);
+    fwrite(&hcd,   sizeof(hcd),   1, g_fp);
+    fwrite(g_buf,  sizeof(float), hc_dim, g_fp);
+    fflush(g_fp);
+}
+
 static bool metal_graph_eval_mtp_draft_from_hc(
         ds4_gpu_graph       *g,
         const ds4_model       *base_model,
@@ -14786,6 +14827,7 @@ static bool metal_graph_eval_mtp_draft_from_hc(
     if (ok && top_id) {
         ok = ds4_gpu_tensor_read(g->comp_selected, 0, top_id, sizeof(*top_id)) != 0;
     }
+    if (ok && top_id) mtp_dump_draft_record(prev_hc, pos, token, *top_id);
     if (ok && g->mtp_n_raw < g->raw_window) g->mtp_n_raw++;
     if (!ok) {
         (void)ds4_gpu_synchronize();
