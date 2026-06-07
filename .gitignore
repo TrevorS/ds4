@@ -16,3 +16,13 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+/librechat/
+tools/perf/*/runs/
+/tests/cuda_long_context_smoke
+tools/perf/runs.db
+tools/perf/runs/*/
+tests/test_q4k_dot
+tests/cuda_long_context_smoke
+
+# wandb offline runs (training telemetry, not source)
+wandb/
