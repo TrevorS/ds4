@@ -10370,9 +10370,16 @@ typedef struct {
     bool batch_routed_mid_is_f16;
     ds4_gpu_tensor *batch_ffn_out;
     bool materialize_ffn_out;
+    /* directional_steering_dirs is the ACTIVE profile: a borrowed pointer into
+     * steering_cache below (or NULL = steering off).  The cache owns the loaded
+     * direction-vector tensors so a per-request profile switch is a pointer swap
+     * instead of a reload.  Each profile is n_layer*n_embd f32 (~0.69 MiB). */
     ds4_gpu_tensor *directional_steering_dirs;
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
+#define DS4_STEERING_CACHE_MAX 64
+    struct { char name[64]; ds4_gpu_tensor *dirs; } steering_cache[DS4_STEERING_CACHE_MAX];
+    uint32_t steering_cache_len;
     uint32_t power_percent;
     double prefill_layer_avg_sec[DS4_MAX_LAYER];
     double decode_token_avg_sec;
@@ -10424,7 +10431,10 @@ static void graph_power_note_decode_token(ds4_gpu_graph *g, double elapsed_sec) 
 
 /* Release every Metal tensor owned by the whole-model graph runtime. */
 static void metal_graph_free(ds4_gpu_graph *g) {
-    ds4_gpu_tensor_free(g->directional_steering_dirs);
+    for (uint32_t si = 0; si < g->steering_cache_len; si++)
+        ds4_gpu_tensor_free(g->steering_cache[si].dirs);
+    g->steering_cache_len = 0;
+    g->directional_steering_dirs = NULL;  /* borrowed into the cache; freed above */
     ds4_gpu_tensor_free(g->batch_ffn_out);
     ds4_gpu_tensor_free(g->batch_routed_out);
     ds4_gpu_tensor_free(g->batch_routed_down);
@@ -10583,32 +10593,52 @@ static bool metal_tensor_fill_f32(ds4_gpu_tensor *t, float v, uint64_t n) {
  * the normal inference path.
  */
 
+/* Return the cache-owned dirs tensor for profile `name`, loading it from `path`
+ * on a miss.  NULL on failure (unknown name with no/failed path, or cache full). */
+static ds4_gpu_tensor *metal_graph_steering_cache_get(ds4_gpu_graph *g, const char *name,
+                                                      const char *path) {
+    if (!g || !name || !name[0]) return NULL;
+    for (uint32_t i = 0; i < g->steering_cache_len; i++)
+        if (!strcmp(g->steering_cache[i].name, name)) return g->steering_cache[i].dirs;
+    if (g->steering_cache_len >= DS4_STEERING_CACHE_MAX || !path || !path[0]) return NULL;
+
+    const uint64_t n = (uint64_t)DS4_N_LAYER * DS4_N_EMBD;
+    float *host = xmalloc((size_t)n * sizeof(host[0]));
+    bool ok = read_f32_binary_file(path, host, n);
+    ds4_gpu_tensor *t = NULL;
+    if (ok) {
+        t = ds4_gpu_tensor_alloc(n * sizeof(host[0]));
+        ok = t != NULL && ds4_gpu_tensor_write(t, 0, host, n * sizeof(host[0])) != 0;
+    }
+    free(host);
+    if (!ok) {
+        if (t) ds4_gpu_tensor_free(t);
+        fprintf(stderr, "ds4: failed to load directional steering vectors from %s\n", path);
+        return NULL;
+    }
+    const uint32_t idx = g->steering_cache_len++;
+    snprintf(g->steering_cache[idx].name, sizeof(g->steering_cache[idx].name), "%s", name);
+    g->steering_cache[idx].dirs = t;
+    return t;
+}
+
+/* Launch/test helper: load a profile by file path (name = its basename) into the
+ * cache and make it the active profile with the given scales. */
 static bool metal_graph_load_directional_steering(
         ds4_gpu_graph *g,
         const char      *path,
         float            attn_scale,
         float            ffn_scale) {
     if (attn_scale == 0.0f && ffn_scale == 0.0f) return true;
-
     if (!path || !path[0]) {
         fprintf(stderr, "ds4: directional steering needs --dir-steering-file\n");
         return false;
     }
-
-    const uint64_t n = (uint64_t)DS4_N_LAYER * DS4_N_EMBD;
-    float *dirs = xmalloc((size_t)n * sizeof(dirs[0]));
-    bool ok = read_f32_binary_file(path, dirs, n);
-    if (ok) {
-        g->directional_steering_dirs = ds4_gpu_tensor_alloc(n * sizeof(dirs[0]));
-        ok = g->directional_steering_dirs != NULL &&
-             ds4_gpu_tensor_write(g->directional_steering_dirs, 0, dirs, n * sizeof(dirs[0])) != 0;
-    }
-    free(dirs);
-
-    if (!ok) {
-        fprintf(stderr, "ds4: failed to load directional steering vectors from %s\n", path);
-        return false;
-    }
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    ds4_gpu_tensor *t = metal_graph_steering_cache_get(g, base, path);
+    if (!t) return false;
+    g->directional_steering_dirs = t;
     g->directional_steering_attn_scale = attn_scale;
     g->directional_steering_ffn_scale = ffn_scale;
     fprintf(stderr, "ds4: directional steering enabled: %s attn=%g ffn=%g\n",
@@ -26375,6 +26405,83 @@ int ds4_session_set_power(ds4_session *s, int power_percent) {
     if (!ds4_session_is_cpu(s)) s->graph.power_percent = (uint32_t)power_percent;
 #endif
     return 0;
+}
+
+int ds4_session_set_steering_scale(ds4_session *s, float attn, float ffn) {
+#ifndef DS4_NO_GPU
+    if (!s || ds4_session_is_cpu(s)) return 1;
+    s->graph.directional_steering_attn_scale = attn;
+    s->graph.directional_steering_ffn_scale = ffn;
+    return 0;
+#else
+    (void)s; (void)attn; (void)ffn;
+    return 1;
+#endif
+}
+
+void ds4_session_get_steering(ds4_session *s, float *attn, float *ffn, bool *loaded) {
+#ifndef DS4_NO_GPU
+    const bool gpu = s && !ds4_session_is_cpu(s);
+    if (attn) *attn = gpu ? s->graph.directional_steering_attn_scale : 0.0f;
+    if (ffn) *ffn = gpu ? s->graph.directional_steering_ffn_scale : 0.0f;
+    if (loaded) *loaded = gpu && s->graph.directional_steering_dirs != NULL;
+#else
+    (void)s;
+    if (attn) *attn = 0.0f;
+    if (ffn) *ffn = 0.0f;
+    if (loaded) *loaded = false;
+#endif
+}
+
+bool ds4_session_steering_is_cached(ds4_session *s, const char *name) {
+#ifndef DS4_NO_GPU
+    if (!s || ds4_session_is_cpu(s) || !name || !name[0]) return false;
+    for (uint32_t i = 0; i < s->graph.steering_cache_len; i++)
+        if (!strcmp(s->graph.steering_cache[i].name, name)) return true;
+    return false;
+#else
+    (void)s; (void)name;
+    return false;
+#endif
+}
+
+int ds4_session_steering_select(ds4_session *s, const char *name, const char *path,
+                                float attn, float ffn, char *err, size_t errlen) {
+#ifndef DS4_NO_GPU
+    if (!s || ds4_session_is_cpu(s)) {
+        snprintf(err, errlen, "steering is only available on the GPU backend");
+        return 1;
+    }
+    if (name && name[0]) {
+        /* Cache hit = pointer swap (free); miss = load `path` into the cache.
+         * On failure the active pointer is left untouched, so a bad profile
+         * name never disturbs the current steering state. */
+        ds4_gpu_tensor *t = metal_graph_steering_cache_get(&s->graph, name, path);
+        if (!t) {
+            snprintf(err, errlen, "failed to load steering profile '%s'", name);
+            return 1;
+        }
+        s->graph.directional_steering_dirs = t;
+    } else {
+        s->graph.directional_steering_dirs = NULL;  /* no profile -> steering off */
+    }
+    s->graph.directional_steering_attn_scale = attn;
+    s->graph.directional_steering_ffn_scale = ffn;
+    return 0;
+#else
+    (void)s; (void)name; (void)path; (void)attn; (void)ffn;
+    snprintf(err, errlen, "GPU support is not compiled in");
+    return 1;
+#endif
+}
+
+int ds4_session_reload_steering(ds4_session *s, const char *path,
+                                float attn, float ffn, char *err, size_t errlen) {
+    /* Path-based convenience wrapper: profile name = the file's basename. */
+    if (!path || !path[0]) return ds4_session_set_steering_scale(s, attn, ffn);
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    return ds4_session_steering_select(s, base, path, attn, ffn, err, errlen);
 }
 
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud) {
