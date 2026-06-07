@@ -1,0 +1,4 @@
+## label:   thermal-repro
+## started: 2026-05-27T19:30:40-07:00
+## host:    spark-ebf0 — uptime: up 16 minutes
+## cmd:     ./ds4-bench --prompt-file /home/trevor/Projects/ds4/tests/long_context_story_prompt.txt -m /home/trevor/models/ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf --ctx-start 4096 --ctx-max 32768 --step-mul 2 --gen-tokens 32 --csv /home/trevor/Projects/ds4/tools/perf/runs/thermal-repro/bench.csv --mtp /home/trevor/models/ds4/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf --mtp-draft 2 --temp 1.0 --top-p 0.95 --seed 1234

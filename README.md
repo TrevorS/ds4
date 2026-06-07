@@ -1,3 +1,216 @@
+> **This is a fork.** [`TrevorS/ds4`](https://github.com/TrevorS/ds4) is a GB10 / DGX Spark (NVIDIA `sm_121a`) performance fork of [`antirez/ds4`](https://github.com/antirez/ds4). Fork `main` carries the changes below on top of upstream `main` and is rebased on upstream periodically. Everything below this section is the upstream README, unchanged.
+
+## What's different in this fork
+
+- **GB10 / DGX Spark CUDA backend** — the full model kept resident in the unified GPU memory pool (no per-step weight streaming) — the real GB10 win. Built via PTX→`sm_121` JIT (`make cuda-spark`, the default empty `CUDA_ARCH`), **not** native `sm_121a` cubins: native-arch SASS measured **−5.5% decode** on GB10 for these kernels (the PTX-JIT path schedules better here), so the JIT path is the validated default — don't set `CUDA_ARCH=sm_121`. [`35466ad`](https://github.com/TrevorS/ds4/commit/35466addc5131363d02b1f2c196cccc5e6dead83)
+- **MTP speculative decode (greedy + sampling)** — combined-forward, cascaded N=3 (two draft tokens verified in a single forward pass); `--mtp-draft` defaults to 2. **~1.5× sustained decode uplift over plain** on GB10 across 4k–32k ctx (greedy; see Benchmarks). Now covers **temperature sampling** too, via distribution-preserving rejection sampling (output is identical to plain sampling, just faster: 1.25–1.43× measured); on by default for `temp>0`, `DS4_MTP_SPEC_DISABLE=1` turns it off. **MTP is now wired in `ds4-agent`** — was previously the only DS4 binary that loaded the MTP gguf without ever calling `ds4_session_eval_speculative_*`; the agent's worker decode now spec-decodes too, lifting agent decode tps from ~11 to ~15-18 (+39% to +64%) on chat-formatted prompts. [`fe9f316`](https://github.com/TrevorS/ds4/commit/fe9f316129a77fca66c516b211b4f0e12f04b057), [`0529fad`](https://github.com/TrevorS/ds4/commit/0529fad79e3170e0a9b5918044a570efedcb5472), [`339c59e`](https://github.com/TrevorS/ds4/commit/339c59e255bbaa4f0a7b71acc7354140213053b1), [`38a7570`](https://github.com/TrevorS/ds4/commit/38a757038507266409bf06da46f1beea71433515)
+- **CUDA kernel & graph perf** — share-warp Q8 (load weight quants once across tokens), `__launch_bounds__` tuning (+5.5% decode), bit-identical CUDA-graph decode (+5%), a Q8→f16 dense-weight prewarm (~2× prefill TTFT), and a bounded top-K nucleus sampler that drops the per-token 129k qsort (+14.8% on the sampled path). [`cacfce1`](https://github.com/TrevorS/ds4/commit/cacfce1757e4277ce0d0fbfddea2cbb8669ff78e), [`b9135aa`](https://github.com/TrevorS/ds4/commit/b9135aae5602d29fe93a1a10490bec181ce083e2), [`300430c`](https://github.com/TrevorS/ds4/commit/300430c911d33e6efa5897e6362d18698bd6d9d3), [`2f0955c`](https://github.com/TrevorS/ds4/commit/2f0955c2d5cdd511df148c099ef415ad1c29da66), [`4748b3a`](https://github.com/TrevorS/ds4/commit/4748b3a37a754a6e417e0ecfa6ebe3fd3c9bda68)
+- **Deterministic MTP verify (default) + `DS4_CUDA_FAST_VERIFY` fast mode** — the combined-forward verify is **bit-exact by default** (`mtp-correctness` gate: `worst_rms=0`; `mtp-selfconsistency`: run-to-run `maxabs=0`), so it's mergeable and reproducible. `DS4_CUDA_FAST_VERIFY=1` is the single "Spark fast mode" switch: it bypasses *all* the determinism machinery (fast batched `heads8` attention, n=1 GEMM → cuBLAS, skips the comp-row bitonic sort) for faster decode while staying self-consistent (MTP-fast output == plain-fast). Greedy quality is unaffected on IQ2-XXS.
+- **GB10 weight-residency: HBM device-copy of the hot dense spans** — the startup cache stages the hot Q8 weights into device memory (2 MiB pages) instead of serving them over 4 KiB-page host-registered UVA; without it the Q8 decode matmuls run **~25%/call slower** (a regression an upstream rebase had silently dropped). `DS4_CUDA_NO_HBM_CACHE=1` opts out.
+- **Runtime directional steering** — per-request scale plus an admin endpoint, named profiles, and model-name steering where `model:profile:tier` selects a steering vector and strength. [`d812335`](https://github.com/TrevorS/ds4/commit/d8123355aa3a3b3399e768ab687ee3431c97372b), [`2c1fd09`](https://github.com/TrevorS/ds4/commit/2c1fd095da2e688dbcbc68d37715db121dd65b50)
+- **In-process Python binding** — `make libds4.so` builds an fPIC shared library, and `python/ds4.py` is a ctypes wrapper over the full `ds4.h` API (engine/session lifecycle, tokenization, sampling/logprobs, MTP decode, steering, KV persistence). No server process needed. [`09e3813`](https://github.com/TrevorS/ds4/commit/09e38136a76dabddb8a8273ab36a32c9b005b7d9)
+- **Perf & debug tooling — the `gamut` suite** — `tools/perf/gamut/` is a clean Python package (one CLI, no bash): `gamut-cli capture` nsys-traces a run and joins ptxas regs / gb20b occupancy / ncu stalls / MTP accept+verify timing into one report (md/json/html) and a SQLite run-store; `gamut-cli bench --matrix` runs the 3-cell decode matrix (plain · MTP-greedy · MTP-sample) under a GPU/thermal monitor; `gamut-cli db list|show|compare` reviews/diffs historical runs. Plus a streaming-reasoning client, a mobile-friendly LAN log viewer, and a `DS4_MTP_TV` acceptance probe (`1 − TV`) — see `docs/mtp-nongreedy-sampling.md`. [`b79856c`](https://github.com/TrevorS/ds4/commit/b79856cfa134b063186c138f49242c929be58ffb), [`ce976a0`](https://github.com/TrevorS/ds4/commit/ce976a0d27971c0fa77eac30e8b5eb3885f100b2), [`1b526b1`](https://github.com/TrevorS/ds4/commit/1b526b10e1cc89df88e9fd36bac4ad159a61689a)
+
+### Recommended GB10 settings
+
+What we run for best perf on a DGX Spark (128 GB unified memory) with DeepSeek-V4-Flash IQ2-XXS. **Same core flags across binaries** — `--cuda --warm-weights --mtp DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf --mtp-draft 2 --power 85` — then add binary-specific tail.
+
+```sh
+# ds4-server (HTTP)
+DS4_METAL_PREFILL_CHUNK=2048 ./ds4-server -m ds4flash.gguf \
+  --cuda --warm-weights --power 85 \
+  --mtp DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf --mtp-draft 2 \
+  --ctx 524288
+
+# ds4 (interactive chat)
+./ds4 -m ds4flash.gguf \
+  --cuda --warm-weights --power 85 \
+  --mtp DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf --mtp-draft 2 \
+  -c 524288
+
+# ds4-agent (native coding agent)
+./ds4-agent -m ds4flash.gguf \
+  --cuda --warm-weights --power 85 \
+  --mtp DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf --mtp-draft 2 \
+  -c 524288
+
+# ds4-bench (perf measurement)
+./ds4-bench -m ds4flash.gguf \
+  --cuda --warm-weights --power 85 \
+  --mtp DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf --mtp-draft 2 \
+  --prompt-file tests/long_context_story_prompt.txt \
+  --ctx-start 4096 --ctx-max 32768 --step-mul 2 --gen-tokens 128 --temp 1
+```
+
+What each flag buys:
+
+- `--mtp` + `--mtp-draft 2` — combined-forward speculative decode; **+50-65% sustained decode** over plain. Works in all four binaries as of `mqoyowyo` (the agent was the last holdout — it loaded the MTP gguf but never called the speculative path; that's fixed now).
+- `--warm-weights` — front-loads the Q8→f16 dense-weight cache; **~2× prefill TTFT**.
+- `--power 85` — caps GPU duty cycle at 85%. **Slightly faster than 100%** at sustained load on Spark because the firmware-level thermal throttle never kicks in. Measured 18.99 vs 17.52 t/s at draft=2 sampled (the 100% cell hit the silent throttle floor mid-run).
+- `-c 524288` / `--ctx 524288` — keeps KV cache device-resident; the model's full **1M** context also fits via demand-paged managed memory.
+- `DS4_METAL_PREFILL_CHUNK=2048` — frees context-buffer headroom at no throughput cost (the `4096` default wastes memory on this model). Name is historical, applies to CUDA too.
+
+Flags **not** to pass for everyday use:
+
+- `--quality` — disables TF32, the WMMA indexer, and the Q8→f16 dequant cache. Costs **~37% decode tps** with no observable quality gain on IQ2-XXS weights (the precision was already burned at quantization time). Only useful for cross-backend numerical-drift debugging.
+- `--think-max` — generates extra reasoning tokens; same per-token speed but longer time-to-final-answer on routine prompts. Use only when a task warrants the extra thinking budget.
+
+### Fork knobs
+
+CLI flags (server + bench, fork additions to upstream):
+
+| flag                         | default      | what it does                                                                       |
+| ---------------------------- | ------------ | ---------------------------------------------------------------------------------- |
+| `--mtp PATH`                 | off          | load MTP draft model; enables combined-forward speculative decode                  |
+| `--mtp-draft N`              | 2            | draft tokens verified per forward (cascaded N=3 verifier)                          |
+| `--warm-weights`             | off          | front-load Q8→f16 dense-weight cache (~2× prefill TTFT)                            |
+| `--power N`                  | 100          | cap GPU duty cycle (%). **85** is slightly faster than 100 on Spark — keeps the firmware throttle from biting; thermally safer for sustained sessions |
+| `--ctx N`                    | 4096         | KV cache size; `524288` keeps device-resident, full 1M fits via demand-paged       |
+| `--temp F` (bench)           | 0 (greedy)   | `>0` measures the sampled decode path (spec-sampling when `--mtp` set)             |
+| `--top-p`/`--min-p`/`--seed` | 0.95 / 0 / 1234 | sampler params for the sampled bench cell                                       |
+
+Environment variables (perf / observability):
+
+| env                                | default | effect                                                                  |
+| ---------------------------------- | ------- | ----------------------------------------------------------------------- |
+| `DS4_METAL_PREFILL_CHUNK=N`        | 4096    | prefill chunk tokens; **2048** frees ctx-buffer headroom (zero TPS cost on DS4-Flash). Name is historical — applies to CUDA too. |
+| `DS4_MTP_SPEC_DISABLE=1`           | off     | disable speculative sampling (greedy MTP still active)                  |
+| `DS4_GRAPH_DECODE=1`               | off     | enable bit-identical CUDA-graph decode (+5% sustained, greedy-only)     |
+| `DS4_CUDA_DIRECT_MODEL=1`          | off     | register model mapping without the startup prewarm scan (debug)         |
+| `DS4_CUDA_WEIGHT_PRELOAD_SPAN_MB=N`| 1024    | Q8→f16 dense-weight preload span size                                   |
+| `DS4_LOG_MEM=1`                    | off     | KV/buffer memory log lines on session open                              |
+| `DS4_MTP_TV=1`                     | off     | speculative-sampling acceptance probe (`1 − TV`); see `docs/mtp-nongreedy-sampling.md` |
+| `DS4_MTP_SPEC_LOG=1`               | off     | log every spec-decode miss/verifier fallback                            |
+| `DS4_MTP_TIMING=1`                 | off     | per-spec-step stderr: `drafted=N committed=N total=X ms` — feed into `tools/perf/mtp/parse_timing.py` for accept-rate + committed-distribution stats |
+| `DS4_MTP_MIN_MARGIN=F`             | 0       | reject drafts whose verifier margin is below F. Sweep showed mostly noise across prompt classes; only `analytical-qa` saw a clear +8% at `F=0.5`. Not a universal lever |
+| `DS4_MTP_NO_CASCADE=1`             | off     | force single-draft window (no draft-conditioning). Costs throughput; debug only |
+| `DS4_MTP_STRICT=1`                 | off     | exact verification path (no margin-skip). Same kill-switch `--quality` activates |
+| `DS4_CUDA_MOE_NO_ATOMIC_DOWN=1`    | off     | force the deterministic (non-atomic) MoE down-projection accumulation, even at large prefill chunks. Set this for bit-reproducible greedy decode (see caveat below) |
+| `DS4_CUDA_MOE_ATOMIC_DOWN=1`       | off     | force the atomic-accumulate MoE down-projection on, regardless of chunk size. Faster at large prefill but scheduling-order-dependent |
+| `DS4_CUDA_FAST_VERIFY=1`           | off     | **Spark fast mode** — bypass all deterministic-verify machinery (heads8 batched attention, n=1 GEMM → cuBLAS, skip comp-row sort). Faster MTP/decode; greedy-quality-neutral on IQ2-XXS. Default off keeps the bit-exact verify (the `mtp-correctness`/`mtp-selfconsistency` gates run without it) |
+| `DS4_CUDA_NO_HBM_CACHE=1`          | off     | skip the startup HBM device-copy of hot weight spans (serve them over UVA instead). Costs ~25%/call on the Q8 decode matmuls — debug only |
+| `DS4_CUDA_WEIGHT_CACHE_LIMIT_GB=N` | 96      | device-resident weight-cache budget ceiling (the HBM device-copy stops once spans reach this) |
+
+> **MoE atomic-down nondeterminism (issue #244):** the MoE down-projection auto-enables atomic accumulation for prefill chunks `>= 128` tokens (`ds4_cuda.cu:10437`). Atomic-add accumulation order is scheduling-dependent, so f32 rounding differs run-to-run; this can flip the greedy argmax during large prefill, picking a valid-but-different next token. For bit-reproducible greedy output set `DS4_CUDA_MOE_NO_ATOMIC_DOWN=1` (forces the deterministic path); `DS4_CUDA_MOE_ATOMIC_DOWN=1` forces it on for any chunk size.
+
+`gamut-cli bench` knobs: `--label NAME`, `--matrix`, `--iter N`, `--no-mtp`, `--temp` (sampled cell), `--fast` (`DS4_CUDA_FAST_VERIFY=1`), `--ctx-start/--ctx-max/--gen-tokens`, `-m MODEL`, `--prompt-file FILE`. (The old `tools/perf/bench-with-monitor.sh` and flat scripts now live under `tools/perf/legacy/`.)
+
+### Benchmarks (GB10 / DGX Spark)
+
+Reproduce the full 8-cell decode matrix — four paths (plain / MTP × greedy / sample) crossed with the accuracy dial (high-accuracy deterministic verify vs the `DS4_CUDA_FAST_VERIFY` Spark fast path) — at 4k–32k context. The matrix sets the accuracy mode per-cell and cools the GPU to ≤55 °C between cells (anti-soak), so one run captures the whole grid:
+
+```sh
+tools/perf/gamut-cli bench --label decode-matrix --matrix --iter 1 --gen-tokens 256
+```
+
+Or a single-cell sanity check (plain, fast path, same ctx sweep):
+
+```sh
+tools/perf/gamut-cli bench --label sanity --no-mtp --fast
+```
+
+Defaults the wrapper bakes in: model `DeepSeek-V4-Flash-IQ2XXS` chat-v2, draft `DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32` with `--mtp-draft 2`, core flags `--cuda --warm-weights --power 85`, prompt `tests/long_context_story_prompt.txt` (auto-stitched to fit `--ctx-max`), ctx sweep `--ctx-start 4096 --ctx-max 32768 --step-mul 2`; sample cells add `--temp 1.0 --top-p 0.95 --seed 1234`. Per-cell GPU/CPU/throttle monitors stream into `tools/perf/runs/<label>/` alongside the bench CSVs. (`--no-cooldown` / `--cooldown-c N` tune the between-cell cooldown.)
+
+**Decode t/s** (`--gen-tokens 256` steady-state, cooled between cells, `tools/perf/runs/readme-matrix/`). MTP `(N×)` is the speedup over plain in the same mode.
+
+Fast path (`DS4_CUDA_FAST_VERIFY=1` — the Spark default):
+
+| context | plain-greedy | plain-sample | mtp-greedy   | mtp-sample   |
+| ------: | -----------: | -----------: | -----------: | -----------: |
+|   4,096 |         12.7 |         12.6 | 21.3 (1.68×) | 18.8 (1.49×) |
+|   8,192 |         12.6 |         12.4 | 21.2 (1.68×) | 18.8 (1.52×) |
+|  16,384 |         12.4 |         12.2 | 20.7 (1.67×) | 18.9 (1.55×) |
+|  32,768 |         11.6 |         11.4 | 19.9 (1.72×) | 17.9 (1.57×) |
+
+High-accuracy path (deterministic bit-exact verify — the default; gates run here):
+
+| context | plain-greedy | plain-sample | mtp-greedy   | mtp-sample   |
+| ------: | -----------: | -----------: | -----------: | -----------: |
+|   4,096 |          9.7 |          9.6 | 18.8 (1.94×) | 16.0 (1.67×) |
+|   8,192 |          9.5 |          9.5 | 18.7 (1.97×) | 16.1 (1.69×) |
+|  16,384 |          9.4 |          9.4 | 18.3 (1.95×) | 15.7 (1.67×) |
+|  32,768 |          8.9 |          8.8 | 16.9 (1.90×) | 15.1 (1.72×) |
+
+The fast path buys **~30 % plain decode, ~13 % MTP decode, and ~55 % prefill** over deterministic verify (greedy output is bit-identical between the two — determinism only changes sampled-path fidelity, validated by the `mtp-correctness`/`mtp-selfconsistency` gates). MTP-greedy holds **~1.7× over plain** across the whole ctx range on the fast path (and ~1.9× on the accuracy path, where the determinism tax falls harder on plain). Plain decode is memory-bandwidth-bound (≈12.7 t/s × ~18.9 GB/token ≈ the measured 236 GB/s LPDDR5X read ceiling) — MTP is the only lever past it, by amortizing the per-token weight read across accepted drafts. Prefill is identical across decode paths (~350 t/s fast, ~228 t/s deterministic at 4k–32k) — MTP doesn't affect prefill.
+
+**Long-context decode** (MTP-greedy, `--mtp-draft 2 --power 85`, KV-restore single-context points, 2026-05-29):
+
+| context | decode t/s |
+| ------: | ---------: |
+|  43,643 |       19.7 |
+| 147,877 |       17.6 |
+
+Decode degrades gracefully far past the 32k sweep: ~22.6 t/s peak at 4k → 17.6 t/s at 148k, so ~36× context costs only ~22% decode. The attention + compressed-KV path is bandwidth-bound but holds up at long context (F16 comp-KV above 131k ctx-alloc keeps the cache footprint halved — a memory win, decode-neutral).
+
+Those are *prose* numbers (the bench greedily continues an Italian novel). MTP shines harder on low-entropy output: on real **code or structured generation** the draft accept rate climbs and sustained decode clears **23+ t/s** greedy. Reproducible via the server — AVL-tree codegen:
+
+```sh
+curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
+  "model":"deepseek-v4-flash","reasoning_effort":"none","temperature":0,"max_tokens":1200,
+  "messages":[{"role":"user","content":"Write a complete Python implementation of a balanced AVL tree: node class, insert, delete, search, rotations, in-order traversal, and height-balancing. Full docstrings. Output only code, no prose."}]
+}'
+# server log -> gen=1200 ... avg~=23.3 t/s   (JSON-array generation lands ~25; prose ~15)
+```
+
+#### Per-binary decode tps (same prompt, same flags)
+
+Lighthouse-essay prompt (300 token cap, sampled `--temp 1`, `--mtp-draft 2 --power 85`) across all four binaries:
+
+| binary       | decode tps | what's measured                                        |
+| ------------ | ---------:| ------------------------------------------------------ |
+| **ds4 (CLI)**  | **18.11** | chat-prefilled, sampled MTP via `eval_speculative_sample` |
+| **ds4-bench**  |     17.79 | clean kernel decode, KV-restored (no chat prefill)     |
+| **ds4-server** |     15.91 | HTTP request → chat → MTP decode (server stderr avg)  |
+| **ds4-agent**  |     14.96 | one-shot non-interactive, DSML tool framing + MTP decode |
+
+CLI > bench because the bench measures pure decode on a warm KV while CLI's MTP head sees the chat-formatted essay context, which happens to land more `committed=2` draft hits than the bench's prose-continuation; server takes a ~12% hit from HTTP/JSON + worker-thread coordination; agent takes another ~6% from DSML/tool-parser framing and stream-renderer overhead. None of these were "bugs" — they're the natural cost of each binary's job.
+
+Reproduce the per-binary comparison:
+
+```sh
+tools/perf/legacy/all-binary-bench.sh
+```
+
+#### MTP acceptance by prompt class (agent)
+
+Same agent binary, same flags, varying the prompt content (`--mtp-draft 2 --temp 1 --power 85`):
+
+| class              | accept | decode tps | committed dist (c=0/1/2) |
+| ------------------ | -----:| ---------:| ------------------------: |
+| code-generation    | **79.9%** | **19.62** |  9 / 36 / 55 |
+| prose-continuation |   75.0%   |     n/a*  | 10 / 30 / 60 |
+| analytical-qa      |   61.8%   |   17.29†  | 20 / 37 / 43 |
+| structured-list    |   49.8%   |    14.94  | 27 / 47 / 27 |
+| chat-essay         |   47.7%   |    15.43  | 32 / 41 / 27 |
+
+\* prose model stopped after ~25 generated tokens.  † with `DS4_MTP_MIN_MARGIN=0.5` (analytical was the only class where the margin lever helped). Reproduce: `tools/perf/mtp/baseline_run.sh` and `margin_sweep.sh`.
+
+#### How to measure your own workload
+
+```sh
+# one-shot agent profile (nsys kernel trace + MTP acceptance + decode tps)
+tools/perf/agent/profile_run.sh \
+    --prompt "your prompt here" \
+    --tokens 400 --label my-workload
+
+# server-style HTTP request with avg t/s in server logs
+./ds4-server --cuda --warm-weights --power 85 \
+    --mtp DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf --mtp-draft 2 \
+    --port 8000 -m ds4flash.gguf &
+curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' \
+    -d '{"model":"deepseek-v4-flash","max_tokens":400,"messages":[{"role":"user","content":"..."}]}'
+
+# bench against a warm KV (skip prefill, isolate decode kernels)
+./ds4-bench --cuda --warm-weights --power 85 \
+    --mtp DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf --mtp-draft 2 \
+    --kv-restore ~/.ds4/kvcache/<sha>.kv --ctx-alloc 200000 \
+    --gen-tokens 256 --temp 1 --csv /tmp/bench.csv
+```
+
+For the agent path specifically, `+DWARFSTAR_METRICS` on `--non-interactive` exit reports `decode_tps` (clean) and `avg_tps` (including tool-call drag) — so a tool-heavy session can show a misleading mid-flight number while the actual kernel decode is fine.
+
+---
+
 # DwarfStar
 
 **DwarfStar** is a small native inference engine optimized first for

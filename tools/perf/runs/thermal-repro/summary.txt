@@ -1,0 +1,19 @@
+## rebuild (make cuda-spark)
+make ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=
+make[1]: Entering directory '/home/trevor/Projects/ds4'
+make[1]: 'ds4' is up to date.
+make[1]: 'ds4-server' is up to date.
+make[1]: 'ds4-bench' is up to date.
+make[1]: 'ds4-eval' is up to date.
+make[1]: 'ds4-agent' is up to date.
+make[1]: Leaving directory '/home/trevor/Projects/ds4'
+## label:   thermal-repro
+## started: 2026-05-27T19:30:40-07:00
+## host:    spark-ebf0 — uptime: up 16 minutes
+## cmd:     ./ds4-bench --prompt-file /home/trevor/Projects/ds4/tests/long_context_story_prompt.txt -m /home/trevor/models/ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf --ctx-start 4096 --ctx-max 32768 --step-mul 2 --gen-tokens 32 --csv /home/trevor/Projects/ds4/tools/perf/runs/thermal-repro/bench.csv --mtp /home/trevor/models/ds4/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf --mtp-draft 2 --temp 1.0 --top-p 0.95 --seed 1234
+
+## ended:   2026-05-27T19:32:10-07:00  exit=1
+## samples: 89   peak_temp_C: 44   peak_power_W: 10.92   peak_sm_MHz: 2418
+## throttle masks seen: none (always 0x0)
+## dmesg interesting lines: 1
+## outputs: /home/trevor/Projects/ds4/tools/perf/runs/thermal-repro

@@ -1,0 +1,44 @@
+{
+  "matmul_q8_0_preq_batch_share_warp_kernel<3>": {
+    "stalls": {
+      "long_scb": 63.918327500000004,
+      "lg_throttle": 34.005540375,
+      "mio_throttle": 4.813937625,
+      "short_scb": 2.321336375,
+      "wait": 1.5275205,
+      "barrier": 0.0,
+      "not_selected": 1.3232735
+    },
+    "dominant": "long_scb",
+    "dominant_pct": 59.233032604190676,
+    "occupancy_pct": 62.981723875
+  },
+  "moe_gate_up_mid_expert_tile8_row32_kernel": {
+    "stalls": {
+      "long_scb": 9.171420999999999,
+      "lg_throttle": 0.6838139999999999,
+      "mio_throttle": 0.7898205,
+      "short_scb": 1.3157025,
+      "wait": 1.3790445,
+      "barrier": 4.625086,
+      "not_selected": 0.45771249999999997
+    },
+    "dominant": "long_scb",
+    "dominant_pct": 49.783529480989145,
+    "occupancy_pct": 30.779239
+  },
+  "moe_down_expert_tile8_row32_kernel": {
+    "stalls": {
+      "long_scb": 14.737271,
+      "lg_throttle": 4.278788,
+      "mio_throttle": 0.0009385000000000001,
+      "short_scb": 1.065009,
+      "wait": 1.8783195,
+      "barrier": 25.20001,
+      "not_selected": 0.1721495
+    },
+    "dominant": "barrier",
+    "dominant_pct": 53.24041138722791,
+    "occupancy_pct": 15.8818905
+  }
+}

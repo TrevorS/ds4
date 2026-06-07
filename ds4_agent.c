@@ -65,6 +65,8 @@ typedef struct {
     agent_generation_options gen;
     const char *chdir_path;
     bool non_interactive;
+    bool save_on_exit;
+    const char *load_session_sha;
 } agent_config;
 
 typedef enum {
@@ -557,6 +559,10 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.prompt = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--non-interactive")) {
             c.non_interactive = true;
+        } else if (!strcmp(arg, "--save-on-exit")) {
+            c.save_on_exit = true;
+        } else if (!strcmp(arg, "--load-session")) {
+            c.load_session_sha = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {
@@ -7415,16 +7421,14 @@ static bool agent_worker_compact_if_needed(agent_worker *w, const char *reason,
     return agent_worker_compact(w, reason, err, err_len);
 }
 
-static int worker_accept_generated_token(agent_worker *w,
-                                         int token,
-                                         int *generated,
-                                         double t0,
-                                         agent_stream_renderer *stream,
-                                         char *err,
-                                         size_t err_len) {
-    if (ds4_session_eval(w->session, token, err, err_len) != 0)
-        return 1;
-
+/* Stream + bookkeeping for a token whose session_eval has already happened.
+ * Used by the MTP speculative path where ds4_session_eval_speculative_* has
+ * advanced the session for us. */
+static int worker_record_decoded_token(agent_worker *w,
+                                       int token,
+                                       int *generated,
+                                       double t0,
+                                       agent_stream_renderer *stream) {
     ds4_tokens_push(&w->transcript, token);
 
     size_t text_len = 0;
@@ -7441,6 +7445,18 @@ static int worker_accept_generated_token(agent_worker *w,
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
     return 0;
+}
+
+static int worker_accept_generated_token(agent_worker *w,
+                                         int token,
+                                         int *generated,
+                                         double t0,
+                                         agent_stream_renderer *stream,
+                                         char *err,
+                                         size_t err_len) {
+    if (ds4_session_eval(w->session, token, err, err_len) != 0)
+        return 1;
+    return worker_record_decoded_token(w, token, generated, t0, stream);
 }
 
 static int worker_force_generated_text(agent_worker *w,
@@ -7674,6 +7690,13 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         pthread_mutex_unlock(&w->mu);
 
         bool status_greedy_sampling = false;
+        /* MTP availability is fixed for the run; cache once. The
+         * DS4_MTP_SPEC_DISABLE env var matches what ds4-cli + ds4-bench
+         * + ds4-server check so a single knob disables spec everywhere. */
+        const bool mtp_ready =
+            ds4_engine_mtp_draft_tokens(w->engine) > 1 &&
+            getenv("DS4_MTP_SPEC_DISABLE") == NULL;
+
         while (generated < max_tokens && !worker_should_interrupt(w)) {
             worker_apply_pending_power(w);
             bool greedy_sampling = agent_stream_wants_greedy_sampling(&stream);
@@ -7692,6 +7715,9 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 agent_trace(w, "edit old auto-upto replaced token=%d text=%.*s",
                             token, (int)(text_len > 80 ? 80 : text_len), text);
                 free(text);
+                /* upto-forcer bypasses MTP — it replaces the sampled token
+                 * with a fixed text fragment that needs to be evaluated
+                 * normally. */
                 if (worker_force_generated_text(w, "[upto]\n", max_tokens,
                                                 &generated, t0, &stream,
                                                 err, sizeof(err)) != 0) {
@@ -7701,12 +7727,58 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 }
             } else {
                 free(text);
-                if (worker_accept_generated_token(w, token, &generated, t0,
-                                                  &stream, err, sizeof(err)) != 0) {
+                /* MTP spec path: evaluate token + drafts in one combined
+                 * forward and commit the accepted prefix. Plain path is
+                 * the fallback. */
+                int toks[17];
+                const int toks_cap = (int)(sizeof(toks) / sizeof(toks[0]));
+                int ntok;
+                if (mtp_ready && cfg->gen.temperature > 0.0f) {
+                    ntok = ds4_session_eval_speculative_sample(
+                        w->session, token, max_tokens - generated,
+                        ds4_token_eos(w->engine),
+                        cfg->gen.temperature, 0,
+                        cfg->gen.top_p, cfg->gen.min_p, &rng,
+                        toks, toks_cap, err, sizeof(err));
+                } else if (mtp_ready) {
+                    ntok = ds4_session_eval_speculative_argmax(
+                        w->session, token, max_tokens - generated,
+                        ds4_token_eos(w->engine),
+                        toks, toks_cap, err, sizeof(err));
+                } else {
+                    if (ds4_session_eval(w->session, token, err,
+                                         sizeof(err)) != 0) {
+                        agent_dsml_parser_free(&dsml);
+                        agent_set_error(w, err);
+                        return 1;
+                    }
+                    toks[0] = token;
+                    ntok = 1;
+                }
+                if (ntok < 0) {
                     agent_dsml_parser_free(&dsml);
                     agent_set_error(w, err);
                     return 1;
                 }
+
+                bool stop_batch = false;
+                for (int j = 0; j < ntok; j++) {
+                    if (toks[j] == ds4_token_eos(w->engine)) {
+                        stop_batch = true;
+                        break;
+                    }
+                    if (worker_record_decoded_token(w, toks[j], &generated,
+                                                    t0, &stream) != 0) {
+                        agent_dsml_parser_free(&dsml);
+                        agent_set_error(w, err);
+                        return 1;
+                    }
+                    if (generated >= max_tokens) {
+                        stop_batch = true;
+                        break;
+                    }
+                }
+                if (stop_batch) break;
             }
 
             greedy_sampling = agent_stream_wants_greedy_sampling(&stream);
@@ -9521,6 +9593,21 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     agent_prompt_queue queue = {0};
     double quiet_deadline = 0.0;
     int rc = 0;
+    bool load_session_done = (cfg->load_session_sha == NULL);
+    /* Token-rate metrics (printed once on exit as +DWARFSTAR_METRICS).
+     * decode_sec/decode_tokens accumulate only while the worker is in
+     * AGENT_WORKER_GENERATING, so tool-call prefill and idle time
+     * between turns are excluded from decode_tps. */
+    const double session_t0 = now_sec();
+    double cum_decode_sec = 0.0;
+    double cum_prefill_sec = 0.0;
+    int cum_decode_tokens = 0;
+    int cum_prefill_tokens = 0;
+    double gen_phase_t0 = 0.0;
+    double prefill_phase_t0 = 0.0;
+    double first_token_t = 0.0;     /* time of first generated token */
+    agent_worker_state prev_state = AGENT_WORKER_IDLE;
+    int phase_generated = 0;
 
     if (!one_shot) {
         if (set_nonblock(STDIN_FILENO, true, &old_stdin_flags) != 0) {
@@ -9535,7 +9622,22 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
         bool initialized = worker_is_initialized(&worker, NULL);
         bool idle = worker_is_idle(&worker);
 
-        if (one_shot && !one_shot_submitted && initialized) {
+        if (!load_session_done && initialized && idle) {
+            char err[160] = {0};
+            if (!agent_worker_switch_session(&worker, cfg->load_session_sha,
+                                             AGENT_HISTORY_DEFAULT_TURNS,
+                                             err, sizeof(err))) {
+                fprintf(stderr, "ds4-agent: --load-session %s: %s\n",
+                        cfg->load_session_sha,
+                        err[0] ? err : "switch failed");
+                rc = 1;
+                break;
+            }
+            load_session_done = true;
+            idle = false;  /* switch may flip worker out of idle briefly */
+        }
+
+        if (one_shot && !one_shot_submitted && initialized && load_session_done) {
             if (worker_submit(&worker, cfg->gen.prompt))
                 one_shot_submitted = true;
             idle = false;
@@ -9603,6 +9705,33 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             write_all(STDOUT_FILENO, out, out_len);
             fflush(stdout);
         }
+
+        /* Metrics: accumulate decode time per generation phase. */
+        if (st.state == AGENT_WORKER_GENERATING) {
+            if (prev_state != AGENT_WORKER_GENERATING) {
+                gen_phase_t0 = now_sec();
+                phase_generated = 0;
+            }
+            if (st.generated > phase_generated) {
+                if (phase_generated == 0 && first_token_t == 0.0)
+                    first_token_t = now_sec();
+                phase_generated = st.generated;
+            }
+        } else if (prev_state == AGENT_WORKER_GENERATING) {
+            cum_decode_sec += now_sec() - gen_phase_t0;
+            cum_decode_tokens += phase_generated;
+            phase_generated = 0;
+        }
+        /* Prefill timing: prefill_total/done track the chat-prefill chunks.
+         * Treat any prefill activity as part of the prefill bucket. */
+        if (st.state == AGENT_WORKER_PREFILL) {
+            if (prev_state != AGENT_WORKER_PREFILL)
+                prefill_phase_t0 = now_sec();
+        } else if (prev_state == AGENT_WORKER_PREFILL) {
+            cum_prefill_sec += now_sec() - prefill_phase_t0;
+            if (st.prefill_total > 0) cum_prefill_tokens += st.prefill_total;
+        }
+        prev_state = st.state;
         free(out);
 
         if (worker_take_queued_user_drain_request(&worker)) {
@@ -9654,6 +9783,45 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     if (stdin_nonblock) fcntl(STDIN_FILENO, F_SETFL, old_stdin_flags);
     agent_input_buf_free(&input);
     agent_prompt_queue_free(&queue);
+
+    /* Final metrics — captured after the worker has settled to idle. */
+    if (prev_state == AGENT_WORKER_GENERATING) {
+        cum_decode_sec += now_sec() - gen_phase_t0;
+        cum_decode_tokens += phase_generated;
+    }
+    if (prev_state == AGENT_WORKER_PREFILL)
+        cum_prefill_sec += now_sec() - prefill_phase_t0;
+    {
+        const double wall = now_sec() - session_t0;
+        const double decode_tps = cum_decode_sec > 0.0
+            ? (double)cum_decode_tokens / cum_decode_sec : 0.0;
+        const double avg_tps = wall > 0.0
+            ? (double)cum_decode_tokens / wall : 0.0;
+        const double ttft = first_token_t > 0.0 ? first_token_t - session_t0 : 0.0;
+        fprintf(stderr,
+                "+DWARFSTAR_METRICS wall_s=%.3f decode_s=%.3f decode_tokens=%d "
+                "decode_tps=%.2f avg_tps=%.2f prefill_s=%.3f prefill_tokens=%d "
+                "ttft_s=%.3f\n",
+                wall, cum_decode_sec, cum_decode_tokens,
+                decode_tps, avg_tps, cum_prefill_sec, cum_prefill_tokens, ttft);
+        fflush(stderr);
+    }
+
+    if (rc == 0 && cfg->save_on_exit) {
+        char sha[41] = {0};
+        int saved_tokens = 0;
+        char err[160] = {0};
+        if (agent_worker_save_session_now(&worker, sha, &saved_tokens,
+                                          err, sizeof(err))) {
+            printf("+DWARFSTAR_SAVED %s\n", sha);
+            fflush(stdout);
+        } else {
+            fprintf(stderr, "ds4-agent: --save-on-exit: %s\n",
+                    err[0] ? err : "save failed");
+            rc = 1;
+        }
+    }
+
     agent_worker_free(&worker);
     return rc;
 }

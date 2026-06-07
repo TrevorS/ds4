@@ -1,0 +1,6 @@
+[20:03:24] [plain#3] ds4: CUDA backend initialized on NVIDIA GB10 (sm_121)
+[20:03:28] [plain#3] ds4: CUDA registered 80.76 GiB model mapping for device access
+[20:03:28] [plain#3] ds4: CUDA startup model cache prepared 8.20 GiB of tensor spans in 0.438s
+[20:03:28] [plain#3] ds4: cuda backend initialized for graph diagnostics
+[20:03:28] [plain#3] ds4-bench: context buffers 1054.41 MiB (ctx=32801, backend=cuda, prefill_chunk=4096, raw_kv_rows=4352, compressed_kv_rows=8202)
+[20:03:28] [plain#3] ds4-bench: decode path = plain
