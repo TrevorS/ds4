@@ -66,6 +66,29 @@ make
 make cuda-regression
 ```
 
+The CUDA build also ships three numeric correctness gates (CUDA-only; they skip
+on Metal/CPU builds):
+
+```sh
+make cuda-ppl          # perplexity regression vs the committed self-baseline
+make cpu-cuda-ppl      # cross-check CUDA avg-NLL against a committed CPU f32 reference
+./ds4_test --cuda-tensor-equivalence   # per-layer CUDA-vs-CPU hidden-state RMS gate
+```
+
+- `--cuda-tensor-equivalence`: teacher-forces a single-token decode layer by
+  layer and RMS/max-abs-diffs each GPU layer's post-FFN hidden state against the
+  CPU f32 reference, localizing sub-argmax drift to the first diverging layer.
+  Set `DS4_TEST_TE_VERBOSE=1` for the full per-layer dump; tune tolerances with
+  `DS4_TEST_TE_RMS_TOL` / `DS4_TEST_TE_MAX_TOL`.
+- `--cuda-ppl`: scores avg-NLL on a fixed mixed prose+code corpus and compares
+  to `tests/test-vectors/ppl-baseline.txt` — one scale-free scalar integrating
+  every layer's numeric drift. Determinism is forced. Regenerate the baseline
+  after an intentional numeric change with `make cuda-ppl-baseline`.
+- `--cpu-cuda-ppl`: cross-checks the CUDA avg-NLL against a committed CPU f32
+  scalar reference (CUDA == reference, not just CUDA == itself). It skips if no
+  reference is committed; capture one on the CPU cores (slow) with
+  `make cpu-ppl-baseline`.
+
 For CPU portability, at least verify that the CPU target still builds:
 
 ```sh

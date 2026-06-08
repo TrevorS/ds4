@@ -40,7 +40,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm cuda-ppl cuda-ppl-baseline cpu-cuda-ppl cpu-ppl-baseline
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -137,6 +137,23 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu
 
 cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
+
+# Perplexity regression gate: teacher-forced avg-NLL on a committed corpus vs a
+# committed baseline (tests/test-vectors/ppl-baseline.txt). One scale-free scalar
+# that integrates every layer's numeric drift. Determinism is forced in the test.
+cuda-ppl: ds4_test
+	./ds4_test --cuda-ppl
+cuda-ppl-baseline: ds4_test
+	DS4_TEST_PPL_WRITE_BASELINE=1 ./ds4_test --cuda-ppl
+
+# CPU-reference perplexity cross-check: CUDA avg-NLL on a short reference corpus
+# vs a committed CPU f32 scalar reference (the correctness claim). cpu-ppl-baseline
+# captures the CPU reference once on the Grace cores (slow); cpu-cuda-ppl runs the
+# fast CUDA-vs-committed-reference check.
+cpu-cuda-ppl: ds4_test
+	./ds4_test --cpu-cuda-ppl
+cpu-ppl-baseline: ds4_test
+	DS4_TEST_PPL_WRITE_BASELINE=1 ./ds4_test --cpu-cuda-ppl
 endif
 
 ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h

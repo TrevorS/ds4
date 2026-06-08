@@ -1803,6 +1803,245 @@ static void test_server_unit_group(void) {
 
 typedef void (*test_fn)(void);
 
+static void test_cuda_tensor_equivalence(void) {
+#ifdef __APPLE__
+    fprintf(stderr, "ds4-test: cuda-tensor-equivalence skipped (CUDA-only, Metal build)\n");
+    return;
+#else
+    ds4_engine *engine = test_open_engine(false);
+    if (!engine) return;
+
+    /* A short prompt suffices: the gate runs its own teacher-forced single-token
+     * forward off the first checkpoint token, independent of prefill KV depth. */
+    ds4_tokens prompt = {0};
+    ds4_tokenize_text(engine, "The quick brown fox jumps over the lazy dog.", &prompt);
+    TEST_ASSERT(prompt.len >= 1);
+
+    ds4_session *session = NULL;
+    TEST_ASSERT(ds4_session_create(&session, engine, 8192) == 0);
+    if (!session) {
+        ds4_tokens_free(&prompt);
+        ds4_engine_close(engine);
+        return;
+    }
+
+    char err[160];
+    TEST_ASSERT(ds4_session_sync(session, &prompt, err, sizeof(err)) == 0);
+
+    /* Scale-invariant (relative-to-reference-RMS) tolerances on the per-layer
+     * hidden-channel state. Measured clean-run noise floor on GB10 is worst
+     * rel_rms ~0.005 / rel_max ~0.039 across all 43 layers; the committed
+     * defaults sit ~10x above that and far below the relative drift a real
+     * kernel regression (the ~0.2 absolute-RMS class) would produce.
+     * Overridable for calibration via DS4_TEST_TE_{RMS,MAX}_TOL. */
+    double rms_tol = 0.05, max_abs_tol = 0.5;
+    const char *rt = getenv("DS4_TEST_TE_RMS_TOL"); if (rt && rt[0]) rms_tol = atof(rt);
+    const char *mt = getenv("DS4_TEST_TE_MAX_TOL"); if (mt && mt[0]) max_abs_tol = atof(mt);
+
+    double worst_rms = 0.0, worst_max = 0.0;
+    int first_fail = -1, nonfinite = 0;
+    const int fails = ds4_cuda_tensor_equivalence_selftest(
+        session, rms_tol, max_abs_tol, &worst_rms, &worst_max, &first_fail, &nonfinite);
+    fprintf(stderr,
+            "ds4-test: cuda-tensor-equivalence fails=%d worst_rms=%g worst_max=%g "
+            "first_fail_layer=%d nonfinite=%d (rms_tol=%g max_tol=%g)\n",
+            fails, worst_rms, worst_max, first_fail, nonfinite, rms_tol, max_abs_tol);
+    TEST_ASSERT(nonfinite == 0);
+    TEST_ASSERT(first_fail < 0);
+    TEST_ASSERT(fails == 0);
+
+    ds4_session_free(session);
+    ds4_tokens_free(&prompt);
+    ds4_engine_close(engine);
+#endif
+}
+
+/* Teacher-force a corpus through `engine` and return its average NLL. Same loop
+ * run_perplexity_file uses: sync a 32-token prefix, then per token
+ * token_logprob -> -logprob -> eval. Backend-agnostic (the caller picks CUDA or
+ * CPU). Caller owns the engine. Returns false on any tokenize/sync/score error. */
+static bool test_ppl_score(ds4_engine *engine, const char *corpus_path,
+                           int prefix_len, double *out_avg_nll, int *out_scored) {
+    *out_avg_nll = 0.0;
+    *out_scored = 0;
+    char *text = test_read_file(corpus_path);
+    if (!text) return false;
+    ds4_tokens tokens = {0};
+    ds4_tokenize_text(engine, text, &tokens);
+    free(text);
+    if (tokens.len <= prefix_len + 16) { ds4_tokens_free(&tokens); return false; }
+    const int scored = tokens.len - prefix_len;
+
+    ds4_session *session = NULL;
+    if (ds4_session_create(&session, engine, 8192) != 0) { ds4_tokens_free(&tokens); return false; }
+
+    char err[160];
+    ds4_tokens prefix = {0};
+    for (int i = 0; i < prefix_len; i++) ds4_tokens_push(&prefix, tokens.v[i]);
+    bool ok = (ds4_session_sync(session, &prefix, err, sizeof(err)) == 0);
+    ds4_tokens_free(&prefix);
+
+    double nll = 0.0;
+    for (int j = 0; ok && j < scored; j++) {
+        const int i = prefix_len + j;
+        ds4_token_score score;
+        if (!ds4_session_token_logprob(session, tokens.v[i], &score)) { ok = false; break; }
+        nll -= (double)score.logprob;
+        if (((j + 1) % 64) == 0 || j + 1 == scored) {
+            fprintf(stderr, "ds4-test: ppl scored %d/%d\r", j + 1, scored);
+            fflush(stderr);
+        }
+        if (j + 1 < scored && ds4_session_eval(session, tokens.v[i], err, sizeof(err)) != 0) { ok = false; break; }
+    }
+    if (ok) { fputc('\n', stderr); *out_avg_nll = nll / (double)scored; *out_scored = scored; }
+
+    ds4_session_free(session);
+    ds4_tokens_free(&tokens);
+    return ok;
+}
+
+/* Shared `avg_nll=.. scored=.. tol=..` baseline file format. */
+static bool test_ppl_read_baseline(const char *path, double *avg, int *scored, double *tol) {
+    FILE *bf = fopen(path, "r");
+    if (!bf) return false;
+    const bool ok = (fscanf(bf, "avg_nll=%lf scored=%d tol=%lf", avg, scored, tol) == 3);
+    fclose(bf);
+    return ok;
+}
+
+static bool test_ppl_write_baseline(const char *path, double avg, int scored, double tol) {
+    FILE *wf = fopen(path, "w");
+    if (!wf) return false;
+    fprintf(wf, "avg_nll=%.9f\nscored=%d\ntol=%.4f\n", avg, scored, tol);
+    fclose(wf);
+    return true;
+}
+
+/* Perplexity regression gate. Teacher-forces a committed mixed prose+code corpus
+ * and compares avg-NLL against a committed CUDA self-baseline. PPL integrates
+ * every layer's numeric drift into one scale-free scalar -- the standard
+ * llama.cpp-style correctness number. Determinism is forced so it's bit-
+ * reproducible run-to-run. Regenerate after an intentional numeric change with
+ * DS4_TEST_PPL_WRITE_BASELINE=1 (or `make cuda-ppl-baseline`); also written if the
+ * baseline file is absent. */
+static void test_cuda_perplexity(void) {
+#ifdef __APPLE__
+    fprintf(stderr, "ds4-test: cuda-ppl skipped (CUDA-only, Metal build)\n");
+    return;
+#else
+    setenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN", "1", 1);  /* bit-reproducible scalar */
+
+    const char *corpus_path = getenv("DS4_TEST_PPL_CORPUS");
+    if (!corpus_path || !corpus_path[0]) corpus_path = "tests/test-vectors/ppl-corpus.txt";
+    const char *baseline_path = getenv("DS4_TEST_PPL_BASELINE");
+    if (!baseline_path || !baseline_path[0]) baseline_path = "tests/test-vectors/ppl-baseline.txt";
+
+    ds4_engine *engine = test_open_engine(false);
+    if (!engine) return;
+
+    double avg_nll = 0.0;
+    int scored = 0;
+    const bool ok = test_ppl_score(engine, corpus_path, 32, &avg_nll, &scored);
+    TEST_ASSERT(ok);
+
+    if (ok) {
+        const double ppl = exp(avg_nll);
+        double base_avg = 0.0, base_tol = 0.03;
+        int base_scored = 0;
+        const bool have_base = test_ppl_read_baseline(baseline_path, &base_avg, &base_scored, &base_tol);
+        const bool want_write = getenv("DS4_TEST_PPL_WRITE_BASELINE") != NULL;
+
+        if (!have_base || want_write) {
+            const bool wrote = test_ppl_write_baseline(baseline_path, avg_nll, scored, base_tol);
+            TEST_ASSERT(wrote);
+            fprintf(stderr, "ds4-test: cuda-ppl baseline %s -> %s (avg_nll=%.9f ppl=%.6f scored=%d)\n",
+                    have_base ? "rewritten" : "written", baseline_path, avg_nll, ppl, scored);
+        } else {
+            const double delta = fabs(avg_nll - base_avg);
+            fprintf(stderr,
+                    "ds4-test: cuda-ppl avg_nll=%.9f ppl=%.6f (baseline avg_nll=%.9f ppl=%.6f) "
+                    "delta=%.6f tol=%.4f scored=%d/%d\n",
+                    avg_nll, ppl, base_avg, exp(base_avg), delta, base_tol, scored, base_scored);
+            /* A scored-count mismatch means the corpus or tokenizer moved -> the
+             * baseline is stale, not a model regression. Fail loud to force a regen. */
+            TEST_ASSERT(scored == base_scored);
+            TEST_ASSERT(delta < base_tol);
+        }
+    }
+
+    ds4_engine_close(engine);
+#endif
+}
+
+/* CPU-reference perplexity cross-check (correctness, not just regression). On a
+ * short reference corpus, scores avg-NLL on the CUDA path and asserts it matches a
+ * COMMITTED CPU f32 scalar-reference avg-NLL within tol -- i.e. CUDA == the
+ * reference, the claim a CUDA self-baseline can't make (it only proves CUDA didn't
+ * change vs itself). The CPU reference is a slow Grace-core forward, so it is NOT
+ * run in routine CI: it is captured once with DS4_TEST_PPL_WRITE_BASELINE=1
+ * (`make cpu-ppl-baseline`) and committed; normal runs only score the fast CUDA
+ * path against the committed constant. If no CPU reference is committed the gate
+ * skips (it never auto-triggers the slow capture). */
+static void test_cpu_cuda_ppl(void) {
+#ifdef __APPLE__
+    fprintf(stderr, "ds4-test: cpu-cuda-ppl skipped (CUDA-only, Metal build)\n");
+    return;
+#else
+    setenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN", "1", 1);
+
+    const char *corpus_path = getenv("DS4_TEST_PPL_REF_CORPUS");
+    if (!corpus_path || !corpus_path[0]) corpus_path = "tests/test-vectors/ppl-corpus-ref.txt";
+    const char *cpuref_path = getenv("DS4_TEST_PPL_CPU_BASELINE");
+    if (!cpuref_path || !cpuref_path[0]) cpuref_path = "tests/test-vectors/ppl-baseline-cpu.txt";
+
+    double base_avg = 0.0, base_tol = 0.01;
+    int base_scored = 0;
+    const bool have_base = test_ppl_read_baseline(cpuref_path, &base_avg, &base_scored, &base_tol);
+    const bool want_write = getenv("DS4_TEST_PPL_WRITE_BASELINE") != NULL;
+
+    if (want_write) {
+        /* CAPTURE: CPU f32 scalar reference (slow). Explicit opt-in only. */
+        ds4_engine *cpu = NULL;
+        ds4_engine_options opt = { .model_path = test_model_path(), .backend = DS4_BACKEND_CPU };
+        TEST_ASSERT(ds4_engine_open(&cpu, &opt) == 0 && cpu != NULL);
+        if (!cpu) return;
+        double avg = 0.0; int scored = 0;
+        const bool ok = test_ppl_score(cpu, corpus_path, 32, &avg, &scored);
+        ds4_engine_close(cpu);
+        TEST_ASSERT(ok);
+        if (ok) {
+            TEST_ASSERT(test_ppl_write_baseline(cpuref_path, avg, scored, base_tol));
+            fprintf(stderr, "ds4-test: cpu-cuda-ppl CPU reference %s -> %s (avg_nll=%.9f ppl=%.6f scored=%d, tol=%.4f)\n",
+                    have_base ? "rewritten" : "written", cpuref_path, avg, exp(avg), scored, base_tol);
+        }
+        return;
+    }
+
+    if (!have_base) {
+        fprintf(stderr, "ds4-test: cpu-cuda-ppl skipped — no CPU reference at %s "
+                        "(run `make cpu-ppl-baseline` to capture it)\n", cpuref_path);
+        return;
+    }
+
+    /* CHECK: score the same reference corpus on CUDA, compare to the CPU ref. */
+    ds4_engine *engine = test_open_engine(false);
+    if (!engine) return;
+    double cuda_avg = 0.0; int cuda_scored = 0;
+    const bool ok = test_ppl_score(engine, corpus_path, 32, &cuda_avg, &cuda_scored);
+    ds4_engine_close(engine);
+    TEST_ASSERT(ok);
+    if (ok) {
+        const double delta = fabs(cuda_avg - base_avg);
+        fprintf(stderr,
+                "ds4-test: cpu-cuda-ppl cuda_avg_nll=%.9f ppl=%.6f vs CPU-ref avg_nll=%.9f ppl=%.6f "
+                "delta=%.6f tol=%.4f scored=%d/%d\n",
+                cuda_avg, exp(cuda_avg), base_avg, exp(base_avg), delta, base_tol, cuda_scored, base_scored);
+        TEST_ASSERT(cuda_scored == base_scored);
+        TEST_ASSERT(delta < base_tol);
+    }
+#endif
+}
+
 typedef struct {
     const char *flag;
     const char *name;
@@ -1820,6 +2059,9 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
+    {"--cuda-tensor-equivalence", "cuda-tensor-equivalence", "CUDA vs CPU per-layer hidden-state RMS gate, localizes sub-argmax drift (skips on Metal)", test_cuda_tensor_equivalence},
+    {"--cuda-ppl", "cuda-ppl", "perplexity regression vs committed baseline on a fixed corpus (skips on Metal)", test_cuda_perplexity},
+    {"--cpu-cuda-ppl", "cpu-cuda-ppl", "perplexity cross-check: CUDA vs committed CPU f32 reference (skips if no ref; capture via make cpu-ppl-baseline)", test_cpu_cuda_ppl},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };

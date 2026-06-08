@@ -26619,3 +26619,140 @@ int ds4_session_ctx(ds4_session *s) {
 int ds4_session_prefill_cap(ds4_session *s) {
     return s ? (int)s->prefill_cap : 0;
 }
+
+int ds4_cuda_tensor_equivalence_selftest(ds4_session *s,
+                                         double rms_tol,
+                                         double max_abs_tol,
+                                         double *out_worst_rms,
+                                         double *out_worst_max_abs,
+                                         int *out_first_fail_layer,
+                                         int *out_nonfinite) {
+    if (out_worst_rms) *out_worst_rms = 0.0;
+    if (out_worst_max_abs) *out_worst_max_abs = 0.0;
+    if (out_first_fail_layer) *out_first_fail_layer = -1;
+    if (out_nonfinite) *out_nonfinite = 0;
+#ifdef DS4_NO_GPU
+    (void)s; (void)rms_tol; (void)max_abs_tol;
+    fprintf(stderr, "ds4: cuda-tensor-equivalence self-test requires a GPU build\n");
+    return 1;
+#else
+    if (!s || !s->engine || s->engine->backend != DS4_BACKEND_CUDA) {
+        fprintf(stderr, "ds4: cuda-tensor-equivalence self-test requires a CUDA session\n");
+        return 1;
+    }
+    if (!s->checkpoint_valid || s->checkpoint.len < 1) {
+        fprintf(stderr, "ds4: cuda-tensor-equivalence self-test needs a synced prefix\n");
+        return 1;
+    }
+    /* Force deterministic MoE down-projection for a stable single-run GPU-vs-CPU
+     * compare, then restore the caller's prior setting on exit -- this is a
+     * public hook and must not leak process-global state into the rest of a
+     * test run.  Copy the value first: setenv may invalidate the getenv ptr. */
+    char prev_atomic[32];
+    const char *prev_atomic_env = getenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN");
+    const bool had_prev_atomic = prev_atomic_env != NULL;
+    if (had_prev_atomic) {
+        strncpy(prev_atomic, prev_atomic_env, sizeof(prev_atomic) - 1);
+        prev_atomic[sizeof(prev_atomic) - 1] = '\0';
+    }
+    setenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN", "1", 1);
+    /* Per-layer drift lines are gated behind DS4_TEST_TE_VERBOSE; by default only
+     * tolerance-exceeding layers and the final summary print. */
+    const bool te_verbose = getenv("DS4_TEST_TE_VERBOSE") != NULL;
+
+    ds4_engine *e = s->engine;
+    const ds4_model *model = &e->model;
+    const ds4_weights *weights = &e->weights;
+    const int token = s->checkpoint.v[0];
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+
+    float *plain = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *cpu_cur = xmalloc((size_t)hc_dim * sizeof(float));
+    float *cpu_next = xmalloc((size_t)hc_dim * sizeof(float));
+    float *gpu_hc = xmalloc((size_t)hc_dim * sizeof(float));
+
+    ds4_gpu_graph g;
+    bool ok = metal_graph_alloc(&g, weights, &weights->layer[0]);
+    if (ok) g.materialize_ffn_out = true;
+
+    int fails = 0;
+    int first_fail = -1;
+    int nonfinite = 0;
+    double worst_rms = 0.0, worst_max = 0.0;
+
+    if (ok) {
+        embed_token_f16(model, weights, token, plain);
+        hc_from_plain_embedding(cpu_cur, plain, DS4_N_EMBD, DS4_N_HC);
+        ok = ds4_gpu_begin_commands() != 0;
+        if (ok) ok = ds4_gpu_embed_token_hc_tensor(g.cur_hc, model->map, model->size,
+                                                   weights->token_embd->abs_offset,
+                                                   (uint32_t)weights->token_embd->dim[1],
+                                                   (uint32_t)token, DS4_N_EMBD, DS4_N_HC) != 0;
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+    }
+
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        /* Teacher-force the GPU layer input from the CPU reference so each
+         * layer's error is measured in isolation (localizes first divergence). */
+        ok = ds4_gpu_tensor_write(g.cur_hc, 0, cpu_cur, hc_dim * sizeof(float)) != 0;
+        if (ok) ok = ds4_gpu_begin_commands() != 0;
+        if (ok) ok = metal_graph_encode_decode_layer(&g, model, &weights->layer[il],
+                                                     il, 0, g.layer_raw_cache[il],
+                                                     g.raw_cap, 0, 1, token) != 0;
+        ds4_gpu_tensor *tmp = g.cur_hc;
+        g.cur_hc = g.after_ffn_hc;
+        g.after_ffn_hc = tmp;
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+
+        layer_forward_self_one(cpu_next, model, &weights->layer[il], cpu_cur, il, 0, token);
+        if (ok) ok = ds4_gpu_tensor_read(g.cur_hc, 0, gpu_hc, hc_dim * sizeof(float)) != 0;
+        if (ok) {
+            double refsq = 0.0;
+            for (uint64_t i = 0; i < hc_dim; i++) {
+                if (!isfinite(gpu_hc[i])) nonfinite++;
+                refsq += (double)cpu_next[i] * (double)cpu_next[i];
+            }
+            /* The hidden-channel residual magnitude grows with depth, so an
+             * absolute RMS would false-flag deep layers and mask drift in early
+             * ones. Normalize by the reference RMS magnitude -> a scale-invariant
+             * relative drift that is uniform across layers when it is pure float
+             * noise. max_abs is kept as a coarse blow-up guard, also normalized. */
+            const double ref_rms = sqrt(refsq / (double)hc_dim);
+            const double denom = ref_rms > 1e-9 ? ref_rms : 1.0;
+            const double abs_rms = rms_abs_diff(cpu_next, gpu_hc, hc_dim);
+            const double abs_mx = max_abs_diff(cpu_next, gpu_hc, hc_dim);
+            const double rel_rms = abs_rms / denom;
+            const double rel_mx = abs_mx / denom;
+            if (rel_mx > worst_max) worst_max = rel_mx;
+            if (rel_rms > worst_rms) worst_rms = rel_rms;
+            const bool bad = (rel_rms > rms_tol) || (rel_mx > max_abs_tol);
+            if (bad) { fails++; if (first_fail < 0) first_fail = (int)il; }
+            if (bad || te_verbose)
+                fprintf(stderr,
+                        "ds4: cuda-tensor-equivalence L%u rel_rms=%g rel_max=%g "
+                        "(abs_rms=%g ref_rms=%g)%s\n",
+                        il, rel_rms, rel_mx, abs_rms, ref_rms,
+                        bad ? "  <-- EXCEEDS TOL" : "");
+        }
+        float *ctmp = cpu_cur; cpu_cur = cpu_next; cpu_next = ctmp;
+    }
+
+    if (!ok) {
+        fprintf(stderr, "ds4: cuda-tensor-equivalence self-test failed mid-forward\n");
+        fails++;
+    }
+    if (nonfinite > 0) fails++;
+
+    metal_graph_free(&g);
+    free(gpu_hc); free(cpu_next); free(cpu_cur); free(plain);
+
+    if (had_prev_atomic) setenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN", prev_atomic, 1);
+    else unsetenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN");
+
+    if (out_worst_rms) *out_worst_rms = worst_rms;
+    if (out_worst_max_abs) *out_worst_max_abs = worst_max;
+    if (out_first_fail_layer) *out_first_fail_layer = first_fail;
+    if (out_nonfinite) *out_nonfinite = nonfinite;
+    return fails;
+#endif
+}
